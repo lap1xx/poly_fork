@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-# scan_2way.py v8 - esports + tennis only
+# scan_2way.py v9 - parallel + hours + dedup + weights + NEW + cache
 import argparse
+import concurrent.futures
 import json
 import os
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import requests
 
 COLON = chr(58)
@@ -18,70 +19,64 @@ TIMEOUT = 15.0
 NL = chr(10)
 PAGE = 100
 CFG_FILE = "config.json"
+PREV_FILE = "2way_prev.json"
+CACHE = {}
+CACHE_TTL = 10.0
 
-# only esports + tennis
 SPORT_PREFIXES = [
-	("cs2-", "CS2"),
-	("dota2-", "DOTA2"),
-	("lol-", "LOL"),
-	("valorant-", "VALORANT"),
-	("r6-", "R6"),
-	("rl-", "ROCKET"),
-	("cod-", "COD"),
-	("pubg-", "PUBG"),
-	("apex-", "APEX"),
-	("ow-", "OW"),
-	("sc2-", "SC2"),
-	("mlbb-", "MLBB"),
-	("fifa-", "FIFA"),
-	("fc-", "EAFC"),
-	("atp-", "TENNIS"),
-	("wta-", "TENNIS"),
-	("itf-", "TENNIS"),
+	("cs2-", "CS2"), ("dota2-", "DOTA2"), ("lol-", "LOL"), ("valorant-", "VALORANT"),
+	("r6-", "R6"), ("rl-", "ROCKET"), ("cod-", "COD"), ("pubg-", "PUBG"),
+	("apex-", "APEX"), ("ow-", "OW"), ("sc2-", "SC2"), ("mlbb-", "MLBB"),
+	("fifa-", "FIFA"), ("fc-", "EAFC"),
+	("atp-", "TENNIS"), ("wta-", "TENNIS"), ("itf-", "TENNIS"),
 ]
 
-DEFAULT_CFG = {
-	"bank": 20000,
-	"rate": 0,
-	"scan": {
-		"top": 800,
-		"show": 40,
-		"min_volume": 200,
-		"min_notional": 50,
-		"max_overround": 1.08,
-		"sport": "",
-		"tier": "",
-	},
-	"bot": {
-		"poll": 1.0,
-		"slip": 0.0,
-	},
+SPORT_WEIGHT = {
+	"CS2": 1.0, "DOTA2": 1.0, "LOL": 0.9, "VALORANT": 0.9,
+	"R6": 0.8, "ROCKET": 0.8, "COD": 0.7, "PUBG": 0.7,
+	"APEX": 0.6, "OW": 0.6, "SC2": 0.6, "MLBB": 0.6,
+	"FIFA": 0.6, "EAFC": 0.6, "TENNIS": 0.9,
 }
+
+SUFFIXES = [
+	"-game1", "-game2", "-game3", "-game4", "-game5",
+	"-set2", "-set3", "-set4", "-set5", "-first-set-winner",
+	"-set-2-winner", "-set-3-winner",
+]
+INFIXES = [
+	"-total-", "-set-totals-", "-spread-", "-handicap-",
+	"-round-total-", "-round-handicap-", "-game-handicap-",
+	"-set-handicap-", "-completed-match",
+]
 
 
 def load_cfg():
-	if not os.path.exists(CFG_FILE):
-		f = open(CFG_FILE, "w", encoding="utf-8")
-		json.dump(DEFAULT_CFG, f, indent=2, ensure_ascii=False)
-		f.close()
-		return dict(DEFAULT_CFG)
 	try:
 		f = open(CFG_FILE, encoding="utf-8")
 		c = json.load(f)
 		f.close()
-		out = dict(DEFAULT_CFG)
-		out.update(c)
-		return out
+		return c
 	except Exception:
-		return dict(DEFAULT_CFG)
+		return {}
 
 
 def sport_of(slug):
 	s = slug.lower()
-	for p, name in SPORT_PREFIXES:
+	for p, n in SPORT_PREFIXES:
 		if s.startswith(p):
-			return name
+			return n
 	return ""
+
+
+def base_slug(slug):
+	s = slug
+	for suf in SUFFIXES:
+		if s.endswith(suf):
+			return s[:-len(suf)]
+	for inf in INFIXES:
+		if inf in s:
+			return s.split(inf)[0]
+	return s
 
 
 def tier_from_league(m):
@@ -116,21 +111,41 @@ def is_future(m):
 		return True
 
 
-def req_with_retry(url, params=None, tries=3):
-	for attempt in range(tries):
+def start_within_hours(m, hours):
+	if hours <= 0:
+		return True
+	iso = m.get("eventStartTime") or m.get("gameStartTime") or ""
+	if not iso:
+		return True
+	try:
+		s = iso.replace("Z", "+00:00").replace(" ", "T")
+		dt = datetime.fromisoformat(s)
+		now = datetime.now(timezone.utc)
+		delta = dt - now
+		return delta < timedelta(hours=hours)
+	except Exception:
+		return True
+
+
+def req_retry(url, params=None, tries=3):
+	for a in range(tries):
 		try:
 			r = requests.get(url, params=params, timeout=TIMEOUT)
+			if r.status_code == 404:
+				return None
 			r.raise_for_status()
 			return r
-		except Exception:
-			time.sleep(2 + attempt * 1)
+		except Exception as e:
+			if "404" in str(e):
+				return None
+			time.sleep(1 + a)
 	return None
 
 
 def fetch_page(offset, limit):
 	params = {"active": "true", "closed": "false", "limit": limit,
 		"offset": offset, "order": "volume24hr", "ascending": "false"}
-	r = req_with_retry(GAMMA + "/markets", params=params)
+	r = req_retry(GAMMA + "/markets", params=params)
 	return r.json() if r else []
 
 
@@ -154,12 +169,17 @@ def fetch_all(max_markets):
 		print("    fetched " + str(len(all_m)))
 		if len(page) < take:
 			break
-		time.sleep(0.6)
+		time.sleep(0.4)
 	return all_m
 
 
 def best_ask(tid):
-	r = req_with_retry(CLOB + "/book", params={"token_id": tid}, tries=2)
+	now = time.time()
+	if tid in CACHE:
+		ts, a, s = CACHE[tid]
+		if now - ts < CACHE_TTL:
+			return (a, s)
+	r = req_retry(CLOB + "/book", params={"token_id": tid}, tries=2)
 	if not r:
 		return None
 	try:
@@ -168,9 +188,12 @@ def best_ask(tid):
 		return None
 	asks = book.get("asks") or []
 	if not asks:
-		return (0.0, 0.0)
-	best = min(asks, key=lambda x: float(x["price"]))
-	return (float(best["price"]), float(best["size"]))
+		res = (0.0, 0.0)
+	else:
+		b = min(asks, key=lambda x: float(x["price"]))
+		res = (float(b["price"]), float(b["size"]))
+	CACHE[tid] = (now, res[0], res[1])
+	return res
 
 
 def analyze(m, min_notional):
@@ -187,9 +210,8 @@ def analyze(m, min_notional):
 		res = best_ask(t)
 		if res is None:
 			return "api"
-		a, s = res
-		asks.append(a)
-		sizes.append(s)
+		asks.append(res[0])
+		sizes.append(res[1])
 	if any(a <= 0 for a in asks):
 		return "empty_ask"
 	n0 = asks[0] * sizes[0]
@@ -215,36 +237,57 @@ def analyze(m, min_notional):
 	}
 
 
+def load_prev():
+	try:
+		f = open(PREV_FILE, encoding="utf-8")
+		d = json.load(f)
+		f.close()
+		return set(d.get("base_slugs", []))
+	except Exception:
+		return set()
+
+
+def save_prev(base_slugs):
+	try:
+		f = open(PREV_FILE, "w", encoding="utf-8")
+		json.dump({"base_slugs": sorted(base_slugs), "ts": time.time()}, f)
+		f.close()
+	except Exception:
+		pass
+
+
 def main():
 	ap = argparse.ArgumentParser(prog="scan_2way")
-	ap.add_argument("--top", type=int, default=0)
-	ap.add_argument("--show", type=int, default=0)
-	ap.add_argument("--min-volume", type=float, default=0.0)
-	ap.add_argument("--min-notional", type=float, default=0.0)
-	ap.add_argument("--max-overround", type=float, default=0.0)
+	ap.add_argument("--top", type=int, default=800)
+	ap.add_argument("--show", type=int, default=40)
+	ap.add_argument("--min-volume", type=float, default=100)
+	ap.add_argument("--min-notional", type=float, default=50)
+	ap.add_argument("--max-overround", type=float, default=1.08)
 	ap.add_argument("--sport", default="")
 	ap.add_argument("--tier", default="")
+	ap.add_argument("--hours", type=float, default=0.0)
+	ap.add_argument("--workers", type=int, default=10)
 	args = ap.parse_args()
 
 	cfg = load_cfg()
 	sc = cfg.get("scan", {})
-	top = args.top if args.top > 0 else sc.get("top", 800)
-	show = args.show if args.show > 0 else sc.get("show", 40)
-	min_vol = args.min_volume if args.min_volume > 0 else sc.get("min_volume", 200)
-	min_notional = args.min_notional if args.min_notional > 0 else sc.get("min_notional", 200)
-	max_over = args.max_overround if args.max_overround > 0 else sc.get("max_overround", 1.08)
-	sport = args.sport if args.sport else sc.get("sport", "")
-	tier = args.tier if args.tier else sc.get("tier", "")
+	top = args.top or sc.get("top", 800)
+	show = args.show or sc.get("show", 40)
+	min_vol = args.min_volume or sc.get("min_volume", 100)
+	min_notional = args.min_notional or sc.get("min_notional", 50)
+	max_over = args.max_overround or sc.get("max_overround", 1.08)
+	sport = args.sport or sc.get("sport", "")
+	tier = args.tier or sc.get("tier", "")
+	hours = args.hours
 
-	print("[*] cfg: top=" + str(top) + " show=" + str(show) + " min_notional=" + str(min_notional) + " max_over=" + str(max_over) + " sport=" + (sport or "ESPORTS+TENNIS"))
-	print("[*] fetching up to " + str(top) + " active markets...")
+	print("[*] top=" + str(top) + " show=" + str(show) + " hours=" + str(hours) + " workers=" + str(args.workers))
+	print("[*] fetching " + str(top) + " markets...")
 	markets = fetch_all(top)
 	print("[*] got " + str(len(markets)) + " raw markets")
 
 	filtered = []
 	for m in markets:
 		slug = m.get("slug", "")
-		q = m.get("question", "")
 		try:
 			oc = json.loads(m.get("outcomes", "[]"))
 		except Exception:
@@ -257,41 +300,41 @@ def main():
 			continue
 		if not is_future(m):
 			continue
-		kind = "MATCH"
-		low = (slug + " " + q).lower()
-		if "o/u" in low or "total" in low or "over/under" in low:
-			kind = "TOTAL"
-		elif "spread" in low or "handicap" in low:
-			kind = "SPREAD"
-		elif "game" in low or "map" in low or "set" in low:
-			kind = "MAP/SET"
-		m["_kind"] = kind
+		if not start_within_hours(m, hours):
+			continue
 		filtered.append(m)
 
-	print("[*] " + str(len(filtered)) + " live candidates pass pre-filter")
+	print("[*] " + str(len(filtered)) + " candidates after pre-filter")
 
 	by_sport = {}
 	for m in filtered:
 		s = sport_of(m.get("slug", ""))
 		by_sport[s] = by_sport.get(s, 0) + 1
-	print("[*] breakdown:")
 	for k in sorted(by_sport.keys()):
 		print("      " + k.ljust(10) + " " + str(by_sport[k]))
 
 	results = []
 	reasons = {}
-	for i, m in enumerate(filtered):
-		r = analyze(m, min_notional)
-		if isinstance(r, str):
-			reasons[r] = reasons.get(r, 0) + 1
-		else:
-			r["sport"] = sport_of(r["slug"])
-			r["tier"] = tier_from_league(m)
-			r["market"] = m["_kind"]
-			results.append(r)
-		if (i + 1) % 20 == 0:
-			print("    processed " + str(i + 1) + " / " + str(len(filtered)))
-		time.sleep(0.5)
+	with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as ex:
+		futures = {ex.submit(analyze, m, min_notional): m for m in filtered}
+		done = 0
+		for fut in concurrent.futures.as_completed(futures):
+			done += 1
+			m = futures[fut]
+			try:
+				r = fut.result()
+			except Exception as e:
+				r = "api"
+			if isinstance(r, str):
+				reasons[r] = reasons.get(r, 0) + 1
+			else:
+				r["sport"] = sport_of(r["slug"])
+				r["tier"] = tier_from_league(m)
+				r["weight"] = SPORT_WEIGHT.get(r["sport"], 0.5)
+				r["score"] = r["over"] / r["weight"]
+				results.append(r)
+			if done % 20 == 0:
+				print("    done " + str(done) + " / " + str(len(filtered)))
 
 	print("[*] rejection reasons:")
 	for k in sorted(reasons.keys()):
@@ -302,49 +345,49 @@ def main():
 	if tier:
 		results = [r for r in results if r["tier"].upper() == tier.upper()]
 
-	results.sort(key=lambda x: x["over"])
+	prev = load_prev()
+	new_slugs = set()
+	for r in results:
+		bs = base_slug(r["slug"])
+		if bs not in prev:
+			r["is_new"] = True
+			new_slugs.add(bs)
+	save_prev(new_slugs | prev)
+
+	results.sort(key=lambda x: (x["score"], x["over"]))
 	good = [r for r in results if r["over"] <= max_over]
 
 	print()
-	print("=" * 110)
-	print("Top " + str(show) + " candidates (over<=" + str(max_over) + ", notional>=" + str(int(min_notional)) + ")")
-	print("=" * 110)
-
+	print("=" * 115)
+	print("Top " + str(show) + " - over<=" + str(max_over) + " notional>=USD" + str(int(min_notional)) + " hours<=" + str(hours))
+	print()
 	for i, r in enumerate(good[:show], 1):
-		print()
-		badge = "[" + r["sport"].ljust(8) + "/" + r["tier"].ljust(3) + "/" + r["market"].ljust(8) + "]"
-		print("#" + str(i).ljust(3) + badge + "  over=" + format(r["over"], ".4f") + "  vol=" + format(r["vol"], ",.0f") + "  league=" + r["league"])
+		marker = " [NEW] " if r.get("is_new") else "       "
+		badge = "[" + r["sport"].ljust(8) + "/" + r["tier"].ljust(3) + "]"
+		print("#" + str(i).ljust(3) + marker + badge + " over=" + format(r["over"], ".4f") + " score=" + format(r["score"], ".4f") + " vol=" + format(r["vol"], ",.0f"))
 		print("     " + r["q"][:95])
-		print("     start: " + r["start"] + "   end: " + r["end"])
-		print("     slug: " + r["slug"])
+		print("     start: " + r["start"] + "   slug: " + r["slug"])
 		for oc, a, s, n in zip(r["o"], r["asks"], r["sizes"], r["notional"]):
-			print("       " + oc[:28].ljust(28) + " ask=" + format(a, ".3f") + "  k=" + format(1.0 / a, ".2f") + "  liq=" + format(n, ",.0f"))
+			print("       " + oc[:28].ljust(28) + " ask=" + format(a, ".3f") + "  k=" + format(1.0/a, ".2f") + "  USDliq=" + format(n, ",.0f"))
+	print()
 
 	print()
-	print("[+] analyzed " + str(len(results)) + ", within threshold: " + str(len(good)))
+	print("[+] analyzed " + str(len(results)) + ", within: " + str(len(good)) + ", new: " + str(len(new_slugs)))
 
 	f = open("2way_candidates.txt", "w", encoding="utf-8")
-	f.write("sport	tier	market	overround	volume24h	league	start	end	slug	question" + NL)
+	f.write("sport	tier	market	overround	score	volume24h	league	start	end	slug	question" + NL)
 	for r in results:
-		line = r["sport"] + "	" + r["tier"] + "	" + r["market"] + "	"
-		line += format(r["over"], ".4f") + "	" + format(r["vol"], ".0f") + "	"
-		line += r["league"] + "	" + r["start"] + "	" + r["end"] + "	"
+		line = r["sport"] + "	" + r["tier"] + "	MATCH	"
+		line += format(r["over"], ".4f") + "	" + format(r["score"], ".4f") + "	"
+		line += format(r["vol"], ".0f") + "	" + r["league"] + "	"
+		line += r["start"] + "	" + r["end"] + "	"
 		line += r["slug"] + "	" + r["q"].replace("	", " ")
 		f.write(line + NL)
 	f.close()
 	print("[+] saved 2way_candidates.txt")
 
-	slugs = [r["slug"] for r in good[:10]]
-	b = open("run_bot.bat", "w", encoding="utf-8")
-	b.write("@echo off" + NL)
-	b.write("python polyarb_v3.py --slugs " + ",".join(slugs) + NL)
-	b.write("pause" + NL)
-	b.close()
-	print("[+] wrote run_bot.bat with " + str(len(slugs)) + " slugs")
-
-
 try:
 	main()
 except KeyboardInterrupt:
 	print()
-	print("interrupted by user")
+	print("interrupted")
