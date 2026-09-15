@@ -32,10 +32,10 @@ SPORT_PREFIXES = [
 ]
 
 SPORT_WEIGHT = {
-	"CS2": 1.0, "DOTA2": 1.0, "LOL": 0.9, "VALORANT": 0.9,
-	"R6": 0.8, "ROCKET": 0.8, "COD": 0.7, "PUBG": 0.7,
-	"APEX": 0.6, "OW": 0.6, "SC2": 0.6, "MLBB": 0.6,
-	"FIFA": 0.6, "EAFC": 0.6, "TENNIS": 0.9,
+	"CS2": 1.0, "DOTA2": 1.0, "LOL": 0.9, "VALORANT": 0.85,
+	"R6": 0.75, "ROCKET": 0.75, "COD": 0.65, "PUBG": 0.65,
+	"APEX": 0.55, "OW": 0.55, "SC2": 0.55, "MLBB": 0.55,
+	"FIFA": 0.55, "EAFC": 0.55, "TENNIS": 0.85,
 }
 
 SUFFIXES = [
@@ -256,6 +256,15 @@ def save_prev(base_slugs):
 		pass
 
 
+
+def is_streamer(slug, question):
+	s = (slug + " " + question).lower()
+	keys = ["streamer", "showmatch", "show-match", "influencer", "charity", "pro-am", "proam", "star-series", "star series", "esforce"]
+	for k in keys:
+		if k in s:
+			return True
+	return False
+
 def main():
 	ap = argparse.ArgumentParser(prog="scan_2way")
 	ap.add_argument("--top", type=int, default=800)
@@ -365,7 +374,8 @@ def main():
 		marker = " [NEW] " if r.get("is_new") else "       "
 		badge = "[" + r["sport"].ljust(8) + "/" + r["tier"].ljust(3) + "]"
 		print("#" + str(i).ljust(3) + marker + badge + " over=" + format(r["over"], ".4f") + " score=" + format(r["score"], ".4f") + " vol=" + format(r["vol"], ",.0f"))
-		print("     " + r["q"][:95])
+		streamer_tag = " [STREAMER]" if is_streamer(r["slug"], r["q"]) else ""
+		print("     " + r["q"][:95] + streamer_tag)
 		print("     start: " + r["start"] + "   slug: " + r["slug"])
 		for oc, a, s, n in zip(r["o"], r["asks"], r["sizes"], r["notional"]):
 			print("       " + oc[:28].ljust(28) + " ask=" + format(a, ".3f") + "  k=" + format(1.0/a, ".2f") + "  USDliq=" + format(n, ",.0f"))

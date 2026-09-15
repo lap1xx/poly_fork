@@ -252,6 +252,32 @@ def classify_sport(slug):
 	return "OTHER"
 
 
+def fmt_age(sec):
+	if sec < 1:
+		return "0s"
+	m = int(sec // 60)
+	s = int(sec - m * 60)
+	if m > 0:
+		return str(m) + "m " + str(s) + "s"
+	return str(s) + "s"
+
+
+def detect_type(slug):
+	s = slug.lower()
+	if "-live" in s or "inplay" in s:
+		return "LIVE"
+	return "PREMATCH"
+
+
+def detect_streamer(slug, question):
+	s = (slug + " " + question).lower()
+	keys = ["streamer", "showmatch", "show-match", "influencer", "charity", "pro-am", "proam", "star-series", "star series", "esforce"]
+	for k in keys:
+		if k in s:
+			return True
+	return False
+
+
 def main():
 	ap = argparse.ArgumentParser(prog="polyarb_v3")
 	ap.add_argument("--slugs", required=True)
