@@ -167,4 +167,8 @@ def main():
 	print("[+] done. " + str(len(filtered)) + " live events")
 
 
-main()
+try:
+	main()
+except KeyboardInterrupt:
+	print()
+	print("interrupted by user")

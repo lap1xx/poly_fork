@@ -343,4 +343,8 @@ def main():
 	print("[+] wrote run_bot.bat with " + str(len(slugs)) + " slugs")
 
 
-main()
+try:
+	main()
+except KeyboardInterrupt:
+	print()
+	print("interrupted by user")
