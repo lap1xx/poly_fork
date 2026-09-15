@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+arbs.db
+arbs.db-journal
+config.json
+config.example.json
+
+2way_candidates.txt
+run_bot.bat
+launchers/
+
+.env
+*.log
