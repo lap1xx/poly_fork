@@ -1,0 +1,241 @@
+:root {
+  /* Brand accents layered on Telegram themeParams */
+  --pf-accent: #3dff9a;
+  --pf-accent-dim: #1a5c3a;
+  --pf-warn: #ffb84d;
+  --pf-danger: #ff5c5c;
+  --pf-pm: #5ec8ff;
+  --pf-bc: #c4a574;
+  --pf-line: var(--tg-theme-section-separator-color, #1e2c26);
+  --pf-bg: var(--tg-theme-bg-color, #0c1210);
+  --pf-panel: var(--tg-theme-section-bg-color, var(--tg-theme-secondary-bg-color, #121a17));
+  --pf-text: var(--tg-theme-text-color, #e8f0eb);
+  --pf-muted: var(--tg-theme-hint-color, #7a9286);
+  --pf-button: var(--tg-theme-button-color, #3dff9a);
+  --pf-button-text: var(--tg-theme-button-text-color, #04140c);
+  --safe-top: var(--tg-viewport-content-safe-area-inset-top, 0px);
+  --safe-bottom: var(--tg-viewport-safe-area-inset-bottom, 0px);
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  background:
+    radial-gradient(ellipse 80% 50% at 10% -10%, color-mix(in srgb, var(--pf-accent) 18%, transparent) 0%, transparent 55%),
+    radial-gradient(ellipse 60% 40% at 100% 0%, color-mix(in srgb, var(--pf-pm) 12%, transparent) 0%, transparent 50%),
+    var(--pf-bg);
+  color: var(--pf-text);
+  -webkit-font-smoothing: antialiased;
+  padding-top: var(--safe-top);
+}
+
+button,
+input,
+select {
+  font: inherit;
+  color: inherit;
+}
+
+a {
+  color: var(--tg-theme-link-color, var(--pf-pm));
+}
+
+.app-shell {
+  width: min(520px, 100%);
+  margin: 0 auto;
+  min-height: 100dvh;
+  padding: 16px 14px calc(72px + var(--safe-bottom));
+}
+
+.brand-title {
+  font-family: Syne, system-ui, sans-serif;
+  font-weight: 800;
+  font-size: 28px;
+  letter-spacing: -0.04em;
+  line-height: 0.95;
+}
+
+.brand-title span {
+  color: var(--pf-accent);
+}
+
+.sub {
+  color: var(--pf-muted);
+  font-size: 11px;
+  margin-top: 6px;
+  letter-spacing: 0.04em;
+}
+
+.panel {
+  background: var(--pf-panel);
+  border: 1px solid var(--pf-line);
+  border-radius: 2px;
+  padding: 14px;
+}
+
+.panel h2 {
+  font-family: Syne, system-ui, sans-serif;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--pf-muted);
+  margin-bottom: 12px;
+}
+
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--pf-accent);
+  box-shadow: 0 0 12px color-mix(in srgb, var(--pf-accent) 70%, transparent);
+  animation: pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.rise {
+  animation: rise 0.4s ease both;
+}
+
+.pos {
+  color: var(--pf-accent);
+}
+.neg {
+  color: var(--pf-danger);
+}
+.mute {
+  color: var(--pf-muted);
+}
+.warn {
+  color: var(--pf-warn);
+}
+.src-pm {
+  color: var(--pf-pm);
+}
+.src-bc {
+  color: var(--pf-bc);
+}
+
+.btn {
+  border: none;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 12px 14px;
+  border-radius: 2px;
+  transition: filter 0.15s ease, transform 0.12s ease;
+}
+.btn:active {
+  transform: scale(0.98);
+}
+.btn-go {
+  background: var(--pf-button);
+  color: var(--pf-button-text);
+  flex: 1;
+}
+.btn-go:hover {
+  filter: brightness(1.08);
+}
+.btn-ghost {
+  background: transparent;
+  color: var(--pf-muted);
+  border: 1px solid var(--pf-line);
+}
+.btn-ghost.on {
+  color: var(--pf-text);
+  border-color: color-mix(in srgb, var(--pf-accent) 40%, var(--pf-line));
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+.field label {
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--pf-muted);
+}
+.field input,
+.field select {
+  background: var(--pf-bg);
+  border: 1px solid var(--pf-line);
+  padding: 11px 12px;
+  border-radius: 2px;
+  outline: none;
+}
+.field input:focus,
+.field select:focus {
+  border-color: color-mix(in srgb, var(--pf-accent) 55%, var(--pf-line));
+}
+
+.tabbar {
+  position: fixed;
+  left: 50%;
+  transform: translateX(-50%);
+  bottom: 0;
+  width: min(520px, 100%);
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 2px;
+  padding: 8px 8px calc(8px + var(--safe-bottom));
+  background: color-mix(in srgb, var(--pf-bg) 88%, transparent);
+  backdrop-filter: blur(14px);
+  border-top: 1px solid var(--pf-line);
+  z-index: 20;
+}
+.tabbar button {
+  border: 0;
+  background: transparent;
+  color: var(--pf-muted);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 8px 2px;
+  cursor: pointer;
+}
+.tabbar button.on {
+  color: var(--pf-accent);
+}
+.tabbar button .ico {
+  display: block;
+  font-size: 14px;
+  margin-bottom: 3px;
+  font-family: Syne, system-ui, sans-serif;
+}
