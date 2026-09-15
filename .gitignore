@@ -14,3 +14,10 @@ launchers/
 
 .env
 *.log
+
+# Mini App / local API
+miniapp/node_modules/
+miniapp/dist/
+bc_odds.json
+watch_slugs.json
+server/__pycache__/

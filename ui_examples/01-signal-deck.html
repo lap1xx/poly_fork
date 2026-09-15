@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <title>PolyFork — Signal Deck</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --ink: #0e1412;
+      --paper: #f2f4ef;
+      --panel: #ffffff;
+      --line: #d5dbd1;
+      --mute: #5c6b62;
+      --signal: #1faa6e;
+      --signal-dim: #d8f3e6;
+      --alert: #e24b2d;
+      --alert-soft: #fde8e3;
+      --pm: #1a5cff;
+      --bc: #8a6d1d;
+      --radius: 14px;
+      --safe-b: env(safe-area-inset-bottom, 12px);
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: "DM Sans", system-ui, sans-serif;
+      background: linear-gradient(165deg, #e8ece3 0%, #f2f4ef 40%, #eef2f7 100%);
+      color: var(--ink);
+      min-height: 100dvh;
+      -webkit-font-smoothing: antialiased;
+    }
+    .phone {
+      width: min(390px, 100%);
+      margin: 0 auto;
+      min-height: 100dvh;
+      padding: 12px 14px calc(72px + var(--safe-b));
+      position: relative;
+    }
+    .tg-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 18px;
+      opacity: 0;
+      animation: rise 0.5s ease forwards;
+    }
+    .brand {
+      font-weight: 700;
+      font-size: 18px;
+      letter-spacing: -0.03em;
+    }
+    .brand span { color: var(--signal); }
+    .live-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-family: "JetBrains Mono", monospace;
+      font-size: 11px;
+      font-weight: 500;
+      background: var(--signal-dim);
+      color: #0f6b42;
+      padding: 6px 10px;
+      border-radius: 8px;
+    }
+    .live-dot {
+      width: 7px; height: 7px; border-radius: 50%;
+      background: var(--signal);
+      animation: pulse 1.4s ease-in-out infinite;
+    }
+    .hero {
+      margin-bottom: 16px;
+      opacity: 0;
+      animation: rise 0.55s 0.08s ease forwards;
+    }
+    .hero h1 {
+      font-size: 28px;
+      line-height: 1.1;
+      letter-spacing: -0.04em;
+      font-weight: 700;
+      margin-bottom: 6px;
+    }
+    .hero p {
+      color: var(--mute);
+      font-size: 14px;
+      line-height: 1.4;
+    }
+    .stats {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 8px;
+      margin-bottom: 16px;
+      opacity: 0;
+      animation: rise 0.55s 0.14s ease forwards;
+    }
+    .stat {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 12px 10px;
+    }
+    .stat .l {
+      font-size: 11px;
+      color: var(--mute);
+      margin-bottom: 4px;
+    }
+    .stat .v {
+      font-family: "JetBrains Mono", monospace;
+      font-size: 15px;
+      font-weight: 600;
+      letter-spacing: -0.02em;
+    }
+    .stat .v.up { color: var(--signal); }
+    .tabs {
+      display: flex;
+      gap: 4px;
+      background: rgba(14, 20, 18, 0.06);
+      padding: 4px;
+      border-radius: 12px;
+      margin-bottom: 14px;
+      opacity: 0;
+      animation: rise 0.55s 0.2s ease forwards;
+    }
+    .tab {
+      flex: 1;
+      border: 0;
+      background: transparent;
+      font: inherit;
+      font-size: 13px;
+      font-weight: 600;
+      padding: 10px 8px;
+      border-radius: 9px;
+      color: var(--mute);
+      cursor: pointer;
+    }
+    .tab.on {
+      background: var(--panel);
+      color: var(--ink);
+      box-shadow: 0 1px 0 rgba(14,20,18,0.06);
+    }
+    .feed { display: flex; flex-direction: column; gap: 10px; }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 14px;
+      opacity: 0;
+      transform: translateY(10px);
+      animation: rise 0.5s ease forwards;
+    }
+    .card:nth-child(1) { animation-delay: 0.26s; }
+    .card:nth-child(2) { animation-delay: 0.34s; }
+    .card:nth-child(3) { animation-delay: 0.42s; }
+    .card.hot {
+      border-color: #9fe0c0;
+      background: linear-gradient(180deg, #f7fffb 0%, #ffffff 55%);
+    }
+    .row-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+    .sport {
+      font-family: "JetBrains Mono", monospace;
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--mute);
+    }
+    .roi {
+      font-family: "JetBrains Mono", monospace;
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--signal);
+      background: var(--signal-dim);
+      padding: 4px 8px;
+      border-radius: 7px;
+    }
+    .roi.flat { color: var(--mute); background: #eef0eb; }
+    .q {
+      font-size: 15px;
+      font-weight: 600;
+      letter-spacing: -0.02em;
+      line-height: 1.25;
+      margin-bottom: 12px;
+    }
+    .legs {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+    .leg {
+      display: grid;
+      grid-template-columns: 52px 1fr auto;
+      gap: 8px;
+      align-items: center;
+      font-size: 13px;
+    }
+    .src {
+      font-family: "JetBrains Mono", monospace;
+      font-size: 10px;
+      font-weight: 600;
+      padding: 4px 6px;
+      border-radius: 6px;
+      text-align: center;
+    }
+    .src.pm { background: #e8efff; color: var(--pm); }
+    .src.bc { background: #f5efd8; color: var(--bc); }
+    .out { color: var(--ink); font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .k { font-family: "JetBrains Mono", monospace; font-weight: 600; font-size: 12px; }
+    .meta {
+      display: flex;
+      justify-content: space-between;
+      font-size: 12px;
+      color: var(--mute);
+      padding-top: 10px;
+      border-top: 1px solid var(--line);
+    }
+    .cta {
+      margin-top: 12px;
+      width: 100%;
+      border: 0;
+      background: var(--ink);
+      color: #fff;
+      font: inherit;
+      font-weight: 600;
+      font-size: 14px;
+      padding: 13px;
+      border-radius: 12px;
+      cursor: pointer;
+      transition: transform 0.15s ease, background 0.15s ease;
+    }
+    .cta:active { transform: scale(0.98); background: #1c2a24; }
+    .nav {
+      position: fixed;
+      left: 50%;
+      transform: translateX(-50%);
+      bottom: 0;
+      width: min(390px, 100%);
+      background: rgba(242, 244, 239, 0.92);
+      backdrop-filter: blur(12px);
+      border-top: 1px solid var(--line);
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      padding: 8px 8px calc(8px + var(--safe-b));
+      z-index: 10;
+    }
+    .nav button {
+      border: 0;
+      background: transparent;
+      font: inherit;
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--mute);
+      padding: 8px 4px;
+      cursor: pointer;
+    }
+    .nav button.on { color: var(--ink); }
+    .nav button span {
+      display: block;
+      font-size: 16px;
+      line-height: 1;
+      margin-bottom: 4px;
+      font-family: "JetBrains Mono", monospace;
+    }
+    @keyframes rise {
+      to { opacity: 1; transform: none; }
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.45; transform: scale(0.85); }
+    }
+  </style>
+</head>
+<body>
+  <div class="phone">
+    <div class="tg-bar">
+      <div class="brand">Poly<span>Fork</span></div>
+      <div class="live-pill"><i class="live-dot"></i> LIVE · 10</div>
+    </div>
+
+    <header class="hero">
+      <h1>Сигнальная<br>панель</h1>
+      <p>Мониторинг Polymarket ↔ БК. Ставки вручную после сигнала.</p>
+    </header>
+
+    <div class="stats">
+      <div class="stat">
+        <div class="l">Банк</div>
+        <div class="v">20 000₽</div>
+      </div>
+      <div class="stat">
+        <div class="l">Сегодня</div>
+        <div class="v up">+1 240₽</div>
+      </div>
+      <div class="stat">
+        <div class="l">USD/RUB</div>
+        <div class="v">84.34</div>
+      </div>
+    </div>
+
+    <div class="tabs">
+      <button class="tab on" type="button">Сигналы</button>
+      <button class="tab" type="button">Сканер</button>
+      <button class="tab" type="button">Live</button>
+    </div>
+
+    <div class="feed">
+      <article class="card hot">
+        <div class="row-top">
+          <div class="sport">CS2 · MID · MATCH</div>
+          <div class="roi">+0.84%</div>
+        </div>
+        <div class="q">FORZE Reload vs UPGRADE (BO3)</div>
+        <div class="legs">
+          <div class="leg">
+            <span class="src pm">PM</span>
+            <span class="out">FORZE Reload</span>
+            <span class="k">k 1.92 · 10 420₽</span>
+          </div>
+          <div class="leg">
+            <span class="src bc">BC</span>
+            <span class="out">UPGRADE</span>
+            <span class="k">k 2.15 · 9 580₽</span>
+          </div>
+        </div>
+        <div class="meta">
+          <span>Age 12s</span>
+          <span>over 1.010</span>
+        </div>
+        <button class="cta" type="button">Place bets NOW</button>
+      </article>
+
+      <article class="card">
+        <div class="row-top">
+          <div class="sport">TENNIS · WTA</div>
+          <div class="roi flat">−0.12%</div>
+        </div>
+        <div class="q">Linana vs Llorca · Valencia</div>
+        <div class="legs">
+          <div class="leg">
+            <span class="src pm">PM</span>
+            <span class="out">Linana</span>
+            <span class="k">ask 0.72 · 1.39</span>
+          </div>
+          <div class="leg">
+            <span class="src bc">BC</span>
+            <span class="out">Llorca</span>
+            <span class="k">— skip</span>
+          </div>
+        </div>
+        <div class="meta">
+          <span>monitoring</span>
+          <span>liq OK</span>
+        </div>
+      </article>
+
+      <article class="card">
+        <div class="row-top">
+          <div class="sport">TENNIS · ATP</div>
+          <div class="roi flat">+0.03%</div>
+        </div>
+        <div class="q">Pereira vs Pieczonka · Szczecin</div>
+        <div class="legs">
+          <div class="leg">
+            <span class="src pm">PM</span>
+            <span class="out">Pereira</span>
+            <span class="k">k 2.08</span>
+          </div>
+          <div class="leg">
+            <span class="src bc">BC</span>
+            <span class="out">Pieczonka</span>
+            <span class="k">k 1.95</span>
+          </div>
+        </div>
+        <div class="meta">
+          <span>near</span>
+          <span>over 1.020</span>
+        </div>
+      </article>
+    </div>
+  </div>
+
+  <nav class="nav">
+    <button class="on" type="button"><span>■</span>Home</button>
+    <button type="button"><span>▣</span>Scan</button>
+    <button type="button"><span>◎</span>Watch</button>
+    <button type="button"><span>☰</span>More</button>
+  </nav>
+</body>
+</html>

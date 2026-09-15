@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <title>PolyFork — Desk Ledger</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=Manrope:wght@400;500;600;700&family=Fragment+Mono:wght@400&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #eef2f5;
+      --ink: #121820;
+      --mute: #66707c;
+      --rule: #d5dde5;
+      --panel: #fbfcfd;
+      --accent: #0b6e4f;
+      --accent-2: #1d4ed8;
+      --alert: #9f1239;
+      --safe-b: env(safe-area-inset-bottom, 12px);
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: Manrope, system-ui, sans-serif;
+      background:
+        repeating-linear-gradient(
+          0deg,
+          transparent,
+          transparent 27px,
+          rgba(18, 24, 32, 0.035) 28px
+        ),
+        var(--bg);
+      color: var(--ink);
+      min-height: 100dvh;
+      -webkit-font-smoothing: antialiased;
+    }
+    .wrap {
+      width: min(390px, 100%);
+      margin: 0 auto;
+      padding: 16px 16px calc(24px + var(--safe-b));
+    }
+    .top {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-end;
+      margin-bottom: 20px;
+      padding-bottom: 14px;
+      border-bottom: 1px solid var(--rule);
+      animation: fade 0.45s ease both;
+    }
+    .mark {
+      font-family: Fraunces, Georgia, serif;
+      font-size: 22px;
+      font-weight: 700;
+      letter-spacing: -0.03em;
+    }
+    .mark span { color: var(--accent); }
+    .clock {
+      font-family: "Fragment Mono", monospace;
+      font-size: 11px;
+      color: var(--mute);
+      text-align: right;
+    }
+    .clock strong {
+      display: block;
+      color: var(--ink);
+      font-size: 13px;
+      font-weight: 400;
+      margin-top: 2px;
+    }
+
+    .lede {
+      margin-bottom: 18px;
+      animation: fade 0.5s 0.06s ease both;
+    }
+    .lede h1 {
+      font-family: Fraunces, Georgia, serif;
+      font-size: 34px;
+      line-height: 1.02;
+      letter-spacing: -0.035em;
+      font-weight: 600;
+      margin-bottom: 8px;
+    }
+    .lede p {
+      font-size: 14px;
+      color: var(--mute);
+      line-height: 1.4;
+    }
+
+    .ledger {
+      background: var(--panel);
+      border: 1px solid var(--rule);
+      border-radius: 4px;
+      overflow: hidden;
+      margin-bottom: 14px;
+      animation: fade 0.55s 0.12s ease both;
+    }
+    .ledger-h {
+      display: grid;
+      grid-template-columns: 1.4fr 0.7fr 0.7fr 0.8fr;
+      gap: 6px;
+      padding: 10px 12px;
+      font-family: "Fragment Mono", monospace;
+      font-size: 10px;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--mute);
+      border-bottom: 1px solid var(--rule);
+      background: #e8eef4;
+    }
+    .line {
+      display: grid;
+      grid-template-columns: 1.4fr 0.7fr 0.7fr 0.8fr;
+      gap: 6px;
+      padding: 14px 12px;
+      border-bottom: 1px solid var(--rule);
+      align-items: center;
+      transition: background 0.2s ease;
+      animation: slide 0.4s ease both;
+    }
+    .line:last-child { border-bottom: 0; }
+    .line:nth-child(2) { animation-delay: 0.18s; }
+    .line:nth-child(3) { animation-delay: 0.26s; }
+    .line:nth-child(4) { animation-delay: 0.34s; }
+    .line:nth-child(5) { animation-delay: 0.42s; }
+    .line.hit {
+      background: #ecf8f2;
+    }
+    .line:active { background: #e8eef4; }
+    .ev .s {
+      font-family: "Fragment Mono", monospace;
+      font-size: 10px;
+      color: var(--mute);
+      margin-bottom: 3px;
+    }
+    .ev .n {
+      font-size: 13px;
+      font-weight: 650;
+      letter-spacing: -0.02em;
+      line-height: 1.2;
+    }
+    .cell {
+      font-family: "Fragment Mono", monospace;
+      font-size: 12px;
+    }
+    .cell.pos { color: var(--accent); font-weight: 600; }
+    .cell.warn { color: var(--accent-2); }
+    .cell.mute { color: var(--mute); }
+
+    .alert {
+      border: 1px solid #f1c4cf;
+      background: #fff5f7;
+      border-radius: 4px;
+      padding: 14px;
+      margin-bottom: 14px;
+      animation: pulseBorder 2.2s ease-in-out infinite, fade 0.5s 0.2s ease both;
+    }
+    .alert .tag {
+      font-family: "Fragment Mono", monospace;
+      font-size: 10px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--alert);
+      margin-bottom: 6px;
+    }
+    .alert h2 {
+      font-family: Fraunces, Georgia, serif;
+      font-size: 20px;
+      font-weight: 600;
+      letter-spacing: -0.02em;
+      margin-bottom: 8px;
+    }
+    .alert .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+    .alert .box {
+      background: #fff;
+      border: 1px solid #f1c4cf;
+      padding: 10px;
+      border-radius: 3px;
+    }
+    .alert .box .l {
+      font-size: 10px;
+      color: var(--mute);
+      margin-bottom: 4px;
+      font-family: "Fragment Mono", monospace;
+    }
+    .alert .box .v {
+      font-size: 13px;
+      font-weight: 650;
+    }
+    .alert button {
+      width: 100%;
+      border: 0;
+      background: var(--alert);
+      color: #fff;
+      font: inherit;
+      font-weight: 700;
+      font-size: 13px;
+      padding: 12px;
+      border-radius: 3px;
+      cursor: pointer;
+    }
+
+    .prefs {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      animation: fade 0.5s 0.35s ease both;
+    }
+    .pref {
+      background: var(--panel);
+      border: 1px solid var(--rule);
+      border-radius: 4px;
+      padding: 12px;
+    }
+    .pref .l {
+      font-size: 11px;
+      color: var(--mute);
+      margin-bottom: 4px;
+    }
+    .pref .v {
+      font-family: "Fragment Mono", monospace;
+      font-size: 14px;
+      font-weight: 500;
+    }
+
+    .footer-note {
+      margin-top: 18px;
+      font-size: 11px;
+      color: var(--mute);
+      line-height: 1.4;
+      animation: fade 0.5s 0.45s ease both;
+    }
+
+    @keyframes fade {
+      from { opacity: 0; transform: translateY(8px); }
+      to { opacity: 1; transform: none; }
+    }
+    @keyframes slide {
+      from { opacity: 0; transform: translateX(-6px); }
+      to { opacity: 1; transform: none; }
+    }
+    @keyframes pulseBorder {
+      0%, 100% { border-color: #f1c4cf; }
+      50% { border-color: #e11d48; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="top">
+      <div class="mark">Poly<span>Fork</span></div>
+      <div class="clock">
+        MONITOR
+        <strong>15:27:04 MSK</strong>
+      </div>
+    </div>
+
+    <div class="lede">
+      <h1>Журнал<br>арбитража</h1>
+      <p>Плотный экран оператора: таблица ROI, алерт сверху, банк и slip как в config.</p>
+    </div>
+
+    <div class="alert">
+      <div class="tag">Place bets now · age 12s</div>
+      <h2>FORZE vs UPGRADE · +0.84%</h2>
+      <div class="grid">
+        <div class="box">
+          <div class="l">PM · FORZE</div>
+          <div class="v">k 1.92 · 10 420₽</div>
+        </div>
+        <div class="box">
+          <div class="l">BC · UPGRADE</div>
+          <div class="v">k 2.15 · 9 580₽</div>
+        </div>
+      </div>
+      <button type="button">Открыть ноги и подтвердить</button>
+    </div>
+
+    <div class="ledger">
+      <div class="ledger-h">
+        <div>Event</div>
+        <div>ROI</div>
+        <div>Over</div>
+        <div>Status</div>
+      </div>
+      <div class="line hit">
+        <div class="ev">
+          <div class="s">CS2 · MATCH</div>
+          <div class="n">FORZE / UPGRADE</div>
+        </div>
+        <div class="cell pos">+0.84</div>
+        <div class="cell">1.010</div>
+        <div class="cell warn">ARB</div>
+      </div>
+      <div class="line">
+        <div class="ev">
+          <div class="s">WTA · LIVE</div>
+          <div class="n">Linana / Llorca</div>
+        </div>
+        <div class="cell mute">−0.12</div>
+        <div class="cell">1.010</div>
+        <div class="cell mute">WAIT</div>
+      </div>
+      <div class="line">
+        <div class="ev">
+          <div class="s">ATP · MATCH</div>
+          <div class="n">Pereira / Piecz.</div>
+        </div>
+        <div class="cell pos">+0.03</div>
+        <div class="cell">1.020</div>
+        <div class="cell mute">NEAR</div>
+      </div>
+      <div class="line">
+        <div class="ev">
+          <div class="s">CS2 · MATCH</div>
+          <div class="n">BakS / Spirit Ac.</div>
+        </div>
+        <div class="cell mute">−0.41</div>
+        <div class="cell">1.010</div>
+        <div class="cell mute">WAIT</div>
+      </div>
+    </div>
+
+    <div class="prefs">
+      <div class="pref">
+        <div class="l">Bank</div>
+        <div class="v">20 000 ₽</div>
+      </div>
+      <div class="pref">
+        <div class="l">Slip / Comm</div>
+        <div class="v">0% / 0%</div>
+      </div>
+      <div class="pref">
+        <div class="l">USD/RUB</div>
+        <div class="v">84.3363</div>
+      </div>
+      <div class="pref">
+        <div class="l">Today</div>
+        <div class="v">3 / +1 240</div>
+      </div>
+    </div>
+
+    <p class="footer-note">
+      Direction 03 · Desk Ledger. Под Telegram themeParams легко заменить
+      --bg/--ink, сохранив «бухгалтерскую» сетку. Без автоставок — только алерт.
+    </p>
+  </div>
+</body>
+</html>
