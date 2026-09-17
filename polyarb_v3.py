@@ -8,6 +8,8 @@ import sqlite3
 import sys
 import threading
 import time
+import subprocess
+import webbrowser
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 import requests
@@ -367,6 +369,17 @@ def sport_color(sport):
 		return C.B
 	return C.RST
 
+
+def copy_to_clipboard(text):
+	if sys.platform == "win32":
+		try:
+			p = subprocess.Popen(["clip"], stdin=subprocess.PIPE, shell=True)
+			p.communicate(input=text.encode("utf-16-le"))
+			return True
+		except Exception:
+			return False
+	return False
+
 def main():
 	ap = argparse.ArgumentParser(prog="polyarb_v3")
 	ap.add_argument("--slugs", required=True)
@@ -452,7 +465,7 @@ def main():
 			print("  PM " + oc.ljust(24) + " ask=" + format(a, ".3f") + "  k=" + format(kk, ".2f"))
 		crm = {}
 		for oc in m["o"]:
-			raw = input("  BC odds for " + oc + " (Enter=skip): ").strip()
+			raw = input("  BC odds for " + oc + " (ex: BetBoom 1.85, Enter=skip): ").strip()
 			if not raw:
 				continue
 			p = raw.split()
