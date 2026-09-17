@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # bot_live.py v4 - no stale score, live-refresh
-import argparse, json, os, subprocess, sys, time, requests
+import argparse, concurrent.futures, json, os, subprocess, sys, time, requests
 if sys.platform == 'win32': os.system('')
 
 PY = sys.executable
@@ -78,9 +78,17 @@ def market_liq(m):
 def fetch_live():
     return req(GAMMA + '/events', params={'active': 'true', 'closed': 'false', 'limit': 200, 'live': 'true'}) or []
 
-def collect_events(sport_filter='', only_low=False, min_liq=20):
+def market_task(m):
+    mslug = m.get('slug', '')
+    mq = m.get('question', '')
+    if not mslug: return None
+    over, liq = market_liq(m)
+    return {'slug': mslug, 'question': mq, 'over': over, 'liq': liq}
+
+
+def collect_events(sport_filter='', only_low=False, min_liq=20, workers=20):
     events = fetch_live()
-    out = []
+    pass_list = []
     for ev in events:
         slug = ev.get('slug', '')
         title = ev.get('title', '')
@@ -89,23 +97,46 @@ def collect_events(sport_filter='', only_low=False, min_liq=20):
         if sport_filter and sport.upper() != sport_filter.upper(): continue
         low = is_low(slug, title)
         if only_low and not low: continue
+        pass_list.append((ev, slug, title, sport, low))
+    print('[*] ' + str(len(pass_list)) + ' events pass pre-filter')
+    all_markets = []
+    for tup in pass_list:
+        ev, slug, title, sport, low = tup
         markets = ev.get('markets', []) or []
-        good = []
         for m in markets:
             if m.get('closed') is True: continue
             if m.get('acceptingOrders') is False: continue
-            mslug = m.get('slug', '')
-            mq = m.get('question', '')
-            if not mslug: continue
-            over, liq = market_liq(m)
-            if liq < min_liq: continue
-            good.append({'slug': mslug, 'question': mq, 'over': over, 'liq': liq})
+            all_markets.append(m)
+    print('[*] ' + str(len(all_markets)) + ' markets (parallel x' + str(workers) + ')')
+    rmap = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {ex.submit(market_task, m): m for m in all_markets}
+        done = 0
+        for fut in concurrent.futures.as_completed(futures):
+            done += 1
+            if done % 20 == 0:
+                print('    ' + str(done) + ' / ' + str(len(futures)))
+            try:
+                r = fut.result()
+            except Exception:
+                r = None
+            if r is None: continue
+            if r['liq'] < min_liq: continue
+            rmap[r['slug']] = r
+    out = []
+    for tup in pass_list:
+        ev, slug, title, sport, low = tup
+        markets = ev.get('markets', []) or []
+        good = []
+        for m in markets:
+            ms = m.get('slug', '')
+            if ms in rmap:
+                good.append(rmap[ms])
         if not good: continue
         good.sort(key=lambda x: x['over'])
         start_time = ev.get('startTime', '') or ev.get('eventStartTime', '') or ''
         out.append({'event_slug': slug, 'sport': sport, 'title': title, 'start': start_time, 'low': low, 'streamer': is_streamer(slug, title), 'markets': good})
     return out
-
 def show_menu(items, fetched_at):
     print()
     print('=' * 105)
@@ -136,13 +167,14 @@ def main():
     ap.add_argument('--only-low', action='store_true')
     ap.add_argument('--min-liq', type=float, default=20)
     ap.add_argument('--refresh', type=int, default=0)
+    ap.add_argument('--workers', type=int, default=20)
     args = ap.parse_args()
     last_fetch = 0
     items = []
     while True:
         if time.time() - last_fetch >= args.refresh or last_fetch == 0:
             print('[*] fetching live events...')
-            items = collect_events(args.sport, args.only_low, args.min_liq)
+            items = collect_events(args.sport, args.only_low, args.min_liq, args.workers)
             last_fetch = time.time()
             fetched_at = time.strftime('%H:%M:%S')
         else:
