@@ -6,6 +6,7 @@ import os
 import sys
 import time
 import requests
+from clob_utils import batch_books, walk_avg, depth_liquidity, local_is_live
 
 if sys.platform == "win32":
 	os.system("")
@@ -106,29 +107,23 @@ def req_retry(url, params=None, tries=2):
 	return None
 
 def fetch_live_events():
-	params = {"active": "true", "closed": "false", "limit": 200, "live": "true"}
-	r = req_retry(GAMMA + "/events", params=params)
-	if not r:
-		return []
-	try:
-		return r.json()
-	except Exception:
-		return []
-
+    params = {'tag_id': 100639, 'live': 'true', 'active': 'true', 'closed': 'false', 'limit': 200}
+    r = req_retry(GAMMA + '/events', params=params)
+    if not r:
+        return []
+    try:
+        return r.json()
+    except Exception:
+        return []
 def best_ask(tid):
-	r = req_retry(CLOB + "/book", params={"token_id": tid})
-	if not r:
-		return None
-	try:
-		book = r.json()
-	except Exception:
-		return None
-	asks = book.get("asks") or []
-	if not asks:
-		return (0.0, 0.0)
-	b = min(asks, key=lambda x: float(x["price"]))
-	return (float(b["price"]), float(b["size"]))
-
+    b = batch_books([tid], ttl=10.0).get(tid)
+    if not b:
+        return None
+    asks = b.get('asks') or []
+    if not asks:
+        return (0.0, 0.0)
+    p, s = asks[0]
+    return (p, s)
 def market_summary(m):
 	try:
 		tokens = json.loads(m.get("clobTokenIds", "[]"))

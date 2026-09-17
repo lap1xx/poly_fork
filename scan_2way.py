@@ -8,6 +8,7 @@ import sys
 import time
 from datetime import datetime, timezone, timedelta
 import requests
+from clob_utils import batch_books, walk_avg, depth_liquidity
 
 COLON = chr(58)
 SLASH = chr(47)
@@ -171,26 +172,14 @@ def fetch_all(max_markets):
 	return all_m
 
 def best_ask(tid):
-	now = time.time()
-	if tid in CACHE:
-		ts, a, s = CACHE[tid]
-		if now - ts < CACHE_TTL:
-			return (a, s)
-	r = req_retry(CLOB + "/book", params={"token_id": tid}, tries=2)
-	if not r:
-		return None
-	try:
-		book = r.json()
-	except Exception:
-		return None
-	asks = book.get("asks") or []
-	res = (0.0, 0.0)
-	if asks:
-		b = min(asks, key=lambda x: float(x["price"]))
-		res = (float(b["price"]), float(b["size"]))
-	CACHE[tid] = (now, res[0], res[1])
-	return res
-
+    b = batch_books([tid], ttl=10.0).get(tid)
+    if not b:
+        return None
+    asks = b.get('asks') or []
+    if not asks:
+        return (0.0, 0.0)
+    p, s = asks[0]
+    return (p, s)
 def analyze(m, min_notional):
 	try:
 		outcomes = json.loads(m["outcomes"])

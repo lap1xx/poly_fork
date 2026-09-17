@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # bot_live.py v4 - no stale score, live-refresh
 import argparse, concurrent.futures, json, os, subprocess, sys, time, requests
+from clob_utils import batch_books, walk_avg, depth_liquidity, local_is_live
 if sys.platform == 'win32': os.system('')
 
 PY = sys.executable
@@ -53,13 +54,14 @@ def req(url, params=None):
         return None
 
 def best_ask(tid):
-    d = req(CLOB + '/book', params={'token_id': tid})
-    if not d: return None
-    asks = d.get('asks') or []
-    if not asks: return (0.0, 0.0)
-    b = min(asks, key=lambda x: float(x['price']))
-    return (float(b['price']), float(b['size']))
-
+    b = batch_books([tid], ttl=10.0).get(tid)
+    if not b:
+        return None
+    asks = b.get('asks') or []
+    if not asks:
+        return (0.0, 0.0)
+    p, s = asks[0]
+    return (p, s)
 def market_liq(m):
     try:
         tokens = json.loads(m.get('clobTokenIds', '[]'))
@@ -74,8 +76,7 @@ def market_liq(m):
     return p0 + p1, min(p0 * s0, p1 * s1)
 
 def fetch_live():
-    return req(GAMMA + '/events', params={'active': 'true', 'closed': 'false', 'limit': 200, 'live': 'true'}) or []
-
+    return req(GAMMA + '/events', params={'tag_id': 100639, 'live': 'true', 'active': 'true', 'closed': 'false', 'limit': 200}) or []
 def market_task(m):
     mslug = m.get('slug', '')
     mq = m.get('question', '')
@@ -97,6 +98,19 @@ def collect_events(sport_filter='', only_low=False, min_liq=20, workers=20):
         if only_low and not low: continue
         pass_list.append((ev, slug, title, sport, low))
     print('[*] ' + str(len(pass_list)) + ' events pass pre-filter')
+    all_tokens = []
+    for ev, slug, title, sport, low in pass_list:
+        for m in (ev.get('markets', []) or []):
+            if m.get('closed') is True: continue
+            if m.get('acceptingOrders') is False: continue
+            try:
+                tk = json.loads(m.get('clobTokenIds', '[]'))
+                all_tokens.extend(tk)
+            except Exception:
+                pass
+    print('[*] prefetching ' + str(len(all_tokens)) + ' token books (batch)...')
+    batch_books(all_tokens, ttl=15.0)
+
     all_markets = []
     for tup in pass_list:
         ev, slug, title, sport, low = tup
