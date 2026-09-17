@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# scan_2way.py v9 - parallel + hours + dedup + weights + NEW + cache
+# scan_2way.py v10 - LOW tiers + streamers + extended BK
 import argparse
 import concurrent.futures
 import json
@@ -12,7 +12,7 @@ import requests
 COLON = chr(58)
 SLASH = chr(47)
 DOT = chr(46)
-HT = "http" + chr(115) + COLON + SLASH + SLASH
+HT = "https" + COLON + SLASH + SLASH
 GAMMA = HT + "gamma-api" + DOT + "polymarket" + DOT + "com"
 CLOB = HT + "clob" + DOT + "polymarket" + DOT + "com"
 TIMEOUT = 15.0
@@ -38,17 +38,12 @@ SPORT_WEIGHT = {
 	"FIFA": 0.55, "EAFC": 0.55, "TENNIS": 0.85,
 }
 
-SUFFIXES = [
-	"-game1", "-game2", "-game3", "-game4", "-game5",
-	"-set2", "-set3", "-set4", "-set5", "-first-set-winner",
-	"-set-2-winner", "-set-3-winner",
-]
-INFIXES = [
-	"-total-", "-set-totals-", "-spread-", "-handicap-",
-	"-round-total-", "-round-handicap-", "-game-handicap-",
-	"-set-handicap-", "-completed-match",
-]
+STREAMER_KEYS = ["streamer", "showmatch", "show-match", "show match", "influencer", "charity", "pro-am", "proam", "star-series", "star series", "esforce", "betboom", "winline", "parimatch", "1win", "content-creator", "vs-streamer", "creator", "youtube", "twitch", "kick", "boom-cup", "cyber-battle", "esports-battle", "streamers-battle", "streamers cup", "media-tournament", "media tournament", "blitz-cup", "show-cup", "beast-cup", "showmatch-cup"]
 
+LOW_LEAGUES = ["cct", "esea-open", "esea-intermediate", "esea-advanced", "esea-md", "united21", "nodwin", "elisa", "challenger", "qualifier", "open-qualifier", "closed-qualifier", "european-pro-league", "cis-lan", "academy", "youth", "junior", "reserves", "w15", "w25", "w40", "w60", "w75", "w100", "itf", "m15", "m25", "winline-insight", "winline-star", "beast-cup", "fantasy-cup", "gamers-club", "esports-battle", "cups", "show-cup", "boom-cup", "rising-stars", "talent", "development", "amateur"]
+
+SUFFIXES = ["-game1", "-game2", "-game3", "-game4", "-game5", "-set2", "-set3", "-set4", "-set5", "-first-set-winner", "-set-2-winner", "-set-3-winner"]
+INFIXES = ["-total-", "-set-totals-", "-spread-", "-handicap-", "-round-total-", "-round-handicap-", "-game-handicap-", "-set-handicap-", "-completed-match"]
 
 def load_cfg():
 	try:
@@ -59,14 +54,12 @@ def load_cfg():
 	except Exception:
 		return {}
 
-
 def sport_of(slug):
 	s = slug.lower()
 	for p, n in SPORT_PREFIXES:
 		if s.startswith(p):
 			return n
 	return ""
-
 
 def base_slug(slug):
 	s = slug
@@ -78,8 +71,23 @@ def base_slug(slug):
 			return s.split(inf)[0]
 	return s
 
+def is_streamer(slug, q):
+	s = (slug + " " + q).lower()
+	for k in STREAMER_KEYS:
+		if k in s:
+			return True
+	return False
+
+def is_low_league(slug, q):
+	s = (slug + " " + q).lower()
+	for k in LOW_LEAGUES:
+		if k in s:
+			return True
+	return False
 
 def tier_from_league(m):
+	if is_low_league(m.get("slug", ""), m.get("question", "")):
+		return "LOW"
 	try:
 		em = m.get("eventMetadata") or {}
 		t = int(em.get("leagueTier", 0))
@@ -92,7 +100,6 @@ def tier_from_league(m):
 	if t <= 4:
 		return "MID"
 	return "LOW"
-
 
 def is_future(m):
 	if m.get("ended") is True:
@@ -110,7 +117,6 @@ def is_future(m):
 	except Exception:
 		return True
 
-
 def start_within_hours(m, hours):
 	if hours <= 0:
 		return True
@@ -121,11 +127,9 @@ def start_within_hours(m, hours):
 		s = iso.replace("Z", "+00:00").replace(" ", "T")
 		dt = datetime.fromisoformat(s)
 		now = datetime.now(timezone.utc)
-		delta = dt - now
-		return delta < timedelta(hours=hours)
+		return (dt - now) < timedelta(hours=hours)
 	except Exception:
 		return True
-
 
 def req_retry(url, params=None, tries=3):
 	for a in range(tries):
@@ -141,13 +145,10 @@ def req_retry(url, params=None, tries=3):
 			time.sleep(1 + a)
 	return None
 
-
 def fetch_page(offset, limit):
-	params = {"active": "true", "closed": "false", "limit": limit,
-		"offset": offset, "order": "volume24hr", "ascending": "false"}
+	params = {"active": "true", "closed": "false", "limit": limit, "offset": offset, "order": "volume24hr", "ascending": "false"}
 	r = req_retry(GAMMA + "/markets", params=params)
 	return r.json() if r else []
-
 
 def fetch_all(max_markets):
 	all_m = []
@@ -172,7 +173,6 @@ def fetch_all(max_markets):
 		time.sleep(0.4)
 	return all_m
 
-
 def best_ask(tid):
 	now = time.time()
 	if tid in CACHE:
@@ -187,14 +187,12 @@ def best_ask(tid):
 	except Exception:
 		return None
 	asks = book.get("asks") or []
-	if not asks:
-		res = (0.0, 0.0)
-	else:
+	res = (0.0, 0.0)
+	if asks:
 		b = min(asks, key=lambda x: float(x["price"]))
 		res = (float(b["price"]), float(b["size"]))
 	CACHE[tid] = (now, res[0], res[1])
 	return res
-
 
 def analyze(m, min_notional):
 	try:
@@ -222,20 +220,7 @@ def analyze(m, min_notional):
 	k1 = 1.0 / asks[1]
 	if k0 > 7.0 or k1 > 7.0 or k0 < 1.15 or k1 < 1.15:
 		return "extreme_odds"
-	return {
-		"slug": m["slug"],
-		"q": m.get("question", ""),
-		"o": outcomes,
-		"asks": asks,
-		"sizes": sizes,
-		"notional": [n0, n1],
-		"over": sum(asks),
-		"vol": float(m.get("volume24hr") or 0),
-		"end": m.get("endDate", ""),
-		"start": m.get("eventStartTime", "") or m.get("gameStartTime", ""),
-		"league": (m.get("eventMetadata") or {}).get("league", ""),
-	}
-
+	return {"slug": m["slug"], "q": m.get("question", ""), "o": outcomes, "asks": asks, "sizes": sizes, "notional": [n0, n1], "over": sum(asks), "vol": float(m.get("volume24hr") or 0), "end": m.get("endDate", ""), "start": m.get("eventStartTime", "") or m.get("gameStartTime", ""), "league": (m.get("eventMetadata") or {}).get("league", "")}
 
 def load_prev():
 	try:
@@ -246,7 +231,6 @@ def load_prev():
 	except Exception:
 		return set()
 
-
 def save_prev(base_slugs):
 	try:
 		f = open(PREV_FILE, "w", encoding="utf-8")
@@ -254,16 +238,6 @@ def save_prev(base_slugs):
 		f.close()
 	except Exception:
 		pass
-
-
-
-def is_streamer(slug, question):
-	s = (slug + " " + question).lower()
-	keys = ["streamer", "showmatch", "show-match", "influencer", "charity", "pro-am", "proam", "star-series", "star series", "esforce"]
-	for k in keys:
-		if k in s:
-			return True
-	return False
 
 def main():
 	ap = argparse.ArgumentParser(prog="scan_2way")
@@ -274,6 +248,7 @@ def main():
 	ap.add_argument("--max-overround", type=float, default=1.08)
 	ap.add_argument("--sport", default="")
 	ap.add_argument("--tier", default="")
+	ap.add_argument("--only-low", action="store_true")
 	ap.add_argument("--hours", type=float, default=0.0)
 	ap.add_argument("--workers", type=int, default=10)
 	args = ap.parse_args()
@@ -289,7 +264,7 @@ def main():
 	tier = args.tier or sc.get("tier", "")
 	hours = args.hours
 
-	print("[*] top=" + str(top) + " show=" + str(show) + " hours=" + str(hours) + " workers=" + str(args.workers))
+	print("[*] top=" + str(top) + " show=" + str(show) + " hours=" + str(hours) + " only_low=" + str(args.only_low))
 	print("[*] fetching " + str(top) + " markets...")
 	markets = fetch_all(top)
 	print("[*] got " + str(len(markets)) + " raw markets")
@@ -332,7 +307,7 @@ def main():
 			m = futures[fut]
 			try:
 				r = fut.result()
-			except Exception as e:
+			except Exception:
 				r = "api"
 			if isinstance(r, str):
 				reasons[r] = reasons.get(r, 0) + 1
@@ -341,6 +316,7 @@ def main():
 				r["tier"] = tier_from_league(m)
 				r["weight"] = SPORT_WEIGHT.get(r["sport"], 0.5)
 				r["score"] = r["over"] / r["weight"]
+				r["streamer"] = is_streamer(r["slug"], r["q"])
 				results.append(r)
 			if done % 20 == 0:
 				print("    done " + str(done) + " / " + str(len(filtered)))
@@ -353,6 +329,8 @@ def main():
 		results = [r for r in results if r["sport"].upper() == sport.upper()]
 	if tier:
 		results = [r for r in results if r["tier"].upper() == tier.upper()]
+	if args.only_low:
+		results = [r for r in results if r["tier"].upper() == "LOW"]
 
 	prev = load_prev()
 	new_slugs = set()
@@ -369,17 +347,18 @@ def main():
 	print()
 	print("=" * 115)
 	print("Top " + str(show) + " - over<=" + str(max_over) + " notional>=USD" + str(int(min_notional)) + " hours<=" + str(hours))
-	print()
+	print("=" * 115)
+
 	for i, r in enumerate(good[:show], 1):
+		print()
 		marker = " [NEW] " if r.get("is_new") else "       "
+		streamer_tag = " [STREAMER]" if r.get("streamer") else ""
 		badge = "[" + r["sport"].ljust(8) + "/" + r["tier"].ljust(3) + "]"
-		print("#" + str(i).ljust(3) + marker + badge + " over=" + format(r["over"], ".4f") + " score=" + format(r["score"], ".4f") + " vol=" + format(r["vol"], ",.0f"))
-		streamer_tag = " [STREAMER]" if is_streamer(r["slug"], r["q"]) else ""
-		print("     " + r["q"][:95] + streamer_tag)
+		print("#" + str(i).ljust(3) + marker + badge + " over=" + format(r["over"], ".4f") + " score=" + format(r["score"], ".4f") + " vol=" + format(r["vol"], ",.0f") + streamer_tag)
+		print("     " + r["q"][:95])
 		print("     start: " + r["start"] + "   slug: " + r["slug"])
 		for oc, a, s, n in zip(r["o"], r["asks"], r["sizes"], r["notional"]):
 			print("       " + oc[:28].ljust(28) + " ask=" + format(a, ".3f") + "  k=" + format(1.0/a, ".2f") + "  USDliq=" + format(n, ",.0f"))
-	print()
 
 	print()
 	print("[+] analyzed " + str(len(results)) + ", within: " + str(len(good)) + ", new: " + str(len(new_slugs)))

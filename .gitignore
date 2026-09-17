@@ -22,3 +22,6 @@ miniapp/dist/
 bc_odds.json
 watch_slugs.json
 server/__pycache__/
+
+bk_profiles.json
+arbs.csv
