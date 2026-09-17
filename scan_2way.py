@@ -25,9 +25,6 @@ CACHE_TTL = 10.0
 
 SPORT_PREFIXES = [
 	("cs2-", "CS2"), ("dota2-", "DOTA2"), ("lol-", "LOL"), ("valorant-", "VALORANT"),
-	("r6-", "R6"), ("rl-", "ROCKET"), ("cod-", "COD"), ("pubg-", "PUBG"),
-	("apex-", "APEX"), ("ow-", "OW"), ("sc2-", "SC2"), ("mlbb-", "MLBB"),
-	("fifa-", "FIFA"), ("fc-", "EAFC"),
 	("atp-", "TENNIS"), ("wta-", "TENNIS"), ("itf-", "TENNIS"),
 ]
 

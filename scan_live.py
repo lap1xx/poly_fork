@@ -35,8 +35,6 @@ SPORTS = [
 	("dota2-", "DOTA2"),
 	("lol-", "LOL"),
 	("valorant-", "VALORANT"),
-	("r6-", "R6"),
-	("rl-", "ROCKET"),
 	("atp-", "TENNIS"),
 	("wta-", "TENNIS"),
 	("itf-", "TENNIS"),
