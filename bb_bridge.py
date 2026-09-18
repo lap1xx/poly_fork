@@ -805,19 +805,24 @@ BB_ENABLED = True          # polyarb проверяет эту констант�
 _BB_ERR = None             # текст ошибки, если стрим не поднялся
 
 
-def wait_ready(timeout=60, min_matches=25, poll=0.5):
-    """Ждёт, пока BBStream накопит min_matches матчей или timeout сек."""
+def wait_ready(timeout=120, min_matches=10, poll=0.5):
     s = get_global_stream()
     if s is None:
         return False
     t0 = time.time()
+    last_log = 0
     while time.time() - t0 < timeout:
         try:
             n = len(s.matches)
         except Exception:
             n = 0
         if n >= min_matches:
+            print(f"    [wait_ready] накопил {n} матчей за {int(time.time()-t0)}с")
             return True
+        now = time.time()
+        if now - last_log >= 5:
+            print(f"    [wait_ready] {n} матчей… (нужно {min_matches})")
+            last_log = now
         time.sleep(poll)
     return False
 
