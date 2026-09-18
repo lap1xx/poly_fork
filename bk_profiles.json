@@ -1,0 +1,20 @@
+{
+  "BetBoom": {
+    "comm": 0.0,
+    "min_bet": 50,
+    "update_seconds": 1,
+    "active": true
+  },
+  "Winline": {
+    "comm": 0.0,
+    "min_bet": 100,
+    "update_seconds": 2,
+    "active": true
+  },
+  "PARI": {
+    "comm": 0.0,
+    "min_bet": 100,
+    "update_seconds": 4,
+    "active": true
+  }
+}

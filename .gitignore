@@ -1,27 +1,35 @@
+# temp
 __pycache__/
 *.pyc
 *.pyo
-*.pyd
 
-arbs.db
-arbs.db-journal
-config.json
-config.example.json
-2way_prev.json
-
-2way_candidates.txt
-run_bot.bat
-launchers/
-
-.env
-*.log
-
-# Mini App / local API
-miniapp/node_modules/
-miniapp/dist/
-bc_odds.json
-watch_slugs.json
-server/__pycache__/
-
-bk_profiles.json
+# data & output
+*.db
+*.db-journal
 arbs.csv
+arbs.jsonl
+cyber.db
+
+# protocol dumps (large, not for git)
+vendor.txt
+*.bin
+
+# local secrets (if any)
+config.json# temp
+__pycache__/
+*.pyc
+*.pyo
+
+# data & output
+*.db
+*.db-journal
+arbs.csv
+arbs.jsonl
+cyber.db
+
+# protocol dumps (large, not for git)
+vendor.txt
+*.bin
+
+# local secrets (if any)
+config.json
