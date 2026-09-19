@@ -32,4 +32,11 @@ vendor.txt
 *.bin
 
 # local secrets (if any)
-config.json
+config.jsonlegacy/ 
+*.db 
+*.csv 
+*.jsonl 
+__pycache__/ 
+*.pyc 
+ip/ 
+vendor.txt 

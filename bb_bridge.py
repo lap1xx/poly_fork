@@ -1,5 +1,6 @@
-#!/usr/bin/env python3
-"""bb_bridge.py — BetBoom tree_ws ↔ POLY-ARB."""
+# bb_bridge.py - BetBoom tree_ws <-> POLY-ARB bridge. v6.
+# v6: _winner_side определяет исход по URL если display_name/name пустые.
+# v5: parse_stake всегда проставляет st["map_num"]; универсальный walker для f29/f30/f17.
 from __future__ import annotations
 import json, re, struct, threading, time, uuid
 from datetime import datetime, timezone
@@ -24,35 +25,55 @@ _PM_TOTAL_RE = re.compile(r"-(?:total|match-total|total-games|total-maps)-(\d+)p
 _PM_HANDICAP_RE = re.compile(r"-(?:game-handicap|map-handicap|handicap|spread)-(-?\d+)pt(\d+)", re.I)
 _PM_GAME_RE = re.compile(r"-(?:game|map)(\d)(?:-|$)", re.I)
 _STOPWORDS = {"over", "under", "yes", "no", "o", "u", "1", "2"}
+
 _ODDIN_MAP_RE       = re.compile(r"[?&]map=(\d+)")
 _ODDIN_ROUND_RE     = re.compile(r"[?&]round=(\d+)")
 _ODDIN_HANDICAP_RE  = re.compile(r"[?&]handicap=(-?\d+(?:\.\d+)?)")
 _ODDIN_THRESHOLD_RE = re.compile(r"[?&]threshold=(-?\d+(?:\.\d+)?)")
 _MAP_NUM_IN_PERIOD  = re.compile(r"(\d+)")
 _MAP_SLUG_RE        = re.compile(r"map-(\d+)", re.I)
+_MAP_NUM_IN_MARKET  = re.compile(r"(?:\bmap[\s\-]+(\d+)\b)|(?:\b(\d+)[\s\-]+map\b)", re.I)
+_COMPOSITE_MAP_RE   = re.compile(r"map[-_](\d+)", re.I)
+
+_URL_OUTCOME_HOME = {"1", "4", "70", "74", "1714", "2047", "882", "884", "886", "888", "890", "892"}
+_URL_OUTCOME_AWAY = {"2", "5", "72", "76", "1715", "2048", "883", "885", "887", "889", "891", "893"}
 
 def _stake_map_num(st):
-    """Номер карты из URL (f1) → period_name (f18) → market_slug (f22)."""
     url = st.get("url") or ""
     m = _ODDIN_MAP_RE.search(url)
     if m:
         try: return int(m.group(1))
         except Exception: pass
+
     pn = st.get("period_name") or st.get("period_name_alt") or ""
-    if "карт" in pn.lower() or "map" in pn.lower():
+    low = pn.lower()
+    if "карт" in low or "map" in low:
         m = _MAP_NUM_IN_PERIOD.search(pn)
         if m:
             try: return int(m.group(1))
             except Exception: pass
+
+    mn = st.get("market_name") or ""
+    m = _MAP_NUM_IN_MARKET.search(mn)
+    if m:
+        try: return int(m.group(1) or m.group(2))
+        except Exception: pass
+
+    cid = st.get("composite_id") or ""
+    m = _COMPOSITE_MAP_RE.search(cid)
+    if m:
+        try: return int(m.group(1))
+        except Exception: pass
+
     slug = st.get("market_slug") or ""
     m = _MAP_SLUG_RE.search(slug)
     if m:
         try: return int(m.group(1))
         except Exception: pass
+
     return None
 
 def _stake_line(st):
-    """Линия: f9, иначе из URL (handicap=/threshold=)."""
     if st.get("line") is not None:
         return st["line"]
     url = st.get("url") or ""
@@ -240,7 +261,7 @@ def parse_stake(raw):
             if fn == 1:
                 ss = try_str(v)
                 if ss:
-                    st["stake_id"] = ss      # в HAR f1 = URL с map=N
+                    st["stake_id"] = ss
                     st["url"]      = ss
             elif fn == 5:
                 ss = try_str(v)
@@ -256,21 +277,23 @@ def parse_stake(raw):
                 if ss: st["market_view"] = ss
             elif fn == 18:
                 ss = try_str(v)
-                if ss: st["period_name"] = ss          # "Карта 2" / "Матч"
+                if ss: st["f18"] = ss
             elif fn == 20:
                 ss = try_str(v)
-                if ss:
-                    st["period_name_alt"] = ss
-                    st.setdefault("period_name", ss)
+                if ss: st["period_name"] = ss
             elif fn == 22:
                 ss = try_str(v)
-                if ss: st["market_slug"] = ss          # "map-2"
+                if ss: st["market_slug"] = ss
             elif fn == 24:
                 ss = try_str(v)
                 if ss: st["composite_id"] = ss
             elif fn == 25:
                 ss = try_str(v)
                 if ss: st["display_name"] = ss
+
+    if "period_name" not in st and "f18" in st:
+        st["period_name"] = st["f18"]
+    st["map_num"] = _stake_map_num(st)
     return st
 
 def parse_f29(payload):
@@ -285,6 +308,46 @@ def parse_f29(payload):
                 st = parse_stake(v2)
                 if "factor" in st: stakes.append(st)
     return match, stakes
+
+def _try_extract_match_stakes(buf):
+    match = None
+    stakes = []
+    try:
+        for fn, wt, v in pf(buf):
+            if wt != 2:
+                continue
+            if fn == 1:
+                m = parse_match(v)
+                if m.get("match_id") and m.get("sr_match"):
+                    match = m
+            elif fn == 2:
+                st = parse_stake(v)
+                if st.get("factor") is not None and st.get("url"):
+                    stakes.append(st)
+    except Exception:
+        return None, []
+    if match and stakes:
+        return match, stakes
+    return None, []
+
+def _walk_find_match_and_stakes(buf, depth=0, max_depth=15):
+    if depth > max_depth or not buf:
+        return None, []
+    m, sts = _try_extract_match_stakes(buf)
+    if m:
+        return m, sts
+    try:
+        for fn, wt, v in pf(buf):
+            if wt != 2:
+                continue
+            if len(v) < 8:
+                continue
+            m, sts = _walk_find_match_and_stakes(v, depth + 1, max_depth)
+            if m:
+                return m, sts
+    except Exception:
+        pass
+    return None, []
 
 def _parse_iso(s):
     if not s: return None
@@ -374,9 +437,6 @@ _PM_UNSUPPORTED = (
 
 def pm_market_kind(slug):
     s = (slug or "").lower()
-
-    # Только чистый Match Winner поддерживаем как "winner"
-    # Все остальные рынки либо отдельным kind, либо unsupported
     m = _PM_GAME_RE.search(s)
     if m:
         try: n = int(m.group(1))
@@ -384,7 +444,6 @@ def pm_market_kind(slug):
         return ("map_winner", n, None)
     if any(kw in s for kw in _PM_UNSUPPORTED):
         return ("unsupported", None, None)
-
     m = _PM_TOTAL_RE.search(s)
     if m:
         try: arg = float(f"{m.group(1)}.{m.group(2)}")
@@ -407,7 +466,6 @@ def _arg_from_display(name):
 def _is_winner_stake(st):
     mn = (st.get("market_name") or "").lower()
     pn = (st.get("period_name") or "").lower()
-    # Match-level only — отсекаем Map/Card/Set/Game
     if any(k in mn for k in ("map", "карт", "set", "game", "game ")):
         return False
     if any(ch.isdigit() for ch in mn):
@@ -427,35 +485,32 @@ def _is_handicap_stake(st):
     return "handicap" in mn or "фора" in mn
 
 def _is_map_winner_stake(st):
-    """Победитель карты N: map=N в URL, БЕЗ handicap/threshold/round."""
     url = (st.get("url") or "").lower()
     mn  = (st.get("market_name") or "").lower()
-    n = _stake_map_num(st)
+    n = st.get("map_num") or _stake_map_num(st)
     if not n:
         return False
     if "handicap=" in url or "threshold=" in url or "round=" in url:
         return False
+    if any(k in mn for k in ("handicap", "фора", "total", "тотал",
+                             "round", "раунд", "kills", "kills ")):
+        return False
+    if " / " in mn or "(threeway)" in mn or "threeway" in mn:
+        return False
     if any(k in mn for k in ("победа на карте", "победитель карты",
                              "map winner", "победит в карте")):
         return True
-    # Fallback: URL вида ".../3189200/1/1?variant=way:two" — это Match Winner.
-    # URL вида ".../3189200/12/1?map=N" — тоже winner, но с явным map=N.
-    if "?map=" in url and url.split("?", 1)[1].strip() in (
-        f"map={n}", f"map={n}&", "map=1", "map=2", "map=3"
-    ):
+    if "?map=" in url:
         return True
-    # Если period = "Карта N" и market_name ровно "Исход"/"Winner"/"1x2"
     pn = (st.get("period_name") or "").lower()
-    if f"карта {n}" in pn and any(
-        k in mn for k in ("исход", "winner", "1x2")
-    ):
+    if f"карта {n}" in pn and any(k in mn for k in ("исход", "winner", "1x2")):
         return True
     return False
 
 def _is_map_total_stake(st, map_num=None):
     url = (st.get("url") or "").lower()
     mn  = (st.get("market_name") or "").lower()
-    n = _stake_map_num(st)
+    n = st.get("map_num") or _stake_map_num(st)
     if n is None: return False
     if map_num is not None and n != map_num: return False
     if "map=" in url and ("threshold=" in url or "handicap=" in url):
@@ -468,7 +523,7 @@ def _is_map_total_stake(st, map_num=None):
 def _is_map_handicap_stake(st, map_num=None):
     url = (st.get("url") or "").lower()
     mn  = (st.get("market_name") or "").lower()
-    n = _stake_map_num(st)
+    n = st.get("map_num") or _stake_map_num(st)
     if n is None: return False
     if map_num is not None and n != map_num: return False
     if "map=" in url and "handicap=" in url:
@@ -479,13 +534,25 @@ def _is_map_handicap_stake(st, map_num=None):
     return False
 
 def _winner_side(st):
-    dn = (st.get("display_name") or "").lower()
-    nm = (st.get("name") or "").lower()
-    for v in (dn, nm):
-        if v in ("win1", "п1"):
+    for key in ("display_name", "name", "short_name"):
+        v = (st.get(key) or "").strip().lower()
+        if not v:
+            continue
+        if v in ("win1", "п1", "1", "t1", "home", "w1"):
             return "home"
-        if v in ("win2", "п2"):
+        if v in ("win2", "п2", "2", "t2", "away", "w2"):
             return "away"
+
+    url = (st.get("url") or "")
+    path = url.split("?", 1)[0]
+    parts = re.findall(r"/([0-9]+)", path)
+    if parts:
+        oid = parts[-1]
+        if oid in _URL_OUTCOME_HOME:
+            return "home"
+        if oid in _URL_OUTCOME_AWAY:
+            return "away"
+
     return None
 
 def _extract_winner(stakes, teams=None):
@@ -526,7 +593,6 @@ def _extract_winner(stakes, teams=None):
     return None
 
 def _extract_map_winner(stakes, map_num):
-    """{'home': stake, 'away': stake} для карты map_num, либо None."""
     if not map_num:
         return None
     home = away = None
@@ -535,13 +601,26 @@ def _extract_map_winner(stakes, map_num):
             continue
         if not _is_map_winner_stake(st):
             continue
-        if _stake_map_num(st) != map_num:
+        if (st.get("map_num") or _stake_map_num(st)) != map_num:
             continue
         side = _winner_side(st)
         if side == "home" and home is None:
             home = st
         elif side == "away" and away is None:
             away = st
+    if home is None or away is None:
+        cands = [st for st in stakes
+                 if st.get("is_active", True)
+                 and _is_map_winner_stake(st)
+                 and (st.get("map_num") or _stake_map_num(st)) == map_num]
+        if len(cands) >= 2 and home is None and away is None:
+            home, away = cands[0], cands[1]
+        elif len(cands) >= 2:
+            if home is None:
+                home = next((c for c in cands if c is not away), None)
+            elif away is None:
+                away = next((c for c in cands if c is not home), None)
+
     if home and away:
         return {"home": home, "away": away}
     return None
@@ -586,10 +665,11 @@ class BBStream:
         self.bindings = {}
         self._stop = threading.Event()
         self._threads = []
+        self._f16_subs = set() # v7: чтобы не дублировать f16
 
     def start(self):
         if websocket is None:
-            self.log("[BB] websocket-client not installed — skip")
+            self.log("[BB] websocket-client not installed - skip")
             return
         for domain, sid, label in self.subs:
             t = threading.Thread(target=self._run_loop, args=(domain, sid, label), daemon=True)
@@ -639,8 +719,17 @@ class BBStream:
                 try: r = ws.recv()
                 except Exception: r = None
                 if not r or isinstance(r, str): continue
-                if top_field(r) != 29: continue
-                self._handle_f29(bytes(r), label)
+                fn = top_field(r)
+                if fn == 29:
+                    self._handle_f29(bytes(r), label)
+                elif fn == 30:
+                    self._handle_f30(bytes(r), label)
+                elif fn == 31:
+                    self._handle_f31(bytes(r), label)
+                elif fn == 17:
+                    self._handle_f17(bytes(r), label)
+                elif fn is not None:
+                    self.log(f"[BB {label}] field f{fn} len={len(r)}")
         finally:
             with self.lock:
                 self._ws_by_label.pop(label, None)
@@ -649,9 +738,53 @@ class BBStream:
 
     def _handle_f29(self, raw, label):
         pl = top_payload(raw)
-        if not pl: return
-        try: match, stakes = parse_f29(pl)
-        except Exception: return
+        if not pl:
+            return
+        try:
+            match, stakes = parse_f29(pl)
+        except Exception:
+            return
+        self._store_f29_result(match, stakes, label)
+
+    def _handle_f30(self, raw, label):
+        pl = top_payload(raw)
+        if not pl:
+            return
+        try:
+            match, stakes = _walk_find_match_and_stakes(pl)
+        except Exception as e:
+            self.log(f"[BB {label}] F30 parse error: {e}")
+            return
+        self.log(f"[BB {label}] F30: match={match.get('match_id') if match else None}, "
+                 f"stakes={len(stakes)}")
+        self._store_f29_result(match, stakes, label)
+
+    def _handle_f17(self, raw, label):
+        pl = top_payload(raw)
+        if not pl:
+            return
+        try:
+            match, stakes = _walk_find_match_and_stakes(pl)
+        except Exception as e:
+            self.log(f"[BB {label}] F17 parse error: {e}")
+            return
+        if match or stakes:
+            self.log(f"[BB {label}] F17: match={match.get('match_id') if match else None}, "
+                     f"stakes={len(stakes)}, pl={len(pl)}")
+            if match or stakes:
+                self._store_f29_result(match, stakes, label)
+
+    def _handle_f31(self, raw, label):
+        pl = top_payload(raw)
+        if not pl:
+            return
+        try:
+            match, stakes = parse_f29(pl)
+        except Exception:
+            return
+        self._store_f29_result(match, stakes, label)
+
+    def _store_f29_result(self, match, stakes, label):
         now = time.time()
         with self.lock:
             if match and "match_id" in match:
@@ -659,10 +792,13 @@ class BBStream:
                 match["_ts"] = now
                 self.matches[match["match_id"]] = match
             if stakes:
+                fallback_mid = match.get("match_id") if match else None
                 by_mid = {}
                 for st in stakes:
-                    mid = st.get("match_id")
-                    if mid: by_mid.setdefault(mid, []).append(st)
+                    mid = st.get("match_id") or fallback_mid
+                    if mid:
+                        st["match_id"] = mid
+                        by_mid.setdefault(mid, []).append(st)
                 for mid, lst in by_mid.items():
                     bucket = self.stakes.setdefault(mid, {})
                     for st in lst:
@@ -670,12 +806,11 @@ class BBStream:
                         if sid:
                             st["_ts"] = now
                             bucket[sid] = st
+
     def subscribe_f16(self, match_id):
-        """f16 matches_subscribe_full(site_match_id) → сервер шлёт полный матч
-        со всеми стейками, включая карточные."""
         uid  = uuid.uuid4().hex[:6]
         uid2 = uuid.uuid4().hex[:6]
-        inner = s(1, uid2) + enum(2, LIVE) + i64(3, match_id)
+        inner = s(1, uid2) + i64(2, match_id)
         payload = msg(16, s(1, uid) + msg(2, inner))
         with self.lock:
             ws_list = list(self._ws_by_label.values())
@@ -717,7 +852,14 @@ class BBStream:
             "map": mapping, "score": score, "bound_at": time.time(),
         }
         with self.lock:
-            self.bindings[slug] = binding
+            self.bindings[slug] = binding # v7: запросить полный матч (f30/f17), чтобы получить карточные стейки
+        if kind == "map_winner" and bb["match_id"] not in self._f16_subs:
+            self._f16_subs.add(bb["match_id"])
+            try:
+                self.subscribe_f16(bb["match_id"])
+                self.log(f"[BB] subscribed f16 {bb['match_id']} ({slug})")
+            except Exception as e:
+                self.log(f"[BB] f16 failed {bb['match_id']}: {e}")
         return binding
 
     def live_bc(self, slug):
@@ -789,21 +931,11 @@ def wait_ready(timeout=10.0):
         time.sleep(0.3)
     return False
 
-def bind_slug(slug, pm_market):
-    st = get_global_stream()
-    return st.bind(slug, pm_market)
-
 def subscribe_match_full(match_id):
-    """Запросить у BB полный набор стейков (включая карточные) для матча."""
     get_global_stream().subscribe_f16(match_id)
 
-# ============================================================
-# Module-level API для polyarb_v3.py
-# ============================================================
-
-BB_ENABLED = True          # polyarb проверяет эту константу
-_BB_ERR = None             # текст ошибки, если стрим не поднялся
-
+BB_ENABLED = True
+_BB_ERR = None
 
 def wait_ready(timeout=120, min_matches=10, poll=0.5):
     s = get_global_stream()
@@ -821,14 +953,12 @@ def wait_ready(timeout=120, min_matches=10, poll=0.5):
             return True
         now = time.time()
         if now - last_log >= 5:
-            print(f"    [wait_ready] {n} матчей… (нужно {min_matches})")
+            print(f"    [wait_ready] {n} матчей... (нужно {min_matches})")
             last_log = now
         time.sleep(poll)
     return False
 
-
 def bind_slug(slug, market):
-    """Обёртка над BBStream.bind(slug, market). None если не сматчилось."""
     s = get_global_stream()
     if s is None:
         return None
@@ -837,26 +967,19 @@ def bind_slug(slug, market):
     except Exception:
         return None
 
-
 def get_live_bc(slug):
-    """Обёртка над BBStream.live_bc(slug, binding). None если нет binding."""
     s = get_global_stream()
     if s is None:
         return None
     try:
-        b = s.bindings.get(slug)
+        if slug not in s.bindings:
+            return None
     except Exception:
-        b = None
-    if b is None:
         return None
     try:
-        return s.live_bc(slug, b)
+        return s.live_bc(slug)
     except Exception:
         return None
-
-def get_live_bc(slug):
-    st = get_global_stream()
-    return st.live_bc(slug)
 
 def stop_global_stream():
     global _GLOBAL

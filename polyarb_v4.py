@@ -610,28 +610,82 @@ def _is_live_by_time(iso):
         return False
 
 def fetch_live_pm_slugs():
-    """Все live slug'и PM (tag 100639 = sports live)."""
-    try:
-        r = requests.get(
-            GAMMA + "/events",
-            params={"tag_id": 100639, "live": "true",
-                    "active": "true", "closed": "false", "limit": 200},
-            timeout=TIMEOUT,
-        )
-        r.raise_for_status()
-        events = r.json()
-    except Exception:
-        return []
-    out = []
-    for ev in events:
-        for m in (ev.get("markets") or []):
-            if m.get("closed") is True:
+    """Все live slug'и PM (по tag_slug'ам esports/tennis)."""
+    tags = ["esports", "cs2", "dota-2", "league-of-legends",
+            "valorant", "tennis", "atp"]
+    out = set()
+    for tg in tags:
+        try:
+            r = requests.get(
+                GAMMA + "/events",
+                params={"tag_slug": tg, "limit": 200,
+                        "active": "true", "closed": "false"},
+                timeout=TIMEOUT,
+            )
+            r.raise_for_status()
+            events = r.json()
+        except Exception:
+            continue
+        for ev in events:
+            for m in (ev.get("markets") or []):
+                if m.get("closed") is True:
+                    continue
+                if m.get("acceptingOrders") is False:
+                    continue
+                s = m.get("slug")
+                if s:
+                    out.add(s)
+    return list(out)
+
+def fetch_live_pm_markets():
+    """Собирает market_map из /events. Фильтр: sport-prefix слаги.
+    v2: пробуем и live=true, и без него — чтобы поймать live CS2/Dota2/LoL."""
+    tags = ["esports", "cs2", "dota-2", "league-of-legends",
+            "valorant", "tennis", "atp"]
+    PREFIXES = ("cs2-", "dota2-", "lol-", "valorant-",
+                "atp-", "wta-", "itf-")
+    out = {}
+    for tg in tags:
+        for live_mode in ("true", None):
+            try:
+                params = {"tag_slug": tg, "limit": 200,
+                          "active": "true", "closed": "false"}
+                if live_mode:
+                    params["live"] = live_mode
+                r = requests.get(
+                    GAMMA + "/events", params=params, timeout=TIMEOUT,
+                )
+                r.raise_for_status()
+                events = r.json()
+            except Exception:
                 continue
-            if m.get("acceptingOrders") is False:
-                continue
-            s = m.get("slug")
-            if s:
-                out.append(s)
+            for ev in events:
+                for mk in (ev.get("markets") or []):
+                    sl = mk.get("slug", "")
+                    if not sl or not sl.startswith(PREFIXES):
+                        continue
+                    if mk.get("closed") is True:
+                        continue
+                    if mk.get("acceptingOrders") is False:
+                        continue
+                    try:
+                        o = json.loads(mk.get("outcomes", "[]"))
+                        t = json.loads(mk.get("clobTokenIds", "[]"))
+                    except Exception:
+                        continue
+                    if len(o) != 2 or len(t) != 2:
+                        continue
+                    start = (mk.get("eventStartTime") or
+                             ev.get("startTime") or "")
+                    out[sl] = {
+                        "slug": sl,
+                        "q": mk.get("question", ""),
+                        "o": o,
+                        "t": t,
+                        "start": start,
+                        "live": bool(mk.get("live", False) or
+                                     _is_live_by_time(start)),
+                    }
     return out
 
 def print_arb(m, bets, r, rate, first_seen, bk):
@@ -791,16 +845,17 @@ def main():
     market_map = {}
     if args.watch:
         print("[*] watch mode: fetching PM live markets...")
-        slugs = fetch_live_pm_slugs()
-        print("[*] got %d live slugs" % len(slugs))
-    print("[*] resolving %d PM markets..." % len(slugs))
-    for s in slugs:
-        m = fetch_market(s)
-        if m:
-            market_map[s] = m
-        else:
-            print("    [!] not found: " + s)
-    print("[*] resolved %d / %d" % (len(market_map), len(slugs)))
+        market_map = fetch_live_pm_markets()
+        print("[*] got %d real match markets" % len(market_map))
+    else:
+        print("[*] resolving %d PM markets..." % len(slugs))
+        for s in slugs:
+            m = fetch_market(s)
+            if m:
+                market_map[s] = m
+            else:
+                print("    [!] not found: " + s)
+        print("[*] resolved %d / %d" % (len(market_map), len(slugs)))
     if not market_map and not args.watch:
         return 1
 
@@ -809,7 +864,7 @@ def main():
     if use_bb:
         print("[*] connecting to BetBoom tree_ws...")
         try:
-            get_global_stream(verbose=True)
+            get_global_stream(verbose=False)
         except Exception as e:
             print("[!] BB stream start failed: %s" % e)
             use_bb = False
@@ -857,6 +912,7 @@ def main():
     first_seen = {}
     last_alert = {}
     last_roi = {}
+    last_sig = {}
     alert_gap = float(args.alert_gap)
     def retry_bind():
         stream = get_global_stream()
@@ -882,15 +938,12 @@ def main():
         while not STOP.is_set():
             # watch: подхват новых PM-маркетов
             if args.watch and time.time() - last_pm_refresh >= args.watch_sec:
-                live_slugs = fetch_live_pm_slugs()
+                fresh = fetch_live_pm_markets()
                 added = 0
-                for s in live_slugs:
-                    if s in market_map:
-                        continue
-                    mm = fetch_market(s)
-                    if mm:
-                        market_map[s] = mm
+                for s, mm in fresh.items():
+                    if s not in market_map:
                         added += 1
+                    market_map[s] = mm
                 if added:
                     print("[*] watch: +%d new markets (total %d)"
                           % (added, len(market_map)))
@@ -917,22 +970,24 @@ def main():
                         continue
 
                     now = time.time()
-                    # dedup-алерты (фикс v40):
-                    #   печатаем если (1) первый раз,
-                    #   (2) ROI вырос >= 0.3 п.п. с прошлого алерта,
-                    #   (3) прошло >= alert_gap секунд с прошлого алерта.
+                    # v41: дедуп по хешу (slug + кэфы обеих ног).
+                    # Алертим только когда кэфы реально поменялись
+                    # ИЛИ ROI вырос >= 0.3 п.п.
+                    sig = (round(float(bets[0]["o"]), 3),
+                           round(float(bets[1]["o"]), 3) if len(bets) > 1 else None)
+                    prev_sig = last_sig.get(slug)
                     prev_roi = last_roi.get(slug)
-                    last_ts = last_alert.get(slug, 0.0)
                     should_alert = False
-                    if prev_roi is None:
+                    if prev_sig is None:
                         should_alert = True
-                    elif roi > prev_roi + 0.003:
+                    elif sig != prev_sig:
                         should_alert = True
-                    elif now - last_ts >= alert_gap:
+                    elif prev_roi is not None and roi > prev_roi + 0.003:
                         should_alert = True
                     if not should_alert:
                         continue
 
+                    last_sig[slug] = sig
                     last_alert[slug] = now
                     last_roi[slug] = roi
                     fs = first_seen.setdefault(slug, now)
