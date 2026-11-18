@@ -7,12 +7,12 @@
   "slip": 0.0,
   "live_min_roi_show": -3.0,
   "secondary_bk": {
-    "enabled": true,
+    "enabled": false,
     "name": "1win",
     "color": "#ff8844"
   },
   "onewin": {
-    "enabled": true
+    "enabled": false
   },
   "bb": {
     "enabled": true

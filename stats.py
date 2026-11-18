@@ -1,32 +1,44 @@
 #!/usr/bin/env python3
-# stats.py - stats for Poly-ARB (reads arbs.jsonl, prints dashboard).
-# v1: 22.09.2026
-#
-# Usage:
-#   python stats.py                       # full report
-#   python stats.py --csv stats.csv       # + export best-per-slug to CSV
-#   python stats.py --since 2026-09-22    # only since date (YYYY-MM-DD)
-#   python stats.py --min-roi 5           # only arbs with roi >= 5%
-#   python stats.py --file arbs.jsonl     # custom input file
-#
-# Reads arbs.jsonl (one JSON per line), produced by polyarb_v4.py log_arb_json().
+"""Statistics for Poly-ARB signal snapshots (not executed trades)."""
 from __future__ import annotations
+
 import argparse
 import collections as C
 import csv
 import json
+import math
 import os
 import statistics as S
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
 except Exception:
     pass
 
+
 def sep(ch="=", n=74):
     return ch * n
+
+
+def _parse_timestamp(value):
+    """Parse ISO timestamps consistently as UTC; naive legacy values are local."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("timestamp is empty")
+    dt = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.astimezone()
+    return dt.astimezone(timezone.utc)
+
+
+def _finite_number(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
 
 def load(path):
     if not os.path.exists(path):
@@ -35,41 +47,58 @@ def load(path):
     out = []
     bad = 0
     with open(path, encoding="utf-8") as f:
-        for ln in f:
-            ln = ln.strip()
-            if not ln:
+        for line in f:
+            line = line.strip()
+            if not line:
                 continue
             try:
-                out.append(json.loads(ln))
+                row = json.loads(line)
+                if not isinstance(row, dict):
+                    raise ValueError("row is not an object")
+                if not isinstance(row.get("slug"), str) or not row["slug"].strip():
+                    raise ValueError("missing slug")
+                if _finite_number(row.get("roi")) is None:
+                    raise ValueError("invalid roi")
+                row["roi"] = float(row["roi"])
+                profit = _finite_number(row.get("profit_rub", 0))
+                row["profit_rub"] = profit if profit is not None else 0.0
+                out.append(row)
             except Exception:
                 bad += 1
     return out, bad
+
 
 def filter_rows(rows, since=None, min_roi=None, sport=None, mtype=None):
     out = []
     since_dt = None
     if since:
         try:
-            since_dt = datetime.fromisoformat(since)
-        except Exception:
+            since_dt = _parse_timestamp(since)
+        except (TypeError, ValueError):
             print(f"[!] bad --since: {since}")
             sys.exit(1)
-    for d in rows:
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
         if since_dt is not None:
             try:
-                ts = datetime.fromisoformat(d["ts"])
-                if ts < since_dt:
-                    continue
-            except Exception:
+                row_dt = _parse_timestamp(row.get("ts"))
+            except (TypeError, ValueError):
                 continue
-        if min_roi is not None and d.get("roi", 0) * 100 < min_roi:
+            if row_dt < since_dt:
+                continue
+        roi = _finite_number(row.get("roi"))
+        if roi is None:
             continue
-        if sport and d.get("sport") != sport:
+        if min_roi is not None and roi * 100 < min_roi:
             continue
-        if mtype and d.get("market_type") != mtype:
+        if sport and row.get("sport") != sport:
             continue
-        out.append(d)
+        if mtype and row.get("market_type") != mtype:
+            continue
+        out.append(row)
     return out
+
 
 def print_header(rows, bad):
     n = len(rows)
@@ -81,16 +110,15 @@ def print_header(rows, bad):
     types = C.Counter(d.get("market_type", "?") for d in rows)
     live = sum(1 for d in rows if d.get("live"))
     streamer = sum(1 for d in rows if d.get("streamer"))
-    ts0 = min(d["ts"] for d in rows)
-    ts1 = max(d["ts"] for d in rows)
+    ts_values = [str(d.get("ts", "?")) for d in rows]
 
     print(sep("="))
-    print("  POLY-ARB  ---  arbs.jsonl statistics")
+    print("  POLY-ARB  ---  arbs.jsonl signal statistics")
     print(sep("="))
-    print(f"  Rows total:        {n}" + (f"  (bad: {bad})" if bad else ""))
+    print(f"  Valid signal rows: {n}" + (f"  (bad: {bad})" if bad else ""))
     print(f"  Unique slugs:      {len(slugs)}")
     print(f"  Updates per slug:  {n / max(1, len(slugs)):.1f}")
-    print(f"  Time range:        {ts0}  ->  {ts1}")
+    print(f"  Time range:        {min(ts_values)}  ->  {max(ts_values)}")
     print(f"  Live:              {live}  ({live*100//max(1,n)}%)")
     print(f"  Streamer:          {streamer}  ({streamer*100//max(1,n)}%)")
     print()
@@ -98,121 +126,132 @@ def print_header(rows, bad):
     print("  By type:   " + "  ".join(f"{k}={v}" for k, v in types.most_common()))
     print()
 
+
 def print_roi_block(rows, label="ALL"):
     if not rows:
         return
-    R = [d["roi"] * 100 for d in rows]
-    P = [d.get("profit_rub", 0) for d in rows]
+    roi_values = [d["roi"] * 100 for d in rows]
+    profit_values = [d.get("profit_rub", 0) for d in rows]
     print(sep("-"))
-    print(f"  ROI ({label}, n={len(R)})")
+    print(f"  Calculated signal ROI ({label}, n={len(roi_values)})")
     print(sep("-"))
-    print(f"    median  {S.median(R):7.2f}%")
-    print(f"    mean    {S.mean(R):7.2f}%")
-    print(f"    min     {min(R):7.2f}%")
-    print(f"    max     {max(R):7.2f}%")
-    print(f"    >=5%:   {sum(1 for r in R if r >= 5):4d}   "
-          f">=10%: {sum(1 for r in R if r >= 10):4d}   "
-          f">=20%: {sum(1 for r in R if r >= 20):4d}   "
-          f">=35%: {sum(1 for r in R if r >= 35):4d}")
+    print(f"    median  {S.median(roi_values):7.2f}%")
+    print(f"    mean    {S.mean(roi_values):7.2f}%")
+    print(f"    min     {min(roi_values):7.2f}%")
+    print(f"    max     {max(roi_values):7.2f}%")
+    print(f"    >=5%:   {sum(1 for r in roi_values if r >= 5):4d}   "
+          f">=10%: {sum(1 for r in roi_values if r >= 10):4d}   "
+          f">=20%: {sum(1 for r in roi_values if r >= 20):4d}   "
+          f">=35%: {sum(1 for r in roi_values if r >= 35):4d}")
     print()
-    print(f"  Profit per row (RUB, n={len(P)})")
-    print(f"    median  {S.median(P):8.0f}")
-    print(f"    mean    {S.mean(P):8.0f}")
-    print(f"    max     {max(P):8.0f}")
+    print("  Calculated payout surplus per signal (RUB; not realized P&L)")
+    print(f"    median  {S.median(profit_values):8.0f}")
+    print(f"    mean    {S.mean(profit_values):8.0f}")
+    print(f"    max     {max(profit_values):8.0f}")
     print()
 
+
 def print_grouped(rows, key, title):
-    g = C.defaultdict(list)
-    for d in rows:
-        g[d.get(key, "?")].append(d["roi"] * 100)
+    groups = C.defaultdict(list)
+    for row in rows:
+        groups[row.get(key, "?")].append(row["roi"] * 100)
     print(sep("-"))
-    print(f"  Median ROI by {title}")
+    print(f"  Median signal ROI by {title}")
     print(sep("-"))
     print(f"    {'key':<12}{'n':>6}{'median':>10}{'mean':>10}{'max':>10}")
-    for k, v in sorted(g.items(), key=lambda x: -len(x[1])):
-        print(f"    {k:<12}{len(v):>6}{S.median(v):>9.2f}%{S.mean(v):>9.2f}%{max(v):>9.2f}%")
+    for key_value, values in sorted(groups.items(), key=lambda item: -len(item[1])):
+        print(f"    {key_value:<12}{len(values):>6}{S.median(values):>9.2f}%"
+              f"{S.mean(values):>9.2f}%{max(values):>9.2f}%")
     print()
+
 
 def print_top(rows, n=10):
     print(sep("-"))
-    print(f"  Top-{n} by ROI")
+    print(f"  Top-{n} signal snapshots by ROI")
     print(sep("-"))
-    best = sorted(rows, key=lambda d: -d["roi"])[:n]
-    for d in best:
-        print("    %+6.1f%%  %-8s %-8s  %-42s  profit %5.0fR"
-              % (d["roi"] * 100, d.get("sport", "?"),
-                 d.get("market_type", "?"), d["slug"][:42],
-                 d.get("profit_rub", 0)))
+    best = sorted(rows, key=lambda row: -row["roi"])[:n]
+    for row in best:
+        print("    %+6.1f%%  %-8s %-8s  %-42s  estimate %5.0fR"
+              % (row["roi"] * 100, row.get("sport", "?"),
+                 row.get("market_type", "?"), row["slug"][:42],
+                 row.get("profit_rub", 0)))
     print()
+
 
 def print_persistence(rows, n=15):
-    c = C.Counter(d["slug"] for d in rows)
+    counts = C.Counter(d["slug"] for d in rows)
     print(sep("-"))
-    print(f"  Top-{n} most persistent (updates per slug)")
+    print(f"  Most frequently observed signal slugs (top {n})")
     print(sep("-"))
-    for slug, cnt in c.most_common(n):
-        # best ROI for this slug
-        best = max((d["roi"] * 100 for d in rows if d["slug"] == slug), default=0)
-        print(f"    {cnt:>4}x  {slug[:50]:<50}  best {best:+6.1f}%")
+    for slug, count in counts.most_common(n):
+        best_roi = max((d["roi"] * 100 for d in rows if d["slug"] == slug), default=0)
+        print(f"    {count:>4}x  {slug[:50]:<50}  best {best_roi:+6.1f}%")
     print()
 
+
 def dedup_best_per_slug(rows):
+    """Select the highest observed signal per slug; this does not imply a fill."""
     best = {}
-    for d in rows:
-        s = d["slug"]
-        if s not in best or d["roi"] > best[s]["roi"]:
-            best[s] = d
+    for row in rows:
+        slug = row.get("slug")
+        if not slug:
+            continue
+        if slug not in best or row["roi"] > best[slug]["roi"]:
+            best[slug] = row
     return list(best.values())
+
 
 def print_honest_estimate(rows):
     best = dedup_best_per_slug(rows)
     if not best:
         return
-    R = [d["roi"] * 100 for d in best]
-    P = [d.get("profit_rub", 0) for d in best]
+    roi_values = [d["roi"] * 100 for d in best]
+    profit_values = [d.get("profit_rub", 0) for d in best]
     print(sep("-"))
-    print(f"  Honest estimate (best per slug, n={len(best)})")
+    print(f"  Best observed snapshot per slug (n={len(best)}; not executed trades)")
     print(sep("-"))
-    print(f"    ROI median       {S.median(R):.2f}%")
-    print(f"    ROI mean         {S.mean(R):.2f}%")
-    print(f"    Profit per trade median  {S.median(P):.0f}R")
-    print(f"    Total if hit all:        {sum(P):.0f}R")
-    days = max(1, len({d["ts"][:10] for d in rows}))
-    print(f"    Days in file:            {days}")
-    print(f"    ~ per day:               {sum(P)/days:.0f}R  "
-          f"(~${sum(P)/days/85:.0f})")
+    print(f"    ROI median                 {S.median(roi_values):.2f}%")
+    print(f"    ROI mean                   {S.mean(roi_values):.2f}%")
+    print(f"    Calculated surplus median  {S.median(profit_values):.0f} RUB")
+    print(f"    Sum of displayed estimates {sum(profit_values):.0f} RUB")
+    print("    These are theoretical signal snapshots, not realized profit.")
     print()
-    print("    NOTE: this is upper bound. Real fill rate ~30-50%.")
-    print()
+
+
+def _csv_safe(value):
+    if isinstance(value, str) and value.lstrip().startswith(("=", "+", "-", "@", "\t", "\r")):
+        return "'" + value
+    return value
+
 
 def export_csv(rows, path):
     best = dedup_best_per_slug(rows)
-    best.sort(key=lambda d: -d["roi"])
-    cols = ["ts", "slug", "sport", "market_type", "live", "streamer",
-            "roi", "bank_rub", "profit_rub", "payout_rub", "rate_usdrub"]
+    best.sort(key=lambda row: -row["roi"])
+    columns = ["ts", "slug", "sport", "market_type", "live", "streamer",
+               "roi", "bank_rub", "profit_rub", "payout_rub", "rate_usdrub"]
     with open(path, "w", encoding="utf-8", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(cols)
-        for d in best:
-            w.writerow([d.get(c, "") for c in cols])
+        writer = csv.writer(f)
+        writer.writerow(columns)
+        for row in best:
+            writer.writerow([_csv_safe(row.get(column, "")) for column in columns])
     print(f"[*] wrote {len(best)} rows -> {path}")
 
+
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--file", default="arbs.jsonl")
-    ap.add_argument("--csv", default="")
-    ap.add_argument("--since", default="")
-    ap.add_argument("--min-roi", type=float, default=None)
-    ap.add_argument("--sport", default="")
-    ap.add_argument("--type", default="")
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--file", default="arbs.jsonl")
+    parser.add_argument("--csv", default="")
+    parser.add_argument("--since", default="")
+    parser.add_argument("--min-roi", type=float, default=None)
+    parser.add_argument("--sport", default="")
+    parser.add_argument("--type", default="")
+    args = parser.parse_args()
 
     rows, bad = load(args.file)
     rows = filter_rows(rows, since=args.since or None,
                        min_roi=args.min_roi,
                        sport=args.sport or None,
                        mtype=args.type or None)
-
     print_header(rows, bad)
     if not rows:
         return
@@ -222,7 +261,6 @@ def main():
     print_top(rows, n=10)
     print_persistence(rows, n=15)
     print_honest_estimate(rows)
-
     if args.csv:
         export_csv(rows, args.csv)
 

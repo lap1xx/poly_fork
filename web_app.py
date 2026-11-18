@@ -5,7 +5,11 @@ web_app.py - Poly-ARB web radar v4 (СБП-style).
 ПОЛОЖИ ЭТОТ ФАЙЛ В КОРЕНЬ ПРОЕКТА (рядом с polyarb_v4.py, bb_bridge.py, config.json).
 """
 import asyncio
+import csv
+import io
 import json
+import math
+import os
 import pathlib
 import threading
 import time
@@ -14,7 +18,7 @@ import urllib.request
 from contextlib import asynccontextmanager
 from typing import Set, Dict, List
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -40,7 +44,9 @@ GAMMA = "https://gamma-api.polymarket.com"
 CLOB = "https://clob.polymarket.com"
 PM_FEE = 0.04
 FIRST_SEEN_TTL = 300.0
+DATA_STALE_SEC = 10.0
 SAFE_FORK_THRESHOLD = 0.45
+ALLOWED_ORIGINS = {"http://127.0.0.1:8080", "http://localhost:8080"}
 
 _clients: Set[WebSocket] = set()
 _hidden: Set[str] = set()
@@ -56,10 +62,33 @@ def _load_json(path: pathlib.Path, default):
         return default
 
 def _save_json(path: pathlib.Path, data):
+    tmp = path.with_name(path.name + ".tmp")
     try:
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
     except Exception:
-        pass
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+def _finite_number(value, minimum=None, maximum=None):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    if minimum is not None and number < minimum:
+        return None
+    if maximum is not None and number > maximum:
+        return None
+    return number
+
+def _csv_safe(value):
+    if isinstance(value, str) and value.lstrip().startswith(("=", "+", "-", "@", "\t", "\r")):
+        return "'" + value
+    return value
 
 def _load_hidden():
     _hidden.update(_load_json(HIDE_FILE, []))
@@ -88,14 +117,12 @@ def _load_config():
     if not isinstance(cfg, dict):
         cfg = {}
 
-    rate = float(cfg.get("rate", 0) or 0)
-    if rate <= 0:
-        rate = 85.0
-
-    bank = float(cfg.get("bank", 2500) or 2500)
+    rate = _finite_number(cfg.get("rate"), 0.01, 100_000.0) or 85.0
+    bank = _finite_number(cfg.get("bank"), 1.0, 1_000_000_000.0) or 2500.0
 
     bot_cfg = cfg.get("bot") if isinstance(cfg.get("bot"), dict) else {}
-    poll = float((bot_cfg or {}).get("poll", cfg.get("poll", 0.3)) or 0.3)
+    poll = _finite_number((bot_cfg or {}).get("poll", cfg.get("poll", 0.3)),
+                          0.05, 30.0) or 0.3
 
     sec = cfg.get("secondary_bk")
     if not isinstance(sec, dict):
@@ -105,14 +132,21 @@ def _load_config():
         sec.setdefault("name", "1win")
         sec.setdefault("color", "#ff5a5a")
 
+    pm_fee_pct = _finite_number(cfg.get("pm_fee_pct", PM_FEE), 0.0, 1.0)
+    if pm_fee_pct is None:
+        pm_fee_pct = PM_FEE
+    safe_threshold = _finite_number(
+        cfg.get("safe_fork_threshold", SAFE_FORK_THRESHOLD), 0.01, 0.99
+    )
+    if safe_threshold is None:
+        safe_threshold = SAFE_FORK_THRESHOLD
+
     return {
         "rate": rate,
         "bank": bank,
         "poll": poll,
-        "pm_fee_pct": float(cfg.get("pm_fee_pct", PM_FEE) or PM_FEE),
-        "safe_fork_threshold": float(
-            cfg.get("safe_fork_threshold", SAFE_FORK_THRESHOLD) or SAFE_FORK_THRESHOLD
-        ),
+        "pm_fee_pct": pm_fee_pct,
+        "safe_fork_threshold": safe_threshold,
         "secondary_bk": sec,
     }
 
@@ -175,21 +209,48 @@ def _build_enriched(raw: dict) -> dict:
         enriched["slug"] = slug
         enriched["first_seen_ts"] = fs_snapshot.get(slug, now)
         enriched["age_sec"] = round(now - enriched["first_seen_ts"], 1)
+        source_ts = _finite_number(arb.get("ts"), 0.0)
+        if source_ts is None or source_ts <= 0:
+            enriched["source_age_sec"] = None
+            enriched["source_state"] = "unknown"
+        else:
+            source_age = max(0.0, now - source_ts)
+            enriched["source_age_sec"] = round(source_age, 1)
+            enriched["source_state"] = "stale" if source_age > DATA_STALE_SEC else "fresh"
 
-        pm_best_ask = None
+        pm_best_ask = arb.get("pm_best_ask")
+        pm_best_bid = arb.get("pm_best_bid")
         bets = arb.get("bets") or []
+        if not isinstance(bets, list):
+            bets = []
         for b in bets:
+            if not isinstance(b, dict):
+                continue
             if b.get("source") == "Polymarket":
-                try:
-                    o = float(b.get("o") or 0)
-                    if o > 1.0:
-                        pm_best_ask = 1.0 / o
-                except Exception:
-                    pass
+                if pm_best_ask is None:
+                    pm_best_ask = b.get("pm_best_ask")
+                if pm_best_bid is None:
+                    pm_best_bid = b.get("pm_best_bid")
                 break
-        enriched["pm_best_ask"] = round(pm_best_ask, 4) if pm_best_ask else None
-        is_safe = bool(pm_best_ask is not None and pm_best_ask <= safe_thr)
-        enriched["is_safe"] = is_safe
+        try:
+            pm_best_ask = float(pm_best_ask)
+            if not (0.0 < pm_best_ask < 1.0):
+                pm_best_ask = None
+        except (TypeError, ValueError):
+            pm_best_ask = None
+        try:
+            pm_best_bid = float(pm_best_bid)
+            if not (0.0 < pm_best_bid < 1.0):
+                pm_best_bid = None
+        except (TypeError, ValueError):
+            pm_best_bid = None
+        enriched["pm_best_ask"] = round(pm_best_ask, 4) if pm_best_ask is not None else None
+        enriched["pm_best_bid"] = round(pm_best_bid, 4) if pm_best_bid is not None else None
+        # A low token price is only a filter flag, never a guarantee of settlement.
+        enriched["pm_low_price_flag"] = bool(
+            pm_best_ask is not None and pm_best_ask <= safe_thr
+        )
+        enriched["is_safe"] = False
 
         phase = arb.get("phase")
         if not phase:
@@ -235,11 +296,13 @@ def _build_enriched(raw: dict) -> dict:
 
 async def _broadcast_loop():
     last_ts = 0.0
+    last_broadcast = 0.0
     while True:
         try:
             if LIVE_FILE.exists():
                 st = LIVE_FILE.stat()
-                if st.st_mtime > last_ts:
+                now = time.time()
+                if st.st_mtime > last_ts or now - last_broadcast >= 1.0:
                     last_ts = st.st_mtime
                     raw = _load_json(LIVE_FILE, {})
                     if not isinstance(raw, dict):
@@ -261,6 +324,7 @@ async def _broadcast_loop():
                             dead.append(ws)
                     for ws in dead:
                         _clients.discard(ws)
+                    last_broadcast = now
         except Exception:
             pass
         await asyncio.sleep(0.5)
@@ -272,9 +336,26 @@ async def _lifespan(app):
     threading.Thread(target=_first_seen_save_loop, daemon=True).start()
     if price_history is not None:
         price_history.start()
-    yield
+    try:
+        yield
+    finally:
+        if price_history is not None:
+            price_history.stop()
 
 app = FastAPI(title="Poly-ARB Web v4", lifespan=_lifespan)
+
+@app.middleware("http")
+async def _same_origin_mutations(request: Request, call_next):
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+        origin = request.headers.get("origin")
+        host = request.headers.get("host", "").split(":", 1)[0].strip("[]").lower()
+        client_host = (request.client.host if request.client else "").lower()
+        if (origin not in ALLOWED_ORIGINS
+                or host not in {"127.0.0.1", "localhost"}
+                or client_host not in {"127.0.0.1", "::1", "localhost"}):
+            return JSONResponse({"ok": False, "err": "local same-origin request required"},
+                                status_code=403)
+    return await call_next(request)
 
 STATIC = HERE / "static"
 TEMPLATES = HERE / "templates"
@@ -290,6 +371,9 @@ async def index():
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
+    if ws.headers.get("origin") not in ALLOWED_ORIGINS:
+        await ws.close(code=1008)
+        return
     await ws.accept()
     _clients.add(ws)
     try:
@@ -327,12 +411,24 @@ async def api_config():
 @app.post("/api/config")
 async def api_config_save(payload: dict):
     try:
+        if not isinstance(payload, dict):
+            return JSONResponse({"ok": False, "err": "object required"}, status_code=422)
         cfg = _load_json(CONFIG_FILE, {}) or {}
         if not isinstance(cfg, dict):
             cfg = {}
-        for k in ("bank", "rate", "pm_fee_pct", "safe_fork_threshold"):
+        limits = {
+            "bank": (1.0, 1_000_000_000.0),
+            "rate": (0.01, 100_000.0),
+            "pm_fee_pct": (0.0, 1.0),
+            "safe_fork_threshold": (0.01, 0.99),
+        }
+        for k, (minimum, maximum) in limits.items():
             if k in payload:
-                cfg[k] = payload[k]
+                value = _finite_number(payload[k], minimum, maximum)
+                if value is None:
+                    return JSONResponse({"ok": False, "err": "invalid " + k},
+                                        status_code=422)
+                cfg[k] = value
         _save_json(CONFIG_FILE, cfg)
         return {"ok": True, "config": _load_config()}
     except Exception as e:
@@ -340,20 +436,69 @@ async def api_config_save(payload: dict):
 
 @app.post("/api/hide/{slug}")
 async def api_hide(slug: str):
+    if not slug or len(slug) > 300 or any(ord(ch) < 32 for ch in slug):
+        return JSONResponse({"ok": False, "err": "invalid slug"}, status_code=422)
     _hidden.add(slug)
     _save_hidden()
     return {"ok": True, "hidden": sorted(_hidden)}
 
 @app.post("/api/unhide/{slug}")
 async def api_unhide(slug: str):
+    if not slug or len(slug) > 300 or any(ord(ch) < 32 for ch in slug):
+        return JSONResponse({"ok": False, "err": "invalid slug"}, status_code=422)
     _hidden.discard(slug)
     _save_hidden()
     return {"ok": True, "hidden": sorted(_hidden)}
 
 @app.post("/api/trade")
 async def api_trade(payload: dict):
-    rec = dict(payload or {})
-    rec["ts"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    if not isinstance(payload, dict):
+        return JSONResponse({"ok": False, "err": "object required"}, status_code=422)
+    slug = payload.get("slug")
+    if (not isinstance(slug, str) or not slug.strip() or len(slug) > 300
+            or any(ord(ch) < 32 for ch in slug)):
+        return JSONResponse({"ok": False, "err": "invalid slug"}, status_code=422)
+    bank = _finite_number(payload.get("bank"), 0.01, 1_000_000_000.0)
+    profit = _finite_number(payload.get("profit"), -1_000_000_000.0, 1_000_000_000.0)
+    roi = _finite_number(payload.get("roi"), -1.0, 1000.0)
+    payout = _finite_number(payload.get("payout"), 0.0, 1_000_000_000.0)
+    rate = _finite_number(payload.get("rate"), 0.01, 100_000.0)
+    legs = payload.get("legs")
+    if None in (bank, profit, roi, payout, rate) or not isinstance(legs, list) or len(legs) != 2:
+        return JSONResponse({"ok": False, "err": "invalid trade fields"}, status_code=422)
+    clean_legs = []
+    numeric_leg_fields = {
+        "odds": (1.000001, 1_000_000.0), "stake_rub": (0.01, 1_000_000_000.0),
+        "price_usd": (0.000001, 0.999999), "amount_usd": (0.01, 1_000_000_000.0),
+    }
+    for leg in legs:
+        if not isinstance(leg, dict):
+            return JSONResponse({"ok": False, "err": "invalid leg"}, status_code=422)
+        clean_leg = {}
+        for key in ("book", "outcome"):
+            value = leg.get(key, "")
+            if not isinstance(value, str) or len(value) > 120 or any(ord(ch) < 32 for ch in value):
+                return JSONResponse({"ok": False, "err": "invalid leg text"}, status_code=422)
+            clean_leg[key] = value
+        for key, (minimum, maximum) in numeric_leg_fields.items():
+            if key in leg:
+                value = _finite_number(leg[key], minimum, maximum)
+                if value is None:
+                    return JSONResponse({"ok": False, "err": "invalid leg " + key},
+                                        status_code=422)
+                clean_leg[key] = value
+        clean_legs.append(clean_leg)
+    rec = {
+        "slug": slug.strip(),
+        "q": payload.get("q", "") if isinstance(payload.get("q", ""), str) else "",
+        "sport": payload.get("sport", "") if isinstance(payload.get("sport", ""), str) else "",
+        "market_type": payload.get("market_type", "") if isinstance(payload.get("market_type", ""), str) else "",
+        "bank": bank, "profit": profit, "roi": roi, "payout": payout, "rate": rate,
+        "legs": clean_legs,
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    for key in ("q", "sport", "market_type"):
+        rec[key] = rec[key][:300]
     try:
         with open(TRADES_FILE, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -433,20 +578,22 @@ async def api_weekly():
 
 @app.get("/api/export_csv")
 async def api_export_csv():
+    output = io.StringIO(newline="")
+    writer = csv.writer(output)
+    writer.writerow(["ts", "slug", "q", "sport", "market_type", "bank", "profit", "roi"])
     if not TRADES_FILE.exists():
-        return PlainTextResponse("ts,slug,q,sport,market_type,bank,profit,roi\n", media_type="text/csv")
-    lines = ["ts,slug,q,sport,market_type,bank,profit,roi"]
+        return PlainTextResponse(output.getvalue(), media_type="text/csv")
     for line in TRADES_FILE.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line:
             continue
         try:
             r = json.loads(line)
-            q = (r.get("q") or "").replace(",", " ").replace("\n", " ")
-            lines.append(f'{r.get("ts","")},{r.get("slug","")},{q},{r.get("sport","")},{r.get("market_type","")},{r.get("bank",0)},{r.get("profit",0)},{r.get("roi",0)}')
+            writer.writerow([_csv_safe(r.get(key, "")) for key in
+                             ("ts", "slug", "q", "sport", "market_type", "bank", "profit", "roi")])
         except Exception:
             continue
-    return PlainTextResponse("\n".join(lines), media_type="text/csv",
+    return PlainTextResponse(output.getvalue(), media_type="text/csv",
                              headers={"Content-Disposition": "attachment; filename=arbs.csv"})
 
 @app.get("/api/price_history/{slug}")
@@ -462,6 +609,9 @@ async def api_pm_url(slug: str):
 
 @app.get("/api/pm_book/{slug}")
 async def api_pm_book(slug: str, size_usd: float = 50.0, force: int = 0):
+    size_usd = _finite_number(size_usd, 1.0, 100_000.0)
+    if size_usd is None or not slug or len(slug) > 300:
+        return JSONResponse({"ok": False, "err": "invalid request"}, status_code=422)
     try:
         m = _http_get(f"{GAMMA}/markets", {"slug": slug})
         if not m or not isinstance(m, list) or not m:

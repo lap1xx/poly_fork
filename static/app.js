@@ -172,14 +172,12 @@ function updateHeader() {
   const topEl = document.getElementById('st-top-roi');
   totalEl.textContent = state.visible.length;
 
-  const daily = state.dailyStats;
-  if (daily && daily.roi != null) {
-    topEl.textContent = (daily.roi >= 0 ? '+' : '') + (daily.roi * 100).toFixed(2) + '%';
-    topEl.style.color = daily.roi >= 0 ? 'var(--green)' : 'var(--red)';
-  } else if (state.visible.length) {
+  if (state.visible.length) {
     topEl.textContent = fmtPct(state.visible[0].roi);
+    topEl.style.color = state.visible[0].roi >= 0 ? 'var(--green)' : 'var(--red)';
   } else {
     topEl.textContent = '+0.00%';
+    topEl.style.color = 'var(--green)';
   }
 }
 
@@ -187,27 +185,39 @@ function updateHeader() {
 function renderArbs() {
   const box = document.getElementById('arbs-list');
   if (!state.visible.length) {
-    box.innerHTML = `<div class="empty">Нет вилок в разделе ${state.phase.toUpperCase()}<br>по текущим фильтрам...</div>`;
+    box.innerHTML = `<div class="empty">Нет вилок в разделе ${escapeHtml(state.phase.toUpperCase())}<br>по текущим фильтрам...</div>`;
     return;
   }
+  box.onclick = (event) => {
+    const card = event.target.closest('[data-arb-slug]');
+    if (card && box.contains(card)) selectArb(card.dataset.arbSlug);
+  };
   box.innerHTML = state.visible.map(a => {
     const legs = a.bets || [];
     const pmLeg = legs.find(l => l.source === 'Polymarket') || {};
     const bbLeg = legs.find(l => l.source === 'BetBoom') || {};
     const tags = [];
-    tags.push(`<span class="tag ${sportClass(a.sport)}">${a.sport || ''}</span>`);
-    if (a.market_type) tags.push(`<span class="tag mtype">${a.market_type}</span>`);
+    tags.push(`<span class="tag ${escapeHtml(sportClass(a.sport))}">${escapeHtml(a.sport || '')}</span>`);
+    if (a.market_type) tags.push(`<span class="tag mtype">${escapeHtml(a.market_type)}</span>`);
     if (a.is_live) tags.push(`<span class="tag live">LIVE</span>`);
     if (a.is_streamer) tags.push(`<span class="tag streamer">STREAMER</span>`);
     const pmAge = (pmLeg && pmLeg.pm_age) || a.pm_age;
     if (pmAge && pmAge > 60) tags.push(`<span class="tag pm-age">PM ${Math.floor(pmAge)}с</span>`);
+    const sourceAge = a.source_age_sec == null ? NaN : Number(a.source_age_sec);
+    if (Number.isFinite(sourceAge)) {
+      const ageLabel = `DATA ${Math.floor(sourceAge)}с`;
+      const ageClass = a.source_state === 'stale' ? 'tag pm-age' : 'tag';
+      tags.push(`<span class="${ageClass}">${ageLabel}${a.source_state === 'stale' ? ' · STALE' : ''}</span>`);
+    } else {
+      tags.push(`<span class="tag pm-age">DATA ?</span>`);
+    }
 
     const cls = ['arb'];
     if (a.slug === state.activeSlug) cls.push('active');
     if (state.freshSlugs.has(a.slug)) cls.push('fresh');
 
     return `
-      <div class="${cls.join(' ')}" onclick="selectArb('${escapeHtml(a.slug)}')">
+      <div class="${cls.join(' ')}" data-arb-slug="${escapeHtml(a.slug || '')}">
         <div class="arb-head">
           <div class="arb-title">${escapeHtml(a.title ? (a.title + ' · ' + (a.q || '')) : (a.q || a.slug || ''))}</div>
           <div class="arb-roi">${fmtPct(a.roi)}</div>
@@ -264,9 +274,11 @@ function refreshDetail() {
   document.getElementById('det-title').textContent = a.title
     ? (a.title + ' · ' + (a.q || ''))
     : (a.q || a.slug);
-  const tags = [`<span class="tag mtype">${a.market_type || 'MATCH'}</span>`,
-                `<span class="tag ${sportClass(a.sport)}">${a.sport || ''}</span>`];
+  const tags = [`<span class="tag mtype">${escapeHtml(a.market_type || 'MATCH')}</span>`,
+                `<span class="tag ${escapeHtml(sportClass(a.sport))}">${escapeHtml(a.sport || '')}</span>`];
   if (a.is_streamer) tags.push(`<span class="tag streamer">STREAMER</span>`);
+  if (a.source_state === 'stale') tags.push(`<span class="tag pm-age">DATA STALE</span>`);
+  else if (a.source_state === 'unknown') tags.push(`<span class="tag pm-age">DATA UNKNOWN</span>`);
   document.getElementById('det-tags').innerHTML = tags.join('');
 
   const roiEl = document.getElementById('kpi-roi');
@@ -285,11 +297,11 @@ function refreshDetail() {
   document.getElementById('kpi-odds').innerHTML = `${fmtOdds(bbO)}<br><span style="color:var(--txt2);font-size:14px">${fmtOdds(pmO)}</span>`;
 
   const safeEl = document.getElementById('safe-banner');
-  if (a.is_safe) {
+  if (a.pm_low_price_flag) {
     safeEl.classList.remove('hidden');
-    document.getElementById('safe-text').textContent =
-      `Доля на Полике дешевле ${((state.config.safe_fork_threshold || 0.45) * 100).toFixed(0)}¢. ` +
-      `Если матч отменят, букмекер вернёт ставку, а Полик обычно закрывает рынок 50/50 — по доле ты всё равно в плюсе.`;
+    document.getElementById('signal-note-text').textContent =
+      `Наблюдаемая цена ниже фильтра ${((state.config.safe_fork_threshold || 0.45) * 100).toFixed(0)}¢. ` +
+      `Это только ценовой сигнал: он не гарантирует исполнение, возврат, разрешение рынка или прибыль.`;
   } else {
     safeEl.classList.add('hidden');
   }
