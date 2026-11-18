@@ -1,0 +1,349 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Poly-ARB · Радар</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="app">
+
+  <!-- ============ HEADER ============ -->
+  <header class="hdr">
+    <div class="hdr-left">
+      <div class="logo">
+        <span class="logo-fork">🍴</span>
+        <span class="logo-text">POLY<span class="logo-accent">-ARB</span></span>
+      </div>
+      <div class="hdr-tabs">
+        <button class="tab active" data-phase="live">ЛАЙВ</button>
+        <button class="tab" data-phase="prematch">ПРЕМАТЧ</button>
+      </div>
+    </div>
+    <div class="hdr-right">
+      <div class="stat-summary" id="hdr-summary">
+        <span class="stat-count"><b id="st-total">0</b> вилок</span>
+        <span class="stat-sep">·</span>
+        <span class="stat-roi">ТОП <b id="st-top-roi">+0.00%</b></span>
+      </div>
+      <button class="icon-btn" id="st-sound" title="Звук">🔊</button>
+      <button class="icon-btn" id="btn-config" title="Настройки">⚙️</button>
+      <button class="icon-btn danger" id="btn-shutdown" title="Выключить бота">⏻</button>
+    </div>
+  </header>
+
+  <!-- ============ 3-COLUMN GRID ============ -->
+  <main class="grid">
+
+    <!-- ============ COL 1: ARBS LIST ============ -->
+    <aside class="col-list">
+      <div class="list-filters">
+        <label class="chk"><input type="checkbox" id="f-cs2" checked> CS2</label>
+        <label class="chk"><input type="checkbox" id="f-dota2" checked> DOTA2</label>
+        <label class="chk"><input type="checkbox" id="f-lol" checked> LOL</label>
+        <label class="chk"><input type="checkbox" id="f-tennis" checked> TENNIS</label>
+        <label class="chk minroi">ROI ≥ <input type="number" id="f-minroi" value="0" min="0" max="100" step="0.5">%</label>
+      </div>
+      <div class="arbs-list" id="arbs-list">
+        <div class="empty">Нет вилок по текущим фильтрам...</div>
+      </div>
+    </aside>
+
+    <!-- ============ COL 2: ACTIVE ARB DETAIL ============ -->
+    <section class="col-detail" id="col-detail">
+      <div class="detail-placeholder" id="detail-placeholder">
+        <div class="ph-icon">🍴</div>
+        <div class="ph-text">Выбери вилку слева</div>
+        <div class="ph-sub">Клик по карточке — откроется стакан PM, график и калькулятор</div>
+      </div>
+
+      <div class="detail-body hidden" id="detail-body">
+        <!-- header -->
+        <div class="det-head">
+          <div class="det-head-left">
+            <div class="det-title" id="det-title">—</div>
+            <div class="det-tags" id="det-tags"></div>
+          </div>
+          <button class="icon-btn small" id="btn-det-close" title="Закрыть">✕</button>
+        </div>
+
+        <!-- 4 KPI -->
+        <div class="kpi-row">
+          <div class="kpi kpi-roi">
+            <div class="kpi-lbl">ВИЛКА</div>
+            <div class="kpi-val" id="kpi-roi">—</div>
+          </div>
+          <div class="kpi">
+            <div class="kpi-lbl">ЖИВЁТ</div>
+            <div class="kpi-val" id="kpi-age">—</div>
+          </div>
+          <div class="kpi">
+            <div class="kpi-lbl">ЛУЧШИИЙ ASK</div>
+            <div class="kpi-val" id="kpi-depth">—</div>
+          </div>
+          <div class="kpi">
+            <div class="kpi-lbl">КЭФ СЕЙЧАС</div>
+            <div class="kpi-val" id="kpi-odds">—</div>
+          </div>
+        </div>
+
+        <!-- Safe fork banner -->
+        <div class="safe-banner hidden" id="safe-banner">
+          <div class="safe-title">✓ БЕЗОПАСНАЯ ВИЛКА</div>
+          <div class="safe-text" id="safe-text">Доля на Полике дешевле 45¢. Если матч отменят, букмекер вернёт ставку, а Полик обычно закрывает рынок 50/50 — по доле ты всё равно в плюсе.</div>
+        </div>
+
+        <!-- 2-col inside detail: PM book + chart -->
+        <div class="det-mid">
+          <div class="panel">
+            <div class="panel-head">
+              <span>СТАКАН POLYMARKET</span>
+              <span class="panel-sub" id="pm-side-lbl">—</span>
+            </div>
+            <table class="pm-book" id="pm-book">
+              <thead>
+                <tr><th>цена, ¢</th><th>кол-во</th><th>$</th></tr>
+              </thead>
+              <tbody id="pm-book-body">
+                <tr><td colspan="3" class="empty-cell">—</td></tr>
+              </tbody>
+            </table>
+            <div class="pm-book-foot" id="pm-book-foot">—</div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head">
+              <span>ИСТОРИЯ ЦЕНЫ</span>
+              <span class="panel-sub" id="chart-delta">—</span>
+            </div>
+            <canvas class="price-chart" id="price-chart" width="480" height="220"></canvas>
+            <div class="chart-foot" id="chart-foot">—</div>
+          </div>
+        </div>
+
+        <!-- How much to bet -->
+        <div class="panel how-much">
+          <div class="panel-head">
+            <span>СКОЛЬКО СТАВИТЬ</span>
+            <span class="panel-sub" id="hm-rate">курс —</span>
+          </div>
+
+          <div class="hm-legs">
+            <div class="hm-leg bb">
+              <span class="hm-bk" id="hm-bb-name">BetBoom</span>
+              <input type="number" step="1" id="hm-bb-stake" value="0">
+              <span class="hm-cur">₽</span>
+            </div>
+            <div class="hm-leg pm">
+              <span class="hm-bk">Polymarket</span>
+              <input type="number" step="0.01" id="hm-pm-stake" value="0">
+              <span class="hm-cur">$</span>
+            </div>
+          </div>
+
+          <div class="hm-info">
+            <div><span>Цена доли в стакане</span><b id="hm-price">—</b></div>
+            <div><span>Средняя по стакану</span><b id="hm-avg">—</b></div>
+            <div><span>С комиссией и курсом</span><b id="hm-eff">—</b></div>
+            <div class="hm-hl"><span>Всего в игре</span><b id="hm-total">—</b></div>
+            <div class="hm-hl"><span>Возврат при любом исходе</span><b id="hm-payout">—</b></div>
+            <div class="hm-hl"><span>Профит</span><b id="hm-profit" class="green">—</b></div>
+          </div>
+
+          <div class="hm-actions">
+            <button class="btn dark" id="btn-open-bb">ОТКРЫТЬ BETBOOM С СУММОЙ</button>
+            <button class="btn green" id="btn-buy-pm">КУПИТЬ НА POLYMARKET · $0.00 ↗</button>
+            <button class="btn dark" id="btn-filled">Залился в вилку ✓</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ COL 3: CALCULATOR ============ -->
+    <aside class="col-calc">
+      <div class="calc-head">КАЛЬКУЛЯТОР ВИЛКИ</div>
+
+      <div class="calc-block">
+        <div class="calc-block-title">БУКМЕКЕР <span id="calc-bk-name">—</span></div>
+        <div class="calc-row">
+          <label>Кэф</label>
+          <input type="number" step="0.01" id="calc-bk-odds" value="0">
+        </div>
+        <div class="calc-row">
+          <label>Ставка, ₽</label>
+          <input type="number" step="1" id="calc-bk-stake" value="0">
+        </div>
+      </div>
+
+      <div class="calc-block">
+        <div class="calc-block-title">POLYMARKET</div>
+        <div class="calc-row">
+          <label>Цена, ¢</label>
+          <input type="number" step="0.1" id="calc-pm-price" value="0">
+        </div>
+        <div class="calc-row">
+          <label>Купил на, $</label>
+          <input type="number" step="0.01" id="calc-pm-stake" value="0">
+        </div>
+      </div>
+
+      <div class="calc-rate">
+        <span>курс</span>
+        <input type="number" step="0.01" id="calc-rate" value="85">
+        <span>₽ · из настроек</span>
+        <button class="btn-mini" id="btn-calc-reset">Сброс</button>
+      </div>
+
+      <div class="calc-hint" id="calc-hint">Введи кэф и ставку на БК, цену и сумму на Полике</div>
+
+      <button class="btn green big" id="btn-my-arbs">МОИ ВИЛКИ</button>
+    </aside>
+  </main>
+
+  <!-- ============ MODAL: EDIT ============ -->
+  <div class="modal-back hidden" id="modal-edit">
+    <div class="modal">
+      <div class="modal-eyebrow">РЕДАКТОР СДЕЛКИ</div>
+      <div class="modal-head">
+        <div>
+          <div class="modal-title">Исполненные коэффициенты</div>
+          <div class="match-line" id="ed-match">—</div>
+          <div class="match-sub" id="ed-sub">—</div>
+        </div>
+        <button class="close" onclick="closeEdit()">✕</button>
+      </div>
+
+      <div class="legs">
+        <div class="leg a" id="ed-leg-0"></div>
+        <div class="leg b" id="ed-leg-1"></div>
+      </div>
+
+      <div class="summary">
+        <div class="sum-item"><div class="lbl">Общий банк</div><div class="val" id="ed-bank">—</div></div>
+        <div class="sum-item"><div class="lbl">Профит при плече 1</div><div class="val" id="ed-p1">—</div></div>
+        <div class="sum-item"><div class="lbl">Профит при плече 2</div><div class="val" id="ed-p2">—</div></div>
+        <div class="sum-item highlight"><div class="lbl">Гарантированный ROI</div><div class="val green" id="ed-roi">—</div></div>
+      </div>
+
+      <div class="modal-hint">После сохранения графики и результат сделки пересчитываются автоматически.</div>
+
+      <div class="modal-actions">
+        <button class="btn dark" onclick="closeEdit()">ОТМЕНА</button>
+        <button class="btn dark" onclick="hideCurrent()">Скрыть</button>
+        <button class="btn green" onclick="saveTrade()">СОХРАНИТЬ ИЗМЕНЕНИЯ</button>
+      </div>
+
+      <div class="pm-check-panel hidden" id="pm-check-panel">
+        <div class="pm-check-head">
+          ПРОВЕРКА PM-СТАКАНА
+          <button class="btn-mini" onclick="checkPM()">Проверить PM</button>
+          <button class="btn-mini" onclick="refreshPMNow()">Форс-фетч</button>
+        </div>
+        <div id="pm-check-body"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ MODAL: TRADES ============ -->
+  <div class="modal-back hidden" id="modal-trades">
+    <div class="modal wide">
+      <div class="modal-head">
+        <div class="modal-title">ЖУРНАЛ СДЕЛОК</div>
+        <button class="close" onclick="closeTrades()">✕</button>
+      </div>
+      <div class="trades-list" id="trades-list"></div>
+      <div class="modal-actions">
+        <button class="btn dark" onclick="exportCSV()">ЭКСПОРТ CSV</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ MODAL: DAILY DASHBOARD ============ -->
+  <div class="modal-back hidden" id="modal-daily">
+    <div class="modal wide">
+      <div class="modal-eyebrow">ИТОГИ ДНЯ</div>
+      <div class="modal-head">
+        <div class="modal-title">Результаты без догадок</div>
+        <button class="close" onclick="closeDaily()">✕</button>
+      </div>
+
+      <div class="dash-kpis">
+        <div class="dk"><div class="lbl">СДЕЛОК</div><div class="val" id="daily-count">0</div></div>
+        <div class="dk"><div class="lbl">ОБОРОТ</div><div class="val" id="daily-bank">0 ₽</div></div>
+        <div class="dk"><div class="lbl">РЕЗУЛЬТАТ</div><div class="val green" id="daily-profit">+0 ₽</div></div>
+        <div class="dk"><div class="lbl">СРЕДНИЙ ROI</div><div class="val green" id="daily-roi">+0.000%</div></div>
+      </div>
+
+      <div class="dash-body">
+        <div class="dash-col">
+          <div class="dash-col-title">ПРИБЫЛЬ ПО ДНЯМ · 7 ДНЕЙ</div>
+          <div class="weekly-chart" id="weekly-chart"></div>
+        </div>
+        <div class="dash-col">
+          <div class="dash-col-title">СЕГОДНЯ</div>
+          <div class="daily-ring-wrap">
+            <div class="daily-ring">
+              <svg viewBox="0 0 120 120">
+                <circle cx="60" cy="60" r="52" stroke="#1e2824" stroke-width="10" fill="none"/>
+                <circle id="daily-ring-arc" cx="60" cy="60" r="52"
+                        stroke="#00ff88" stroke-width="10" fill="none"
+                        stroke-linecap="round" stroke-dasharray="0 400"
+                        transform="rotate(-90 60 60)"/>
+              </svg>
+              <div class="daily-ring-text" id="daily-ring-text">0%</div>
+            </div>
+            <div class="daily-meta">
+              <div><span class="lbl">ОБОРОТ</span><b id="daily-bank2">0 ₽</b></div>
+              <div><span class="lbl">ROI ДНЯ</span><b id="daily-roi2">0%</b></div>
+              <div><span class="lbl">СДЕЛОК</span><b id="daily-count2">0</b></div>
+            </div>
+          </div>
+        </div>
+        <div class="dash-col">
+          <div class="dash-col-title">ПОСЛЕДНИЕ СДЕЛКИ</div>
+          <div class="recent-trades" id="recent-trades"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ MODAL: BK FILTER ============ -->
+  <div class="modal-back hidden" id="modal-bk">
+    <div class="modal">
+      <div class="modal-head">
+        <div class="modal-title">БУКМЕКЕРЫ</div>
+        <button class="close" onclick="closeBkModal()">✕</button>
+      </div>
+      <div class="bk-sub" id="bk-sub">Отмечено 0 из 0</div>
+      <div class="bk-grid" id="bk-grid"></div>
+    </div>
+  </div>
+
+  <!-- ============ MODAL: CONFIG ============ -->
+  <div class="modal-back hidden" id="modal-config">
+    <div class="modal">
+      <div class="modal-head">
+        <div class="modal-title">НАСТРОЙКИ</div>
+        <button class="close" onclick="closeConfig()">✕</button>
+      </div>
+      <div class="config-grid">
+        <div class="cfg-row"><label>Банк по умолчанию, ₽</label><input type="number" id="cfg-bank" value="2500"></div>
+        <div class="cfg-row"><label>Курс ₽/$ (fallback)</label><input type="number" step="0.01" id="cfg-rate" value="85"></div>
+        <div class="cfg-row"><label>Комиссия Polymarket, %</label><input type="number" step="0.1" id="cfg-fee" value="4"></div>
+        <div class="cfg-row"><label>Safe-fork threshold, ¢</label><input type="number" step="0.01" id="cfg-safe" value="0.45"></div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn dark" onclick="closeConfig()">ОТМЕНА</button>
+        <button class="btn green" onclick="saveConfig()">СОХРАНИТЬ</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ TOAST ============ -->
+  <div class="toast hidden" id="toast"></div>
+
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>

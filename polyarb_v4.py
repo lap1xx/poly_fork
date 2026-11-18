@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-# polyarb_v3.py v40 - BC odds auto-filled from BetBoom (bb_bridge.py).
-# Ручной ввод кэфов БК убран. Если матч не забинджен к BB - просто нет арба.
+# polyarb_v4.py v41 - BC odds auto-filled from BetBoom AND 1win (bk_router.py).
+# LIVE: BB primary + 1win fallback. PREMATCH: 1win only.
 # v40: фикс dedup-алертов (больше нет спама одинаковых вилок).
+# v41: интеграция bk_router (BB + 1win) — см. память проекта.
 import argparse
 import csv
 import json
@@ -30,13 +31,24 @@ try:
 except ImportError:
     HAS_WS = False
 
+# ---------- БК: bk_router (BB + 1win) с fallback на bb_bridge ----------
+ROUTER_ENABLED = False
+BB_ENABLED = False
+_BB_ERR = None
+
 try:
-    from bb_bridge import get_global_stream, bind_slug, get_live_bc, wait_ready
-    BB_ENABLED = True
-    _BB_ERR = None
-except Exception as _bb_err:
-    BB_ENABLED = False
-    _BB_ERR = _bb_err
+    from bk_router import get_router, is_prematch_slug
+    ROUTER_ENABLED = True
+    BB_ENABLED = True  # косвенно, чтобы старая логика тоже работала
+except Exception as _router_err:
+    _BB_ERR = _router_err
+    try:
+        from bb_bridge import get_global_stream, bind_slug, get_live_bc, wait_ready
+        BB_ENABLED = True
+    except Exception as _bb_err2:
+        BB_ENABLED = False
+        _BB_ERR = _bb_err2
+
 
 COLON = chr(58)
 SLASH = chr(47)
@@ -45,6 +57,7 @@ HT = "https" + COLON + SLASH + SLASH
 WSS = "wss" + COLON + SLASH + SLASH
 GAMMA = HT + "gamma-api" + DOT + "polymarket" + DOT + "com"
 WS_URL = WSS + "ws-subscriptions-clob" + DOT + "polymarket" + DOT + "com" + "/ws/market"
+PM_FEE_PCT = 0.04
 CBR_URL = HT + "www" + DOT + "cbr" + DOT + "ru" + "/scripts/XML_daily.asp"
 
 TIMEOUT = 15.0
@@ -53,6 +66,7 @@ LOCK = threading.Lock()
 STOP = threading.Event()
 
 RUB = " RUB"
+
 
 class C:
     G    = chr(27) + "[92m"
@@ -68,6 +82,7 @@ class C:
     DIM  = chr(27) + "[2m"
     BOLD = chr(27) + "[1m"
     RST  = chr(27) + "[0m"
+
 
 MELODY_PREMATCH = [(523, 180), (659, 180), (784, 180), (1047, 550)]
 MELODY_LIVE = [(880, 120), (880, 120), (1047, 400)]
@@ -89,6 +104,7 @@ DEFAULT_BK = {
     "BetBoom": {"comm": 0.0, "min_bet": 50, "update_seconds": 1},
     "Winline": {"comm": 0.0, "min_bet": 100, "update_seconds": 2},
     "PARI":    {"comm": 0.0, "min_bet": 100, "update_seconds": 4},
+    "1win":    {"comm": 0.0, "min_bet": 50,  "update_seconds": 2},
 }
 
 STREAMER_KEYS = [
@@ -99,11 +115,14 @@ STREAMER_KEYS = [
     "play-connect", "winline-star",
 ]
 
+
 def sep(ch="=", n=74):
     return ch * n
 
+
 def line(s=""):
     print(s)
+
 
 def load_cfg():
     if not os.path.exists(CFG_FILE):
@@ -119,6 +138,7 @@ def load_cfg():
     except Exception:
         return dict(DEFAULT_CFG)
 
+
 def load_bk():
     if not os.path.exists(BK_FILE):
         with open(BK_FILE, "w", encoding="utf-8") as f:
@@ -127,9 +147,13 @@ def load_bk():
     try:
         with open(BK_FILE, encoding="utf-8") as f:
             d = json.load(f)
-        return d
+        # merge defaults чтобы 1win появился
+        out = dict(DEFAULT_BK)
+        out.update(d)
+        return out
     except Exception:
         return dict(DEFAULT_BK)
+
 
 def init_db():
     con = sqlite3.connect(DB_FILE)
@@ -146,6 +170,7 @@ def init_db():
     con.commit()
     con.close()
 
+
 def log_arb(slug, sport, roi, bank, profit, bets, stakes):
     try:
         con = sqlite3.connect(DB_FILE)
@@ -161,13 +186,12 @@ def log_arb(slug, sport, roi, bank, profit, bets, stakes):
             b2.get("source", ""), b2.get("outcome", ""),
             b2.get("o", 0), s2,
         )
-        con.execute(
-            "INSERT INTO arbs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", row
-        )
+        con.execute("INSERT INTO arbs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", row)
         con.commit()
         con.close()
     except Exception:
         pass
+
 
 def log_csv(slug, sport, roi, profit):
     try:
@@ -182,6 +206,7 @@ def log_csv(slug, sport, roi, profit):
             ])
     except Exception:
         pass
+
 
 def log_arb_json(slug, sport, roi, bank, profit, payout_rub, bets, stakes,
                  m, rate, first_seen_ts=0.0):
@@ -204,11 +229,9 @@ def log_arb_json(slug, sport, roi, bank, profit, payout_rub, bets, stakes,
                 "currency": currency,
                 "stake_rub": round(stake_rub, 2),
             })
-
         rec = {
             "ts": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
-            "slug": slug,
-            "sport": sport,
+            "slug": slug, "sport": sport,
             "market_type": detect_market_type(slug, m.get("q", "")),
             "question": m.get("q", "")[:200],
             "live": bool(is_live_slug(slug) or m.get("live", False)),
@@ -226,27 +249,26 @@ def log_arb_json(slug, sport, roi, bank, profit, payout_rub, bets, stakes,
     except Exception:
         pass
 
+
 def log_trade(slug, source, bank_used, profit, note):
     try:
         con = sqlite3.connect(DB_FILE)
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        con.execute(
-            "INSERT INTO trades VALUES (?,?,?,?,?,?)",
-            (ts, slug, source, bank_used, profit, note),
-        )
+        con.execute("INSERT INTO trades VALUES (?,?,?,?,?,?)",
+                    (ts, slug, source, bank_used, profit, note))
         con.commit()
         con.close()
         return True
     except Exception:
         return False
 
+
 def today_stats():
     try:
         today = datetime.now().strftime("%Y-%m-%d")
         con = sqlite3.connect(DB_FILE)
         cur = con.execute(
-            "SELECT COUNT(*), COALESCE(SUM(profit),0) "
-            "FROM arbs WHERE ts LIKE ?",
+            "SELECT COUNT(*), COALESCE(SUM(profit),0) FROM arbs WHERE ts LIKE ?",
             (today + "%",),
         )
         r = cur.fetchone()
@@ -254,6 +276,7 @@ def today_stats():
         return int(r[0]), float(r[1])
     except Exception:
         return 0, 0.0
+
 
 def copy_to_clipboard(text):
     if sys.platform == "win32":
@@ -264,6 +287,7 @@ def copy_to_clipboard(text):
         except Exception:
             return False
     return False
+
 
 def beep(live=False):
     mel = MELODY_LIVE if live else MELODY_PREMATCH
@@ -282,6 +306,7 @@ def beep(live=False):
         sys.stdout.flush()
         time.sleep(0.25)
 
+
 def fmt_ago(sec):
     if sec < 1:
         return "0s"
@@ -290,6 +315,7 @@ def fmt_ago(sec):
     if m > 0:
         return "%dm %ds" % (m, s)
     return "%ds" % s
+
 
 def fmt_until(iso):
     if not iso:
@@ -309,12 +335,14 @@ def fmt_until(iso):
     except Exception:
         return ""
 
+
 def is_streamer(slug, q):
     s = (slug + " " + q).lower()
     for k in STREAMER_KEYS:
         if k in s:
             return True
     return False
+
 
 def detect_sport(slug):
     s = slug.lower()
@@ -328,8 +356,14 @@ def detect_sport(slug):
             return n
     return "OTHER"
 
+
 def detect_market_type(slug, question):
     s = (slug + " " + question).lower()
+    if "handicap" in s or "spread" in s:
+        return "HANDICAP"
+    if ("total-games" in s or "round-total" in s
+            or "match-total" in s or "set-totals" in s):
+        return "TOTAL"
     keys = [
         ("-game1", "MAP1"), ("-game2", "MAP2"), ("-game3", "MAP3"),
         ("-game4", "MAP4"), ("-game5", "MAP5"),
@@ -344,6 +378,7 @@ def detect_market_type(slug, question):
             return n
     return "MATCH"
 
+
 def is_live_slug(slug):
     s = slug.lower()
     for k in ["-game1", "-game2", "-game3", "-game4", "-game5",
@@ -351,6 +386,7 @@ def is_live_slug(slug):
         if k in s:
             return True
     return False
+
 
 def linked_slugs(slug):
     base = slug
@@ -367,6 +403,7 @@ def linked_slugs(slug):
             out.append(c)
     return out
 
+
 def color_sport(sport):
     if sport == "CS2":
         return C.G
@@ -379,6 +416,7 @@ def color_sport(sport):
     if sport == "TENNIS":
         return C.B
     return C.W
+
 
 def color_roi(roi):
     if roi >= 0.10:
@@ -393,6 +431,7 @@ def color_roi(roi):
         return C.Y
     return C.R
 
+
 def color_mtype(mtype):
     if mtype == "MATCH":
         return C.B
@@ -406,6 +445,7 @@ def color_mtype(mtype):
         return C.O
     return C.W
 
+
 def color_bk_speed(bk_name, bk_profiles):
     sec = bk_profiles.get(bk_name, {}).get("update_seconds", 0)
     if sec == 0:
@@ -416,6 +456,7 @@ def color_bk_speed(bk_name, bk_profiles):
         return C.Y
     return C.R
 
+
 class Feed(threading.Thread):
     def __init__(self, ids):
         super().__init__(daemon=True)
@@ -425,11 +466,7 @@ class Feed(threading.Thread):
         while not STOP.is_set():
             try:
                 ws = websocket.create_connection(WS_URL, timeout=10)
-                p = {
-                    "type": "market",
-                    "assets_ids": self.ids,
-                    "initial_dump": True,
-                }
+                p = {"type": "market", "assets_ids": self.ids, "initial_dump": True}
                 ws.send(json.dumps(p))
                 last = time.time()
                 while not STOP.is_set():
@@ -459,43 +496,111 @@ class Feed(threading.Thread):
             self._a(it)
 
     def _a(self, d):
-        if d.get("event_type") != "book":
+        et = d.get("event_type")
+        if et == "book":
+            aid = d.get("asset_id")
+            if not aid:
+                return
+            bids = []
+            asks = []
+            for x in d.get("bids", []) or []:
+                try:
+                    sz = float(x["size"])
+                    if sz > 0:
+                        bids.append((float(x["price"]), sz))
+                except Exception:
+                    pass
+            for x in d.get("asks", []) or []:
+                try:
+                    sz = float(x["size"])
+                    if sz > 0:
+                        asks.append((float(x["price"]), sz))
+                except Exception:
+                    pass
+            bids.sort(key=lambda z: -z[0])
+            asks.sort(key=lambda z: z[0])
+            now = time.time()
+            with LOCK:
+                prev = BOOKS.get(aid)
+                prev_ask = prev["asks"][0][0] if prev and prev.get("asks") else None
+                cur_ask = asks[0][0] if asks else None
+                if prev is None or prev_ask != cur_ask:
+                    last_change = now
+                else:
+                    last_change = prev.get("last_change", now)
+                BOOKS[aid] = {"bids": bids, "asks": asks,
+                              "ts": now, "last_change": last_change}
             return
-        aid = d.get("asset_id")
-        if not aid:
+        if et == "price_change":
+            pcs = d.get("price_changes") or d.get("changes") or []
+            now = time.time()
+            with LOCK:
+                for ch in pcs:
+                    aid = ch.get("asset_id")
+                    if not aid:
+                        continue
+                    prev = BOOKS.get(aid)
+                    if not prev:
+                        continue
+                    try:
+                        side = (ch.get("side") or "").upper()
+                        price = float(ch.get("price", 0))
+                        size = float(ch.get("size", 0))
+                    except Exception:
+                        continue
+                    if price <= 0:
+                        continue
+                    bids = {p: s for p, s in prev.get("bids", [])}
+                    asks = {p: s for p, s in prev.get("asks", [])}
+                    book_side = bids if side == "BUY" else asks
+                    if size <= 0:
+                        book_side.pop(price, None)
+                    else:
+                        book_side[price] = size
+                    new_bids = sorted(bids.items(), key=lambda z: -z[0])
+                    new_asks = sorted(asks.items(), key=lambda z: z[0])
+                    prev_ask = prev["asks"][0][0] if prev.get("asks") else None
+                    cur_ask = new_asks[0][0] if new_asks else None
+                    if prev_ask != cur_ask:
+                        last_change = now
+                    else:
+                        last_change = prev.get("last_change", now)
+                    BOOKS[aid] = {"bids": new_bids, "asks": new_asks,
+                                  "ts": now, "last_change": last_change}
             return
-        bids = []
-        asks = []
-        for x in d.get("bids", []) or []:
-            try:
-                sz = float(x["size"])
-                if sz > 0:
-                    bids.append((float(x["price"]), sz))
-            except Exception:
-                pass
-        for x in d.get("asks", []) or []:
-            try:
-                sz = float(x["size"])
-                if sz > 0:
-                    asks.append((float(x["price"]), sz))
-            except Exception:
-                pass
-        bids.sort(key=lambda z: -z[0])
-        asks.sort(key=lambda z: z[0])
-        with LOCK:
-            BOOKS[aid] = {"bids": bids, "asks": asks}
+        if et == "last_trade_price":
+            aid = d.get("asset_id")
+            if not aid:
+                return
+            now = time.time()
+            with LOCK:
+                prev = BOOKS.get(aid)
+                if prev:
+                    prev["ts"] = now
+            return
+
+
+BOOK_TTL = 30.0
+
 
 def best_ask(aid):
     with LOCK:
         b = BOOKS.get(aid)
         if not b or not b["asks"]:
             return 0.0
+        ts = b.get("ts", 0.0)
+        if ts <= 0 or (time.time() - ts) > BOOK_TTL:
+            return 0.0
         return b["asks"][0][0]
+
 
 def walk_book(aid, target):
     with LOCK:
         b = BOOKS.get(aid)
         if not b:
+            return None
+        ts = b.get("ts", 0.0)
+        if ts <= 0 or (time.time() - ts) > BOOK_TTL:
             return None
         levels = list(b["asks"])
     rem = target
@@ -509,6 +614,79 @@ def walk_book(aid, target):
     if rem > 1e-9:
         return None
     return total / target
+
+
+def pm_age_sec(aid):
+    with LOCK:
+        b = BOOKS.get(aid)
+        if not b:
+            return None
+        lc = b.get("last_change") or b.get("ts") or 0
+        if lc <= 0:
+            return None
+        return round(time.time() - lc, 1)
+
+
+_FRESH_COOLDOWN = {}
+_FRESH_MIN_INTERVAL = 20.0
+_STALE_THRESHOLD = 15.0
+
+
+def _fresh_pm_book(token_id, timeout=6.0):
+    try:
+        r = requests.get("https://clob.polymarket.com/book",
+                         params={"token_id": token_id}, timeout=timeout)
+        r.raise_for_status()
+        book = r.json()
+    except Exception:
+        return None
+    bids, asks = [], []
+    for x in (book.get("bids") or []):
+        try:
+            p = float(x.get("price", 0)); s = float(x.get("size", 0))
+            if p > 0 and s > 0:
+                bids.append((p, s))
+        except Exception:
+            pass
+    for x in (book.get("asks") or []):
+        try:
+            p = float(x.get("price", 0)); s = float(x.get("size", 0))
+            if p > 0 and s > 0:
+                asks.append((p, s))
+        except Exception:
+            pass
+    if not bids and not asks:
+        return None
+    bids.sort(key=lambda z: -z[0])
+    asks.sort(key=lambda z: z[0])
+    return bids, asks
+
+
+def _maybe_refresh_stale(token_id):
+    age = pm_age_sec(token_id)
+    if age is None or age < _STALE_THRESHOLD:
+        return False
+    now = time.time()
+    last = _FRESH_COOLDOWN.get(token_id, 0.0)
+    if now - last < _FRESH_MIN_INTERVAL:
+        return False
+    _FRESH_COOLDOWN[token_id] = now
+    fresh = _fresh_pm_book(token_id)
+    if not fresh:
+        return False
+    bids_f, asks_f = fresh
+    with LOCK:
+        prev = BOOKS.get(token_id)
+        prev_ask = prev["asks"][0][0] if prev and prev.get("asks") else None
+        cur_ask = asks_f[0][0] if asks_f else None
+        if prev is None or prev_ask != cur_ask:
+            last_change = now
+        else:
+            last_change = prev.get("last_change", now) if prev else now
+        BOOKS[token_id] = {"bids": bids_f, "asks": asks_f,
+                           "ts": now, "last_change": last_change}
+    return True
+
 
 def get_rate():
     try:
@@ -526,6 +704,7 @@ def get_rate():
         return None
     return None
 
+
 def eff_mult(odds, comm, slip):
     if odds <= 1.0:
         return 0.0
@@ -533,6 +712,7 @@ def eff_mult(odds, comm, slip):
     if x <= 1.0:
         return 0.0
     return 1.0 + (x - 1.0) * (1.0 - comm)
+
 
 def compute(bets, bank):
     ms = [eff_mult(b["o"], b["c"], b["s"]) for b in bets]
@@ -542,6 +722,7 @@ def compute(bets, bank):
     roi = 1.0 / inv - 1.0
     stakes = [bank * (1.0 / m) / inv for m in ms]
     return {"roi": roi, "stakes": stakes, "payout": bank / inv}
+
 
 def refine_stakes(bets, result, rate):
     if not result:
@@ -561,7 +742,7 @@ def refine_stakes(bets, result, rate):
             avg = walk_book(b.get("token", ""), shares)
             if not avg or avg <= 0:
                 continue
-            new_o = 1.0 / (avg * rate)
+            new_o = (1.0 / (avg * rate)) / (1.0 + PM_FEE_PCT)
             if abs(new_o - b["o"]) / b["o"] > 0.0005:
                 b["o"] = new_o
                 changed = True
@@ -570,13 +751,10 @@ def refine_stakes(bets, result, rate):
         result = compute(bets, result["payout"] / (1 + result["roi"]))
     return result
 
+
 def fetch_market(slug):
     try:
-        r = requests.get(
-            GAMMA + "/markets",
-            params={"slug": slug},
-            timeout=TIMEOUT,
-        )
+        r = requests.get(GAMMA + "/markets", params={"slug": slug}, timeout=TIMEOUT)
         r.raise_for_status()
         d = r.json()
     except Exception:
@@ -597,6 +775,7 @@ def fetch_market(slug):
     except Exception:
         return None
 
+
 def _is_live_by_time(iso):
     if not iso:
         return False
@@ -609,8 +788,8 @@ def _is_live_by_time(iso):
     except Exception:
         return False
 
+
 def fetch_live_pm_slugs():
-    """Все live slug'и PM (по tag_slug'ам esports/tennis)."""
     tags = ["esports", "cs2", "dota-2", "league-of-legends",
             "valorant", "tennis", "atp"]
     out = set()
@@ -637,9 +816,8 @@ def fetch_live_pm_slugs():
                     out.add(s)
     return list(out)
 
+
 def fetch_live_pm_markets():
-    """Собирает market_map из /events. Фильтр: sport-prefix слаги.
-    v2: пробуем и live=true, и без него — чтобы поймать live CS2/Dota2/LoL."""
     tags = ["esports", "cs2", "dota-2", "league-of-legends",
             "valorant", "tennis", "atp"]
     PREFIXES = ("cs2-", "dota2-", "lol-", "valorant-",
@@ -652,9 +830,7 @@ def fetch_live_pm_markets():
                           "active": "true", "closed": "false"}
                 if live_mode:
                     params["live"] = live_mode
-                r = requests.get(
-                    GAMMA + "/events", params=params, timeout=TIMEOUT,
-                )
+                r = requests.get(GAMMA + "/events", params=params, timeout=TIMEOUT)
                 r.raise_for_status()
                 events = r.json()
             except Exception:
@@ -675,21 +851,16 @@ def fetch_live_pm_markets():
                         continue
                     if len(o) != 2 or len(t) != 2:
                         continue
-                    start = (mk.get("eventStartTime") or
-                             ev.get("startTime") or "")
+                    start = (mk.get("eventStartTime") or ev.get("startTime") or "")
                     out[sl] = {
-                        "slug": sl,
-                        "q": mk.get("question", ""),
-                        "o": o,
-                        "t": t,
-                        "start": start,
-                        "live": bool(mk.get("live", False) or
-                                     _is_live_by_time(start)),
+                        "slug": sl, "q": mk.get("question", ""),
+                        "o": o, "t": t, "start": start,
+                        "live": bool(mk.get("live", False) or _is_live_by_time(start)),
                     }
     return out
 
+
 def print_arb(m, bets, r, rate, first_seen, bk):
-    elapsed = time.time() - first_seen
     sport = detect_sport(m["slug"])
     sc = color_sport(sport)
     mtype = detect_market_type(m["slug"], m.get("q", ""))
@@ -718,13 +889,17 @@ def print_arb(m, bets, r, rate, first_seen, bk):
         speed = bk.get(src, {}).get("update_seconds", 0)
         speed_col = color_bk_speed(src, bk)
         speed_str = (speed_col + "(%ds)" % speed + C.RST) if speed > 0 else ""
-        src_col = C.M if src == "Polymarket" else C.G
+        if src == "Polymarket":
+            src_col = C.M
+        elif src == "1win":
+            src_col = C.O
+        else:
+            src_col = C.G
 
-        # PM — в USD, BB — в RUB
         if src == "Polymarket" and rate and rate > 0:
             stake_str = "$%.2f" % (st / rate)
-            min_warn = " !" if (st / rate) < 1.0 else ""
-            stake_str += min_warn
+            if (st / rate) < 1.0:
+                stake_str += " !"
         else:
             stake_str = "%.0f RUB" % st
 
@@ -744,22 +919,33 @@ def print_arb(m, bets, r, rate, first_seen, bk):
     print("  Payout:   %s%.0f%s%s" % (C.W, r["payout"], RUB, C.RST))
     print("  Type:     " + (C.Y + "LIVE" + C.RST if is_live else C.B + "PREMATCH" + C.RST))
 
+
 # =================================================================
-#                  BetBoom ↔ Polymarket integration
+#          BK <-> Polymarket integration (bk_router + fallback BB)
 # =================================================================
 
 def _pm_token(slug):
-    """Возвращает список token-id для PM-рынка."""
     m = fetch_market(slug)
     return (m or {}).get("t") or []
 
-def build_arb_candidates(m, live_bc, slip, bank=0.0, rate=0.0):
+
+def _book_top_levels(token_id, n=3):
+    with LOCK:
+        b = BOOKS.get(token_id)
+        if not b or not b.get("asks"):
+            return []
+        ts = b.get("ts", 0.0)
+        if ts <= 0 or (time.time() - ts) > BOOK_TTL:
+            return []
+        return list(b["asks"][:n])
+
+
+def build_arb_candidates(m, live_bc, slip, bank=0.0, rate=0.0, bk_source="BetBoom"):
     pm_o = m.get("o") or []
     pm_t = m.get("t") or []
     if len(pm_o) != 2 or len(pm_t) != 2 or not live_bc:
         return []
 
-    # размер PM-ноги в USD (половина банка, но 20..200)
     usd_target = 50.0
     try:
         if bank and rate and rate > 0:
@@ -769,23 +955,38 @@ def build_arb_candidates(m, live_bc, slip, bank=0.0, rate=0.0):
 
     pm_legs = []
     for i, oc in enumerate(pm_o):
+        try:
+            _maybe_refresh_stale(pm_t[i])
+        except Exception:
+            pass
         ba = best_ask(pm_t[i])
         if ba <= 0:
             return []
-        # проскальзывание: покупаем ~usd_target USD
         shares = usd_target / ba
         avg = walk_book(pm_t[i], shares)
-        effective = avg if (avg and avg > 0) else ba
+        if not avg or avg <= 0:
+            return []
+        if avg > ba * 1.05:
+            return []
+        try:
+            ba_levels = _book_top_levels(pm_t[i], n=3)
+            total_top = sum(p * s for p, s in ba_levels)
+            if total_top < usd_target * 0.8:
+                return []
+        except Exception:
+            pass
         pm_legs.append({
             "source": "Polymarket",
             "outcome": oc,
-            "o": 1.0 / effective,
+            "o": (1.0 / avg) / (1.0 + PM_FEE_PCT),
             "c": 0.0,
             "s": slip,
             "token": pm_t[i],
+            "pm_age": pm_age_sec(pm_t[i]),
+            "pm_verified": pm_t[i] in _FRESH_COOLDOWN,
         })
 
-    bb_legs = {}
+    bk_legs = {}
     for oc, info in live_bc.items():
         try:
             o = float(info.get("o") or 0)
@@ -793,8 +994,8 @@ def build_arb_candidates(m, live_bc, slip, bank=0.0, rate=0.0):
             continue
         if o <= 1.0:
             continue
-        bb_legs[oc] = {
-            "source": "BetBoom",
+        bk_legs[oc] = {
+            "source": bk_source,
             "outcome": oc,
             "o": o,
             "c": float(info.get("c", 0.0)),
@@ -804,10 +1005,11 @@ def build_arb_candidates(m, live_bc, slip, bank=0.0, rate=0.0):
     pairs = []
     for i, pm_oc in enumerate(pm_o):
         other = pm_o[1 - i]
-        bb = bb_legs.get(other)
+        bb = bk_legs.get(other)
         if bb:
             pairs.append([pm_legs[i], bb])
     return pairs
+
 
 # =================================================================
 #                              main
@@ -821,11 +1023,11 @@ def main():
     ap.add_argument("--bank", type=float, default=0.0, help="override bank size (RUB)")
     ap.add_argument("--min-roi", type=float, default=0.3,
                     help="show arbs with roi >= this %% (default 0.3)")
-    ap.add_argument("--no-bb", action="store_true", help="disable BetBoom bridge")
+    ap.add_argument("--no-bb", action="store_true", help="disable ALL BK bridge")
     ap.add_argument("--watch", action="store_true", help="auto-refresh PM live markets")
-    ap.add_argument("--watch-sec", type=int, default=60, help="watch refresh interval (default 60)")
+    ap.add_argument("--watch-sec", type=int, default=60, help="watch refresh interval")
     ap.add_argument("--alert-gap", type=int, default=120,
-                    help="seconds between repeat alerts for same slug (default 120)")
+                    help="seconds between repeat alerts for same slug")
     args = ap.parse_args()
 
     cfg = load_cfg()
@@ -859,34 +1061,55 @@ def main():
     if not market_map and not args.watch:
         return 1
 
-    # ---------- BetBoom bridge ----------
-    use_bb = BB_ENABLED and not args.no_bb
-    if use_bb:
-        print("[*] connecting to BetBoom tree_ws...")
+    # ---------- BK bridge: bk_router (BB + 1win) с fallback на BB-only ----------
+    router = None
+    if ROUTER_ENABLED and not args.no_bb:
+        print("[*] starting bk_router (BB + 1win)...")
+        try:
+            router = get_router(use_bb=True, use_onewin=True)
+            router.start()
+            ok_bb = router.wait_bb(timeout=60)
+            ok_ow = router.wait_onewin(timeout=45, min_matches=10)
+            print("[*] BB ready: %s | 1win ready: %s" % (ok_bb, ok_ow))
+            if not ok_bb and not ok_ow:
+                print("[!] ни один БК не готов — выход")
+                return 1
+            st = router.stats()
+            print("[*] BK stats: %s" % st)
+        except Exception as e:
+            print("[!] bk_router init failed: %s" % e)
+            router = None
+
+    if router is None:
+        if not (BB_ENABLED and not args.no_bb):
+            why = _BB_ERR if not BB_ENABLED else "disabled"
+            print("[!] нет активных БК: %s" % why)
+            return 1
+        print("[*] fallback: BB-only")
         try:
             get_global_stream(verbose=False)
+            wait_ready(timeout=60)
         except Exception as e:
-            print("[!] BB stream start failed: %s" % e)
-            use_bb = False
+            print("[!] BB start failed: %s" % e)
+            return 1
 
-    if use_bb:
-        ok = wait_ready(timeout=60)
-        print("[*] BB ready: %s" % ("yes" if ok else "no (no matches)"))
-        bound = 0
-        for slug, m in market_map.items():
-            try:
-                b = bind_slug(slug, m)
-            except Exception as e:
-                print("    [!] bind %s: %s" % (slug, e))
-                b = None
-            if b:
-                bound += 1
-        print("[*] bound %d / %d markets to BetBoom" % (bound, len(market_map)))
-    else:
-        why = _BB_ERR if BB_ENABLED is False else "disabled by --no-bb"
-        print("[!] BB bridge off: %s" % why)
-        print("[!] без BB арбов не будет — нужны кэфы БК")
-        return 1
+    # Первичный bind
+    bound_bb = bound_ow = 0
+    for slug, m in market_map.items():
+        try:
+            if router is not None:
+                b, src = router.bind(slug, m)
+                if b:
+                    if src == "BetBoom":
+                        bound_bb += 1
+                    else:
+                        bound_ow += 1
+            else:
+                if bind_slug(slug, m):
+                    bound_bb += 1
+        except Exception as e:
+            print("    [!] bind %s: %s" % (slug, e))
+    print("[*] bound BB=%d 1win=%d / %d" % (bound_bb, bound_ow, len(market_map)))
 
     # ---------- CBR rate ----------
     rate = get_rate()
@@ -913,22 +1136,34 @@ def main():
     last_alert = {}
     last_roi = {}
     last_sig = {}
+    printed_once = set()
+    upd_count = {}
     alert_gap = float(args.alert_gap)
+
     def retry_bind():
-        stream = get_global_stream()
-        unbound = [s for s in market_map if s not in stream.bindings]
+        if router is not None:
+            with router._lock:
+                src_now = set(router.bindings.keys())
+            unbound = [s for s in market_map if s not in src_now]
+        else:
+            stream = get_global_stream()
+            unbound = [s for s in market_map if s not in stream.bindings]
         if not unbound:
             return 0
         n = 0
         for slug in unbound:
             try:
-                if bind_slug(slug, market_map[slug]):
-                    n += 1
+                if router is not None:
+                    b, _ = router.bind(slug, market_map[slug])
+                    if b:
+                        n += 1
+                else:
+                    if bind_slug(slug, market_map[slug]):
+                        n += 1
             except Exception:
                 pass
         if n:
-            print("[*] retry-bind: +%d (total %d / %d)" % (
-                n, len(market_map) - len(unbound) + n, len(market_map)))
+            print("[*] retry-bind: +%d (unbound было %d)" % (n, len(unbound)))
         return n
 
     last_retry = time.time()
@@ -936,7 +1171,6 @@ def main():
 
     try:
         while not STOP.is_set():
-            # watch: подхват новых PM-маркетов
             if args.watch and time.time() - last_pm_refresh >= args.watch_sec:
                 fresh = fetch_live_pm_markets()
                 added = 0
@@ -949,51 +1183,158 @@ def main():
                           % (added, len(market_map)))
                 last_pm_refresh = time.time()
 
-            # retry-bind каждые 10 сек
             if time.time() - last_retry >= 10:
                 retry_bind()
                 last_retry = time.time()
 
+            live_snap = {}
             for slug, m in market_map.items():
-                live_bc = get_live_bc(slug)
+                if router is not None:
+                    live_bc = router.live_bc(slug)
+                    _bk_src = router.get_src(slug) or "BetBoom"
+                else:
+                    live_bc = get_live_bc(slug)
+                    _bk_src = "BetBoom"
                 if not live_bc:
                     continue
 
-                pairs = build_arb_candidates(m, live_bc, slip, bank, rate)
+                pairs = build_arb_candidates(m, live_bc, slip, bank, rate,
+                                             bk_source=_bk_src)
                 for bets in pairs:
                     r = compute(bets, bank)
                     if not r:
                         continue
-
                     roi = r["roi"]
                     if roi < min_roi:
                         continue
 
+                    # --- web snapshot ---
+                    try:
+                        _prf = r["payout"] - (r["payout"] / (1.0 + roi))
+                        _bb_b = None
+                        _bb_stakes_debug = []
+                        if router is not None:
+                            try:
+                                _pair = router.bindings.get(slug)
+                                _bb_b = _pair[1] if _pair else None
+                                _bb_stakes_debug = router.bb_stakes_debug(slug)
+                            except Exception as _e:
+                                _bb_stakes_debug = [{'err': str(_e)}]
+                        else:
+                            try:
+                                from bb_bridge import get_binding as _gb, get_global_stream as _g2
+                                _bb_b = _gb(slug)
+                                _s2 = _g2()
+                                if _bb_b:
+                                    for _st in _s2.snapshot_stakes(_bb_b['match_id']):
+                                        _mn = (_st.get('market_name') or '').lower()
+                                        _pn = (_st.get('period_name') or '').lower()
+                                        _want = (
+                                            'map' in _mn or 'карт' in _mn
+                                            or 'winner' in _mn or 'исход' in _mn
+                                            or 'map' in _pn or 'карт' in _pn
+                                        )
+                                        if not _want:
+                                            continue
+                                        _bb_stakes_debug.append({
+                                            'market_name': _st.get('market_name'),
+                                            'period_name': _st.get('period_name'),
+                                            'market_slug': _st.get('market_slug'),
+                                            'display_name': _st.get('display_name'),
+                                            'short_name': _st.get('short_name'),
+                                            'name': _st.get('name'),
+                                            'factor': _st.get('factor'),
+                                            'map_num': _st.get('map_num'),
+                                            'is_active': _st.get('is_active'),
+                                            'url': (_st.get('url') or '')[:140],
+                                        })
+                            except Exception as _e:
+                                _bb_stakes_debug = [{'err': str(_e)}]
+                        _pm_age = None
+                        for _b in bets:
+                            if _b.get("source") == "Polymarket":
+                                _pm_age = _b.get("pm_age")
+                                break
+                        live_snap[slug] = {
+                            "slug": slug,
+                            "q": m.get("q", ""),
+                            "sport": detect_sport(slug),
+                            "market_type": detect_market_type(slug, m.get("q", "")),
+                            "roi": float(roi),
+                            "bank": float(bank),
+                            "rate": float(rate or 0),
+                            "bets": [
+                                {
+                                    "source": b.get("source"),
+                                    "outcome": b.get("outcome"),
+                                    "o": float(b.get("o") or 0),
+                                    "c": float(b.get("c") or 0),
+                                    "s": float(b.get("s") or 0),
+                                    "pm_age": b.get("pm_age"),
+                                } for b in bets
+                            ],
+                            "stakes": [float(x) for x in r["stakes"]],
+                            "payout": float(r["payout"]),
+                            "profit": float(_prf),
+                            "is_live": bool(is_live_slug(slug) or _is_live_by_time(m.get("start", ""))),
+                            "is_streamer": bool(is_streamer(slug, m.get("q", ""))),
+                            "pm_age": _pm_age,
+                            "bk_source": _bk_src,
+                            "bb_match_id": (_bb_b or {}).get("match_id"),
+                            "bb_tournament_id": (_bb_b or {}).get("tournament_id"),
+                            "bb_binding": _bb_b,
+                            "bb_stakes_debug": _bb_stakes_debug,
+                            "ts": time.time(),
+                        }
+                    except Exception:
+                        pass
+                    # --- /web snapshot ---
+
                     now = time.time()
-                    # v41: дедуп по хешу (slug + кэфы обеих ног).
-                    # Алертим только когда кэфы реально поменялись
-                    # ИЛИ ROI вырос >= 0.3 п.п.
-                    sig = (round(float(bets[0]["o"]), 3),
-                           round(float(bets[1]["o"]), 3) if len(bets) > 1 else None)
                     prev_sig = last_sig.get(slug)
                     prev_roi = last_roi.get(slug)
-                    should_alert = False
-                    if prev_sig is None:
-                        should_alert = True
-                    elif sig != prev_sig:
-                        should_alert = True
-                    elif prev_roi is not None and roi > prev_roi + 0.003:
-                        should_alert = True
-                    if not should_alert:
+
+                    sig = (round(float(bets[0]["o"]), 2),
+                           round(float(bets[1]["o"]), 2) if len(bets) > 1 else None)
+
+                    changed = (prev_sig is None
+                               or sig != prev_sig
+                               or (prev_roi is not None and abs(roi - prev_roi) >= 0.005))
+                    if not changed:
                         continue
 
                     last_sig[slug] = sig
                     last_alert[slug] = now
                     last_roi[slug] = roi
                     fs = first_seen.setdefault(slug, now)
-
                     is_live = args.live or is_live_slug(slug) or m.get("live", False)
-                    print_arb(m, bets, r, rate, fs, bk)
+
+                    if slug not in printed_once:
+                        printed_once.add(slug)
+                        upd_count[slug] = 0
+                        print_arb(m, bets, r, rate, fs, bk)
+                    else:
+                        upd_count[slug] = upd_count.get(slug, 0) + 1
+                        pm_o = next((b["o"] for b in bets
+                                     if b.get("source") == "Polymarket"), 0.0)
+                        bk_o = next((b["o"] for b in bets
+                                     if b.get("source") != "Polymarket"), 0.0)
+                        pm_st = bk_st = 0.0
+                        for i, b in enumerate(bets):
+                            if b.get("source") == "Polymarket":
+                                pm_st = r["stakes"][i] / rate if rate and rate > 0 else r["stakes"][i]
+                            else:
+                                bk_st = r["stakes"][i]
+                        profit_upd = r["payout"] - (r["payout"] / (1.0 + roi))
+                        print("  [~] %s [%s] upd#%-3d  PM %.2f/$%.2f  %s %.2f/%.0fR  ROI %+.1f%% (was %+.1f%%)  profit +%.0fR" % (
+                            slug[:38],
+                            detect_market_type(slug, m.get("q", "")),
+                            upd_count[slug],
+                            pm_o, pm_st,
+                            _bk_src, bk_o, bk_st,
+                            roi * 100, prev_roi * 100 if prev_roi is not None else roi * 100,
+                            profit_upd,
+                        ))
 
                     profit = r["payout"] - (r["payout"] / (1.0 + roi))
                     try:
@@ -1005,10 +1346,15 @@ def main():
                                      m, rate, first_seen_ts=fs)
                     except Exception:
                         pass
-                    try:
-                        beep(live=is_live)
-                    except Exception:
-                        pass
+
+            _now = time.time()
+            if _now - globals().get('_last_snap_write', 0) >= 2.0:
+                try:
+                    with open("arbs_live.json", "w", encoding="utf-8") as _f:
+                        json.dump(live_snap, _f, ensure_ascii=False)
+                    globals()['_last_snap_write'] = _now
+                except Exception:
+                    pass
 
             time.sleep(poll)
     except KeyboardInterrupt:
@@ -1017,12 +1363,16 @@ def main():
     finally:
         STOP.set()
         try:
-            from bb_bridge import stop_global_stream
-            stop_global_stream()
+            if router is not None:
+                router.stop()
+            else:
+                from bb_bridge import stop_global_stream
+                stop_global_stream()
         except Exception:
             pass
 
     return 0
+
 
 if __name__ == "__main__":
     try:

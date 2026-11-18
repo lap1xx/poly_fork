@@ -1,17 +1,20 @@
 {
   "bank": 2500,
-  "rate": 0,
-  "scan": {
-    "top": 800,
-    "show": 40,
-    "min_volume": 80,
-    "min_notional": 50,
-    "max_overround": 1.05,
-    "sport": "",
-    "tier": ""
+  "rate": 85,
+  "pm_fee_pct": 0.04,
+  "safe_fork_threshold": 0.45,
+  "poll": 0.3,
+  "slip": 0.0,
+  "live_min_roi_show": -3.0,
+  "secondary_bk": {
+    "enabled": true,
+    "name": "1win",
+    "color": "#ff8844"
   },
-  "bot": {
-    "poll": 1.0,
-    "slip": 0.0
+  "onewin": {
+    "enabled": true
+  },
+  "bb": {
+    "enabled": true
   }
 }

@@ -1,4 +1,5 @@
-# bb_bridge.py - BetBoom tree_ws <-> POLY-ARB bridge. v6.
+# bb_bridge.py - BetBoom tree_ws <-> POLY-ARB bridge. v10.
+# v10: работает через chrome_bridge.py на ws://127.0.0.1:8765/ (обход TLS/JA3).
 # v6: _winner_side определяет исход по URL если display_name/name пустые.
 # v5: parse_stake всегда проставляет st["map_num"]; универсальный walker для f29/f30/f17.
 from __future__ import annotations
@@ -10,7 +11,7 @@ try:
 except ImportError:
     websocket = None
 
-BB_URL = "wss://ru-ws2.sporthub.bet:443/api/tree_ws/v1"
+BB_URL = "ws://127.0.0.1:8765/"
 BB_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 BB_ORIGIN = "https://betboom.ru"
 BB_REFERER = "https://betboom.ru/"
@@ -19,7 +20,8 @@ D_CYBER = 2
 SPORT_TENNIS = 4
 SPORT_ESPORTS = 1
 LIVE = 1
-DEFAULT_SUBS = [(D_SPORT, SPORT_TENNIS, "TENNIS"), (D_CYBER, SPORT_ESPORTS, "CYBER")]
+PREMATCH = 2
+DEFAULT_SUBS = [(D_SPORT, SPORT_TENNIS, "TENNIS"),(D_CYBER, SPORT_ESPORTS, "CYBER")]
 
 _PM_TOTAL_RE = re.compile(r"-(?:total|match-total|total-games|total-maps)-(\d+)pt(\d+)", re.I)
 _PM_HANDICAP_RE = re.compile(r"-(?:game-handicap|map-handicap|handicap|spread)-(-?\d+)pt(\d+)", re.I)
@@ -44,7 +46,6 @@ def _stake_map_num(st):
     if m:
         try: return int(m.group(1))
         except Exception: pass
-
     pn = st.get("period_name") or st.get("period_name_alt") or ""
     low = pn.lower()
     if "карт" in low or "map" in low:
@@ -52,25 +53,21 @@ def _stake_map_num(st):
         if m:
             try: return int(m.group(1))
             except Exception: pass
-
     mn = st.get("market_name") or ""
     m = _MAP_NUM_IN_MARKET.search(mn)
     if m:
         try: return int(m.group(1) or m.group(2))
         except Exception: pass
-
     cid = st.get("composite_id") or ""
     m = _COMPOSITE_MAP_RE.search(cid)
     if m:
         try: return int(m.group(1))
         except Exception: pass
-
     slug = st.get("market_slug") or ""
     m = _MAP_SLUG_RE.search(slug)
     if m:
         try: return int(m.group(1))
         except Exception: pass
-
     return None
 
 def _stake_line(st):
@@ -290,7 +287,6 @@ def parse_stake(raw):
             elif fn == 25:
                 ss = try_str(v)
                 if ss: st["display_name"] = ss
-
     if "period_name" not in st and "f18" in st:
         st["period_name"] = st["f18"]
     st["map_num"] = _stake_map_num(st)
@@ -367,10 +363,11 @@ def _slug_sport_hint(slug):
     return None
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
+_TEAM_STOPWORDS = {"esports","e","sports","team","gaming","academy","club","stars","gg","roster","squad","pro","lol","cs2","dota2","dota"}
 
 def _tokens(x):
     if not x: return set()
-    return set(_TOKEN_RE.findall(x.lower()))
+    return set(_TOKEN_RE.findall(x.lower())) - _TEAM_STOPWORDS
 
 def name_match_score(pm_name, bb_name):
     if not pm_name or not bb_name: return 0.0
@@ -397,7 +394,7 @@ def team_match_score(pm_name, bb_team):
         if sc > best: best = sc
     return best
 
-def match_pm_to_bb(pm_market, bb_matches, min_score=0.6):
+def match_pm_to_bb(pm_market, bb_matches, min_score=0.7, date_window_days=1):
     pm_o = pm_market.get("o") or []
     slug = pm_market.get("slug") or ""
     if len(pm_o) != 2: return None, 0.0
@@ -408,24 +405,32 @@ def match_pm_to_bb(pm_market, bb_matches, min_score=0.6):
         if not t1 or not t2: return None, 0.0
         match_names = [t1, t2]
     sport_hint = _slug_sport_hint(slug)
+    # Для кибера — жёстче порог (0.85), теннис — обычный (0.7)
+    effective_min = 0.85 if sport_hint == "CYBER" else min_score
     pm_date = _slug_date(slug)
     if not pm_date and pm_market.get("start"):
         dt = _parse_iso(pm_market["start"])
         if dt: pm_date = dt.date()
     best, best_score = None, 0.0
     for bm in bb_matches:
-        if sport_hint and bm.get("_label") != sport_hint: continue
+        bb_hint = bm.get("_label")
+        f8 = bm.get("f8_sport")
+        if f8 == 4:   bb_hint = "TENNIS"
+        elif f8 == 1: bb_hint = "CYBER"
+        if sport_hint and bb_hint and bb_hint != sport_hint: continue
         bb_dt = _parse_iso(bm.get("start_dttm") or "")
         bb_date = bb_dt.date() if bb_dt else None
-        if pm_date and bb_date and abs((bb_date - pm_date).days) > 1: continue
+        if pm_date and bb_date and abs((bb_date - pm_date).days) > date_window_days: continue
         teams = bm.get("teams") or []
         if len(teams) < 2: continue
-        direct = (team_match_score(match_names[0], teams[0]) + team_match_score(match_names[1], teams[1])) / 2.0
-        swapped = (team_match_score(match_names[0], teams[1]) + team_match_score(match_names[1], teams[0])) / 2.0
-        score = max(direct, swapped)
+        s_a  = team_match_score(match_names[0], teams[0])
+        s_b  = team_match_score(match_names[1], teams[1])
+        s_as = team_match_score(match_names[0], teams[1])
+        s_bs = team_match_score(match_names[1], teams[0])
+        score = max(min(s_a, s_b), min(s_as, s_bs))
         if score > best_score:
             best_score, best = score, bm
-    return (best, best_score) if best_score >= min_score else (None, 0.0)
+    return (best, best_score) if best_score >= effective_min else (None, 0.0)
 
 _PM_UNSUPPORTED = (
     "-both-teams", "-kill-", "-first-set-", "-set-totals",
@@ -459,9 +464,10 @@ def pm_market_kind(slug):
 def _arg_from_display(name):
     if not name: return None
     m = re.search(r"\(([-+]?\d+\.?\d*)\)", name)
-    if not m: return None
+    if not m:         return None
     try: return float(m.group(1))
     except Exception: return None
+
 
 def _is_winner_stake(st):
     mn = (st.get("market_name") or "").lower()
@@ -542,7 +548,6 @@ def _winner_side(st):
             return "home"
         if v in ("win2", "п2", "2", "t2", "away", "w2"):
             return "away"
-
     url = (st.get("url") or "")
     path = url.split("?", 1)[0]
     parts = re.findall(r"/([0-9]+)", path)
@@ -552,7 +557,6 @@ def _winner_side(st):
             return "home"
         if oid in _URL_OUTCOME_AWAY:
             return "away"
-
     return None
 
 def _extract_winner(stakes, teams=None):
@@ -564,17 +568,14 @@ def _extract_winner(stakes, teams=None):
         if not st.get("is_active", True):
             continue
         winner_stakes.append(st)
-
     if len(winner_stakes) < 2:
         return None
-
     for st in winner_stakes:
         side = _winner_side(st)
         if side == "home" and home is None:
             home = st
         elif side == "away" and away is None:
             away = st
-
     if home is None and away is None:
         home, away = winner_stakes[0], winner_stakes[1]
     elif home is None:
@@ -587,7 +588,6 @@ def _extract_winner(stakes, teams=None):
             if st is not home:
                 away = st
                 break
-
     if home and away:
         return {"home": home, "away": away}
     return None
@@ -620,7 +620,6 @@ def _extract_map_winner(stakes, map_num):
                 home = next((c for c in cands if c is not away), None)
             elif away is None:
                 away = next((c for c in cands if c is not home), None)
-
     if home and away:
         return {"home": home, "away": away}
     return None
@@ -665,7 +664,9 @@ class BBStream:
         self.bindings = {}
         self._stop = threading.Event()
         self._threads = []
-        self._f16_subs = set() # v7: чтобы не дублировать f16
+        self._f16_subs = set()
+        self._seen_fns = set()
+        self._last_sub_sent = 0.0
 
     def start(self):
         if websocket is None:
@@ -689,38 +690,93 @@ class BBStream:
                 self._connect_and_listen(domain, sport_id, label)
                 backoff = 2.0
             except Exception as e:
-                self.log(f"[BB {label}] {type(e).__name__}: {e}")
+                print(f"[BB {label}] LOOP-ERR {type(e).__name__}: {e}", flush=True)
                 time.sleep(backoff)
                 backoff = min(backoff * 1.6, 20.0)
 
     def _connect_and_listen(self, domain, sport_id, label):
+        print(f"[BB {label}] connecting to {BB_URL} ...", flush=True)
         ws = websocket.create_connection(
-            BB_URL, timeout=10, subprotocols=["protobuf"],
+            BB_URL, timeout=10,
             origin=BB_ORIGIN,
             header={"User-Agent": BB_UA, "Referer": BB_REFERER},
         )
         try:
-            ws.settimeout(3.0)
-            try: ws.recv()
-            except Exception: pass
-            ws.send_binary(req_settings())
             with self.lock:
                 self._ws_by_label[label] = ws
-            try: ws.recv()
-            except Exception: pass
-            ws.send_binary(req_f4(domain, [LIVE]))
-            ws.settimeout(8.0)
-            try: ws.recv()
-            except Exception: pass
-            ws.send_binary(req_f6(sport_id, LIVE))
-            self.log(f"[BB {label}] subscribed (domain={domain}, sport={sport_id})")
+            print(f"[BB {label}] CONNECTED (domain={domain}, sport={sport_id})", flush=True)
             ws.settimeout(2.0)
+            def _do_subscribe():
+                try:
+                    ws.send_binary(req_settings())
+                    time.sleep(0.2)
+                    ws.send_binary(req_f4(domain, [LIVE]))
+                    time.sleep(0.4)
+                    p6 = req_f6(sport_id, LIVE)
+                    ws.send_binary(p6)
+                    ws.send_binary(req_f6(sport_id, PREMATCH))
+                    # print(f"[BB {label}] SUBSCRIBED (domain={domain}, sport={sport_id}) f6_hex={p6.hex()}", flush=True)
+                    return True
+                except Exception as e:
+                    print(f"[BB {label}] subscribe send FAILED: {type(e).__name__}: {e}", flush=True)
+                    return False
+
+            _do_subscribe()
+            self._last_sub_sent = time.time()
+            RESUB_EVERY = 8.0
             while not self._stop.is_set():
-                try: r = ws.recv()
-                except Exception: r = None
-                if not r or isinstance(r, str): continue
+                try:
+                    r = ws.recv()
+                except websocket.WebSocketTimeoutException:
+                    if time.time() - self._last_sub_sent > RESUB_EVERY:
+                        # print(f"[BB {label}] resubscribe (timer)", flush=True)
+                        _do_subscribe()
+                        self._last_sub_sent = time.time()
+                    continue
+                except websocket.WebSocketConnectionClosedException as e:
+                    print(f"[BB {label}] conn closed: {e}", flush=True)
+                    break
+                except Exception as e:
+                    print(f"[BB {label}] recv err: {type(e).__name__}: {e}", flush=True)
+                    break
+                if not r or isinstance(r, str):
+                    continue
                 fn = top_field(r)
-                if fn == 29:
+                # print(f"[RAW {label}] fn={fn} len={len(r)}", flush=True)
+                if len(r) > 500 and fn != 5:
+                    # print(f"[BB {label}] big fn={fn} -> _handle_f30 ({len(r)}B)", flush=True)
+                    try:
+                        self._handle_f30(bytes(r), label)
+                    except Exception as _e:
+                        print(f"[BB {label}] big err: {_e}", flush=True)
+                    continue
+            if fn not in self._seen_fns:
+                self._seen_fns.add(fn)
+                # print(f"[HEX {label}] fn={fn} len={len(r)} hex={bytes(r)[:120].hex()}", flush=True)
+            _now = time.time()
+            if _now - self._last_sub_sent > 0.5:
+                try:
+                    ws.send_binary(req_f6(sport_id, LIVE))
+                    ws.send_binary(req_f6(sport_id, PREMATCH))
+                    self._last_sub_sent = _now
+                    # print(f"[BB {label}] RESUB (any-frame) after fn={fn}", flush=True)
+                except Exception as _e:
+                    print(f"[BB {label}] resub fail: {_e}", flush=True)
+                if fn == 5:
+                    # tree arrived - Chrome hook is alive, resend subscribe
+                    now = time.time()
+                    if now - self._last_sub_sent > 1.0:
+                        try:
+                            ws.send_binary(req_f6(sport_id, LIVE))
+                            ws.send_binary(req_f6(sport_id, PREMATCH))
+                            self._last_sub_sent = now
+                            print(f"[BB {label}] RESUB on fn=5", flush=True)
+                        except Exception as e:
+                            print(f"[BB {label}] resub fn=5 fail: {e}", flush=True)
+                elif fn == 29:
+                    self._handle_f29(bytes(r), label)
+                elif fn == 7 and len(r) > 500:
+                    print(f"[BB {label}] f7-BIG -> _handle_f29 ({len(r)}B)", flush=True)
                     self._handle_f29(bytes(r), label)
                 elif fn == 30:
                     self._handle_f30(bytes(r), label)
@@ -728,8 +784,6 @@ class BBStream:
                     self._handle_f31(bytes(r), label)
                 elif fn == 17:
                     self._handle_f17(bytes(r), label)
-                elif fn is not None:
-                    self.log(f"[BB {label}] field f{fn} len={len(r)}")
         finally:
             with self.lock:
                 self._ws_by_label.pop(label, None)
@@ -739,19 +793,27 @@ class BBStream:
     def _handle_f29(self, raw, label):
         pl = top_payload(raw)
         if not pl:
+            print(f"[H29 {label}] NO PAYLOAD", flush=True)
             return
         try:
             match, stakes = parse_f29(pl)
-        except Exception:
+        except Exception as e:
+            print(f"[H29 {label}] PARSE ERR: {type(e).__name__}: {e}", flush=True)
             return
+        if match:
+            mid = match.get("match_id")
+            teams = match.get("teams") or []
+            print(f"[H29 {label}] match={mid} teams={len(teams)} stakes={len(stakes)}", flush=True)
+        else:
+            # диагностика: что вообще внутри pl?
+            flds = [fn for fn, wt, v in pf(pl)][:10]
+            print(f"[H29 {label}] NO MATCH, top-fields={flds} pl_len={len(pl)}", flush=True)
         self._store_f29_result(match, stakes, label)
 
     def _handle_f30(self, raw, label):
         pl = top_payload(raw)
-        if not pl:
-            return
-        try:
-            match, stakes = _walk_find_match_and_stakes(pl)
+        if not pl: return
+        try: match, stakes = _walk_find_match_and_stakes(pl)
         except Exception as e:
             self.log(f"[BB {label}] F30 parse error: {e}")
             return
@@ -761,51 +823,47 @@ class BBStream:
 
     def _handle_f17(self, raw, label):
         pl = top_payload(raw)
-        if not pl:
-            return
-        try:
-            match, stakes = _walk_find_match_and_stakes(pl)
+        if not pl: return
+        try: match, stakes = _walk_find_match_and_stakes(pl)
         except Exception as e:
             self.log(f"[BB {label}] F17 parse error: {e}")
             return
         if match or stakes:
             self.log(f"[BB {label}] F17: match={match.get('match_id') if match else None}, "
                      f"stakes={len(stakes)}, pl={len(pl)}")
-            if match or stakes:
-                self._store_f29_result(match, stakes, label)
+            self._store_f29_result(match, stakes, label)
 
     def _handle_f31(self, raw, label):
         pl = top_payload(raw)
-        if not pl:
-            return
-        try:
-            match, stakes = parse_f29(pl)
-        except Exception:
-            return
+        if not pl: return
+        try: match, stakes = parse_f29(pl)
+        except Exception: return
         self._store_f29_result(match, stakes, label)
+
+    _KEEP_F8 = {1, 4}   # 1=Esports, 4=Tennis
 
     def _store_f29_result(self, match, stakes, label):
         now = time.time()
         with self.lock:
             if match and "match_id" in match:
+                # фильтр: только Esports (1) и Tennis (4)
+                # if match.get("f8_sport") not in self._KEEP_F8:
+                #     return
                 match["_label"] = label
                 match["_ts"] = now
                 self.matches[match["match_id"]] = match
             if stakes:
                 fallback_mid = match.get("match_id") if match else None
-                by_mid = {}
                 for st in stakes:
                     mid = st.get("match_id") or fallback_mid
-                    if mid:
-                        st["match_id"] = mid
-                        by_mid.setdefault(mid, []).append(st)
-                for mid, lst in by_mid.items():
+                    if not mid:
+                        continue
+                    st["match_id"] = mid
                     bucket = self.stakes.setdefault(mid, {})
-                    for st in lst:
-                        sid = st.get("stake_id")
-                        if sid:
-                            st["_ts"] = now
-                            bucket[sid] = st
+                    sid = st.get("stake_id")
+                    if sid:
+                        st["_ts"] = now
+                        bucket[sid] = st
 
     def subscribe_f16(self, match_id):
         uid  = uuid.uuid4().hex[:6]
@@ -815,10 +873,8 @@ class BBStream:
         with self.lock:
             ws_list = list(self._ws_by_label.values())
         for ws in ws_list:
-            try:
-                ws.send_binary(payload)
-            except Exception:
-                pass
+            try: ws.send_binary(payload)
+            except Exception: pass
 
     def snapshot_matches(self):
         with self.lock: return list(self.matches.values())
@@ -850,9 +906,11 @@ class BBStream:
         binding = {
             "match_id": bb["match_id"], "kind": kind, "arg": arg,
             "map": mapping, "score": score, "bound_at": time.time(),
+            "tournament_id": bb.get("f10"),
+            "sport_id": bb.get("f8_sport"),
         }
         with self.lock:
-            self.bindings[slug] = binding # v7: запросить полный матч (f30/f17), чтобы получить карточные стейки
+            self.bindings[slug] = binding
         if kind == "map_winner" and bb["match_id"] not in self._f16_subs:
             self._f16_subs.add(bb["match_id"])
             try:
@@ -870,19 +928,14 @@ class BBStream:
         if not stakes: return {}
         if b["kind"] == "map_winner":
             winners = _extract_map_winner(stakes, b["arg"])
-            if not winners:
-                return {}
+            if not winners: return {}
             out = {}
             for pm_oc, side in b["map"].items():
                 st = winners.get(side)
-                if not st:
-                    continue
+                if not st: continue
                 f = st.get("factor")
-                if f is None or f <= 1.0:
-                    continue
-                out[pm_oc] = {"src": "BetBoom",
-                              "o": round(float(f), 4),
-                              "c": 0.0}
+                if f is None or f <= 1.0: continue
+                out[pm_oc] = {"src": "BetBoom", "o": round(float(f), 4), "c": 0.0}
             return out
         if b["kind"] == "winner":
             winners = _extract_winner(stakes, [])
@@ -901,12 +954,12 @@ class BBStream:
             out = {}
             pm_o = list(b["map"].keys())
             if len(pm_o) == 2:
-                over_st = totals.get("over")
-                under_st = totals.get("under")
-                if over_st and over_st.get("factor", 0) > 1.0:
-                    out[pm_o[0]] = {"src": "BetBoom", "o": round(float(over_st["factor"]), 4), "c": 0.0}
-                if under_st and under_st.get("factor", 0) > 1.0:
-                    out[pm_o[1]] = {"src": "BetBoom", "o": round(float(under_st["factor"]), 4), "c": 0.0}
+                o_st = totals.get("over")
+                u_st = totals.get("under")
+                if o_st and o_st.get("factor", 0) > 1.0:
+                    out[pm_o[0]] = {"src": "BetBoom", "o": round(float(o_st["factor"]), 4), "c": 0.0}
+                if u_st and u_st.get("factor", 0) > 1.0:
+                    out[pm_o[1]] = {"src": "BetBoom", "o": round(float(u_st["factor"]), 4), "c": 0.0}
             return out
         return {}
 
@@ -923,31 +976,20 @@ def get_global_stream(verbose=False):
             _GLOBAL.verbose = True
         return _GLOBAL
 
-def wait_ready(timeout=10.0):
-    st = get_global_stream()
-    t0 = time.time()
-    while time.time() - t0 < timeout:
-        if st.is_ready(): return True
-        time.sleep(0.3)
-    return False
-
 def subscribe_match_full(match_id):
     get_global_stream().subscribe_f16(match_id)
 
 BB_ENABLED = True
 _BB_ERR = None
 
-def wait_ready(timeout=120, min_matches=10, poll=0.5):
+def wait_ready(timeout=120, min_matches=1, poll=0.5):
     s = get_global_stream()
-    if s is None:
-        return False
+    if s is None: return False
     t0 = time.time()
     last_log = 0
     while time.time() - t0 < timeout:
-        try:
-            n = len(s.matches)
-        except Exception:
-            n = 0
+        try: n = len(s.matches)
+        except Exception: n = 0
         if n >= min_matches:
             print(f"    [wait_ready] накопил {n} матчей за {int(time.time()-t0)}с")
             return True
@@ -960,24 +1002,26 @@ def wait_ready(timeout=120, min_matches=10, poll=0.5):
 
 def bind_slug(slug, market):
     s = get_global_stream()
-    if s is None:
-        return None
-    try:
-        return s.bind(slug, market)
-    except Exception:
-        return None
+    if s is None: return None
+    try: return s.bind(slug, market)
+    except Exception: return None
 
 def get_live_bc(slug):
     s = get_global_stream()
-    if s is None:
-        return None
+    if s is None: return None
     try:
-        if slug not in s.bindings:
-            return None
-    except Exception:
-        return None
+        if slug not in s.bindings: return None
+    except Exception: return None
+    try: return s.live_bc(slug)
+    except Exception: return None
+
+def get_binding(slug):
+    s = get_global_stream()
+    if s is None: return None
     try:
-        return s.live_bc(slug)
+        with s.lock:
+            b = s.bindings.get(slug)
+            return dict(b) if b else None
     except Exception:
         return None
 
@@ -985,5 +1029,5 @@ def stop_global_stream():
     global _GLOBAL
     with _GLOBAL_LOCK:
         if _GLOBAL is not None:
-            _GLOBAL.stop()
+            _GLOBAL._stop.set()
             _GLOBAL = None
