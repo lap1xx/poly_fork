@@ -1,48 +1,45 @@
 @echo off
-REM Установка веб-интерфейса Poly-ARB. Запускать ОДИН раз.
-REM Затем просто запускай bot_live.py как обычно.
+setlocal
+cd /d "%~dp0"
 
-echo === [1/5] Установка зависимостей ===
-pip install fastapi uvicorn[standard] jinja2
+echo === Poly-ARB local dashboard setup ===
+
+set "PY=python"
+where py >nul 2>&1
+if not errorlevel 1 set "PY=py -3"
+
+if not exist ".venv\Scripts\python.exe" (
+    echo Creating isolated .venv...
+    %PY% -m venv .venv
+    if errorlevel 1 (
+        echo [!] Could not create .venv. Install Python 3 and retry.
+        pause
+        exit /b 1
+    )
+)
+
+.venv\Scripts\python.exe -m pip install --upgrade pip
 if errorlevel 1 (
-    echo [!] Ошибка установки зависимостей
+    echo [!] Failed to update pip.
+    pause
+    exit /b 1
+)
+
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+if errorlevel 1 (
+    echo [!] Dependency installation failed.
+    pause
+    exit /b 1
+)
+
+.venv\Scripts\python.exe -c "import fastapi, requests, uvicorn, websocket; print('Dependencies OK')"
+if errorlevel 1 (
+    echo [!] Dependency verification failed.
     pause
     exit /b 1
 )
 
 echo.
-echo === [2/5] Создание структуры ===
-if not exist templates mkdir templates
-if not exist static mkdir static
-echo     templates\ static\ OK
-
-echo.
-echo === [3/5] Патч polyarb_v4.py ===
-python polyarb_v4_patch.py
-if errorlevel 1 (
-    echo [!] Ошибка патча polyarb_v4.py
-    pause
-    exit /b 1
-)
-
-echo.
-echo === [4/5] Патч bot_live.py ===
-python bot_live_patch.py
-if errorlevel 1 (
-    echo [!] Ошибка патча bot_live.py
-    pause
-    exit /b 1
-)
-
-echo.
-echo === [5/5] Проверка ===
-python -c "import fastapi, uvicorn; print('    fastapi', fastapi.__version__)"
-
-echo.
-echo === ГОТОВО ===
-echo Теперь запускай как обычно:
-echo     python chrome_bridge.py    (окно 1)
-echo     python -B bot_live.py      (окно 2)
-echo И открывай в браузере:
-echo     http://localhost:8080
+echo Setup complete. Run start_all.bat to open the local dashboard.
+echo Legacy patch scripts and browser bridges were not run.
 pause

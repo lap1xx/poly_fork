@@ -560,42 +560,25 @@ def _winner_side(st):
     return None
 
 def _extract_winner(stakes, teams=None):
-    home = away = None
-    winner_stakes = []
+    sides = {"home": [], "away": []}
     for st in stakes:
         if not _is_winner_stake(st):
             continue
         if not st.get("is_active", True):
             continue
-        winner_stakes.append(st)
-    if len(winner_stakes) < 2:
-        return None
-    for st in winner_stakes:
         side = _winner_side(st)
-        if side == "home" and home is None:
-            home = st
-        elif side == "away" and away is None:
-            away = st
-    if home is None and away is None:
-        home, away = winner_stakes[0], winner_stakes[1]
-    elif home is None:
-        for st in winner_stakes:
-            if st is not away:
-                home = st
-                break
-    elif away is None:
-        for st in winner_stakes:
-            if st is not home:
-                away = st
-                break
-    if home and away:
-        return {"home": home, "away": away}
-    return None
+        if side in sides:
+            sides[side].append(st)
+    # Do not infer outcome identity from list order. Ambiguous or duplicate
+    # selections fail closed instead of producing a potentially false signal.
+    if len(sides["home"]) != 1 or len(sides["away"]) != 1:
+        return None
+    return {"home": sides["home"][0], "away": sides["away"][0]}
 
 def _extract_map_winner(stakes, map_num):
     if not map_num:
         return None
-    home = away = None
+    sides = {"home": [], "away": []}
     for st in stakes:
         if not st.get("is_active", True):
             continue
@@ -604,25 +587,11 @@ def _extract_map_winner(stakes, map_num):
         if (st.get("map_num") or _stake_map_num(st)) != map_num:
             continue
         side = _winner_side(st)
-        if side == "home" and home is None:
-            home = st
-        elif side == "away" and away is None:
-            away = st
-    if home is None or away is None:
-        cands = [st for st in stakes
-                 if st.get("is_active", True)
-                 and _is_map_winner_stake(st)
-                 and (st.get("map_num") or _stake_map_num(st)) == map_num]
-        if len(cands) >= 2 and home is None and away is None:
-            home, away = cands[0], cands[1]
-        elif len(cands) >= 2:
-            if home is None:
-                home = next((c for c in cands if c is not away), None)
-            elif away is None:
-                away = next((c for c in cands if c is not home), None)
-    if home and away:
-        return {"home": home, "away": away}
-    return None
+        if side in sides:
+            sides[side].append(st)
+    if len(sides["home"]) != 1 or len(sides["away"]) != 1:
+        return None
+    return {"home": sides["home"][0], "away": sides["away"][0]}
 
 def _extract_total(stakes, arg):
     if arg is None: return None

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-# polyarb_v4.py v41 - BC odds auto-filled from BetBoom AND 1win (bk_router.py).
-# LIVE: BB primary + 1win fallback. PREMATCH: 1win only.
+# polyarb_v4.py - legacy Polymarket/BetBoom monitor; secondary source disabled by default.
+# 1win routing is not started by the normal CLI path.
 # v40: фикс dedup-алертов (больше нет спама одинаковых вилок).
 # v41: интеграция bk_router (BB + 1win) — см. память проекта.
 import argparse
 import csv
 import json
+import math
 import os
 import sqlite3
 import subprocess
@@ -460,31 +461,72 @@ def color_bk_speed(bk_name, bk_profiles):
 class Feed(threading.Thread):
     def __init__(self, ids):
         super().__init__(daemon=True)
-        self.ids = ids
+        self.ids = sorted({str(x) for x in ids if x})
+        self._ids_lock = threading.RLock()
+        self._generation = 0
+        self._wake = threading.Event()
+
+    def update_tokens(self, ids):
+        """Replace the subscription set; the reader reconnects with a full snapshot."""
+        new_ids = sorted({str(x) for x in ids if x})
+        with self._ids_lock:
+            if new_ids == self.ids:
+                return False
+            self.ids = new_ids
+            self._generation += 1
+            self._wake.set()
+        return True
 
     def run(self):
+        if not HAS_WS:
+            return
         while not STOP.is_set():
+            ws = None
             try:
+                with self._ids_lock:
+                    ids = list(self.ids)
+                    generation = self._generation
+                if not ids:
+                    STOP.wait(1.0)
+                    continue
                 ws = websocket.create_connection(WS_URL, timeout=10)
-                p = {"type": "market", "assets_ids": self.ids, "initial_dump": True}
+                with self._ids_lock:
+                    changed_while_connecting = generation != self._generation
+                if changed_while_connecting:
+                    continue
+                p = {"type": "market", "assets_ids": ids, "initial_dump": True}
                 ws.send(json.dumps(p))
                 last = time.time()
                 while not STOP.is_set():
+                    with self._ids_lock:
+                        if generation != self._generation:
+                            break
                     ws.settimeout(1.0)
                     try:
                         m = ws.recv()
-                    except Exception:
+                    except websocket.WebSocketTimeoutException:
                         m = None
+                    except Exception:
+                        break
                     if m and m != "PONG":
                         self._h(m)
                     if time.time() - last > 50:
                         try:
                             ws.send("PING")
                         except Exception:
-                            pass
+                            break
                         last = time.time()
             except Exception:
-                time.sleep(2)
+                pass
+            finally:
+                if ws is not None:
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
+            if not STOP.is_set():
+                self._wake.wait(2.0)
+                self._wake.clear()
 
     def _h(self, raw):
         try:
@@ -505,16 +547,16 @@ class Feed(threading.Thread):
             asks = []
             for x in d.get("bids", []) or []:
                 try:
-                    sz = float(x["size"])
-                    if sz > 0:
-                        bids.append((float(x["price"]), sz))
+                    price, sz = float(x["price"]), float(x["size"])
+                    if math.isfinite(price) and math.isfinite(sz) and 0 < price < 1 and sz > 0:
+                        bids.append((price, sz))
                 except Exception:
                     pass
             for x in d.get("asks", []) or []:
                 try:
-                    sz = float(x["size"])
-                    if sz > 0:
-                        asks.append((float(x["price"]), sz))
+                    price, sz = float(x["price"]), float(x["size"])
+                    if math.isfinite(price) and math.isfinite(sz) and 0 < price < 1 and sz > 0:
+                        asks.append((price, sz))
                 except Exception:
                     pass
             bids.sort(key=lambda z: -z[0])
@@ -548,7 +590,9 @@ class Feed(threading.Thread):
                         size = float(ch.get("size", 0))
                     except Exception:
                         continue
-                    if price <= 0:
+                    if (not math.isfinite(price) or not math.isfinite(size)
+                            or not (0 < price < 1)
+                            or side not in {"BUY", "SELL"}):
                         continue
                     bids = {p: s for p, s in prev.get("bids", [])}
                     asks = {p: s for p, s in prev.get("asks", [])}
@@ -592,6 +636,17 @@ def best_ask(aid):
         if ts <= 0 or (time.time() - ts) > BOOK_TTL:
             return 0.0
         return b["asks"][0][0]
+
+
+def best_bid(aid):
+    with LOCK:
+        b = BOOKS.get(aid)
+        if not b or not b.get("bids"):
+            return 0.0
+        ts = b.get("ts", 0.0)
+        if ts <= 0 or (time.time() - ts) > BOOK_TTL:
+            return 0.0
+        return b["bids"][0][0]
 
 
 def walk_book(aid, target):
@@ -644,14 +699,14 @@ def _fresh_pm_book(token_id, timeout=6.0):
     for x in (book.get("bids") or []):
         try:
             p = float(x.get("price", 0)); s = float(x.get("size", 0))
-            if p > 0 and s > 0:
+            if math.isfinite(p) and math.isfinite(s) and 0 < p < 1 and s > 0:
                 bids.append((p, s))
         except Exception:
             pass
     for x in (book.get("asks") or []):
         try:
             p = float(x.get("price", 0)); s = float(x.get("size", 0))
-            if p > 0 and s > 0:
+            if math.isfinite(p) and math.isfinite(s) and 0 < p < 1 and s > 0:
                 asks.append((p, s))
         except Exception:
             pass
@@ -705,8 +760,26 @@ def get_rate():
     return None
 
 
+def resolve_usd_rub_rate(cbr_rate, configured_rate):
+    """Prefer fresh CBR data; fall back only to a positive finite configured rate."""
+    for candidate in (cbr_rate, configured_rate):
+        try:
+            rate = float(candidate)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(rate) and 0 < rate <= 100_000:
+            return rate
+    return None
+
+
 def eff_mult(odds, comm, slip):
-    if odds <= 1.0:
+    try:
+        odds, comm, slip = float(odds), float(comm), float(slip)
+    except (TypeError, ValueError):
+        return 0.0
+    if not all(math.isfinite(x) for x in (odds, comm, slip)):
+        return 0.0
+    if odds <= 1.0 or not (0.0 <= comm < 1.0) or not (0.0 <= slip < 1.0):
         return 0.0
     x = odds * (1.0 - slip)
     if x <= 1.0:
@@ -715,19 +788,43 @@ def eff_mult(odds, comm, slip):
 
 
 def compute(bets, bank):
-    ms = [eff_mult(b["o"], b["c"], b["s"]) for b in bets]
+    try:
+        bank = float(bank)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(bank) or bank <= 0 or not bets:
+        return None
+    try:
+        ms = [eff_mult(b["o"], b.get("c", 0.0), b.get("s", 0.0)) for b in bets]
+    except (KeyError, TypeError, AttributeError):
+        return None
     if any(m <= 0 for m in ms):
         return None
     inv = sum(1.0 / m for m in ms)
+    if not math.isfinite(inv) or inv <= 0:
+        return None
     roi = 1.0 / inv - 1.0
     stakes = [bank * (1.0 / m) / inv for m in ms]
-    return {"roi": roi, "stakes": stakes, "payout": bank / inv}
+    payout = bank / inv
+    return {"roi": roi, "stakes": stakes, "payout": payout,
+            "profit": payout - bank, "bank": bank}
+
+
+def alert_due(changed, last_alert_ts, now, alert_gap):
+    """Allow changed signals after the minimum gap and repeat reminders on schedule."""
+    gap = max(0.0, float(alert_gap))
+    if changed:
+        return last_alert_ts is None or gap == 0.0 or now - last_alert_ts >= gap
+    return last_alert_ts is not None and gap > 0.0 and now - last_alert_ts >= gap
 
 
 def refine_stakes(bets, result, rate):
-    if not result:
+    if not result or not rate or rate <= 0:
         return None
-    for _ in range(3):
+    bank = sum(float(x) for x in result.get("stakes", []))
+    if not math.isfinite(bank) or bank <= 0:
+        return None
+    for _ in range(5):
         changed = False
         for i, b in enumerate(bets):
             if b.get("source") != "Polymarket":
@@ -737,18 +834,23 @@ def refine_stakes(bets, result, rate):
                 continue
             ba = best_ask(b.get("token", ""))
             if ba <= 0:
-                continue
+                return None
             shares = stake_rub / (ba * rate)
             avg = walk_book(b.get("token", ""), shares)
             if not avg or avg <= 0:
-                continue
-            new_o = (1.0 / (avg * rate)) / (1.0 + PM_FEE_PCT)
+                return None
+            # A RUB stake buys stake_rub/(price_usd*rate) shares, then pays
+            # one USD per winning share. Converting the payout back to RUB
+            # cancels `rate`; the multiplier is 1/avg_price, not 1/(avg*rate).
+            new_o = (1.0 / avg) / (1.0 + PM_FEE_PCT)
             if abs(new_o - b["o"]) / b["o"] > 0.0005:
                 b["o"] = new_o
                 changed = True
         if not changed:
             break
-        result = compute(bets, result["payout"] / (1 + result["roi"]))
+        result = compute(bets, bank)
+        if result is None:
+            return None
     return result
 
 
@@ -968,13 +1070,6 @@ def build_arb_candidates(m, live_bc, slip, bank=0.0, rate=0.0, bk_source="BetBoo
             return []
         if avg > ba * 1.05:
             return []
-        try:
-            ba_levels = _book_top_levels(pm_t[i], n=3)
-            total_top = sum(p * s for p, s in ba_levels)
-            if total_top < usd_target * 0.8:
-                return []
-        except Exception:
-            pass
         pm_legs.append({
             "source": "Polymarket",
             "outcome": oc,
@@ -982,6 +1077,9 @@ def build_arb_candidates(m, live_bc, slip, bank=0.0, rate=0.0, bk_source="BetBoo
             "c": 0.0,
             "s": slip,
             "token": pm_t[i],
+            "pm_best_ask": ba,
+            "pm_best_bid": best_bid(pm_t[i]),
+            "pm_avg_ask": avg,
             "pm_age": pm_age_sec(pm_t[i]),
             "pm_verified": pm_t[i] in _FRESH_COOLDOWN,
         })
@@ -1027,7 +1125,7 @@ def main():
     ap.add_argument("--watch", action="store_true", help="auto-refresh PM live markets")
     ap.add_argument("--watch-sec", type=int, default=60, help="watch refresh interval")
     ap.add_argument("--alert-gap", type=int, default=120,
-                    help="seconds between repeat alerts for same slug")
+                    help="minimum gap between signal updates and repeat reminders")
     args = ap.parse_args()
 
     cfg = load_cfg()
@@ -1061,18 +1159,17 @@ def main():
     if not market_map and not args.watch:
         return 1
 
-    # ---------- BK bridge: bk_router (BB + 1win) с fallback на BB-only ----------
+    # ---------- BK bridge: BetBoom-only; 1win remains disabled by default ----------
     router = None
     if ROUTER_ENABLED and not args.no_bb:
-        print("[*] starting bk_router (BB + 1win)...")
+        print("[*] starting bk_router (BetBoom only; secondary source disabled)...")
         try:
-            router = get_router(use_bb=True, use_onewin=True)
+            router = get_router(use_bb=True, use_onewin=False)
             router.start()
             ok_bb = router.wait_bb(timeout=60)
-            ok_ow = router.wait_onewin(timeout=45, min_matches=10)
-            print("[*] BB ready: %s | 1win ready: %s" % (ok_bb, ok_ow))
-            if not ok_bb and not ok_ow:
-                print("[!] ни один БК не готов — выход")
+            print("[*] BB ready: %s | secondary source: disabled" % ok_bb)
+            if not ok_bb:
+                print("[!] BetBoom is not ready — exiting")
                 return 1
             st = router.stats()
             print("[*] BK stats: %s" % st)
@@ -1109,15 +1206,19 @@ def main():
                     bound_bb += 1
         except Exception as e:
             print("    [!] bind %s: %s" % (slug, e))
-    print("[*] bound BB=%d 1win=%d / %d" % (bound_bb, bound_ow, len(market_map)))
+    print("[*] bound BetBoom=%d secondary=%d (disabled by default) / %d"
+          % (bound_bb, bound_ow, len(market_map)))
 
     # ---------- CBR rate ----------
-    rate = get_rate()
-    if rate:
-        print("[*] USD/RUB = %.3f" % rate)
+    cbr_rate = get_rate()
+    rate = resolve_usd_rub_rate(cbr_rate, cfg.get("rate"))
+    if rate is None:
+        print("[!] no valid USD/RUB rate; set config.rate or restore CBR access")
+        return 1
+    if resolve_usd_rub_rate(cbr_rate, None) is None:
+        print("[!] CBR unavailable; using configured USD/RUB = %.3f" % rate)
     else:
-        rate = 1.0
-        print("[!] CBR unavailable, rate=1")
+        print("[*] USD/RUB = %.3f" % rate)
 
     # ---------- PM feed ----------
     tokens = sorted({t for m in market_map.values() for t in (m.get("t") or [])})
@@ -1128,6 +1229,7 @@ def main():
     feed = Feed(tokens)
     feed.start()
     time.sleep(2.0)
+    last_pm_refresh = time.time()
 
     print("[*] main loop (Ctrl+C to stop), min_roi=%.2f%%" % (min_roi * 100))
     print()
@@ -1138,7 +1240,7 @@ def main():
     last_sig = {}
     printed_once = set()
     upd_count = {}
-    alert_gap = float(args.alert_gap)
+    alert_gap = max(0.0, float(args.alert_gap))
 
     def retry_bind():
         if router is not None:
@@ -1167,7 +1269,7 @@ def main():
         return n
 
     last_retry = time.time()
-    last_pm_refresh = 0.0
+    last_pm_refresh = time.time()
 
     try:
         while not STOP.is_set():
@@ -1181,6 +1283,15 @@ def main():
                 if added:
                     print("[*] watch: +%d new markets (total %d)"
                           % (added, len(market_map)))
+                refreshed_tokens = sorted({
+                    str(token)
+                    for market in market_map.values()
+                    for token in (market.get("t") or [])
+                    if token
+                })
+                if refreshed_tokens != tokens and feed.update_tokens(refreshed_tokens):
+                    tokens = refreshed_tokens
+                    print("[*] PM feed resubscribe: %d tokens" % len(tokens))
                 last_pm_refresh = time.time()
 
             if time.time() - last_retry >= 10:
@@ -1202,15 +1313,18 @@ def main():
                                              bk_source=_bk_src)
                 for bets in pairs:
                     r = compute(bets, bank)
+                    if r:
+                        r = refine_stakes(bets, r, rate)
                     if not r:
                         continue
                     roi = r["roi"]
                     if roi < min_roi:
                         continue
+                    is_live = args.live or is_live_slug(slug) or m.get("live", False)
 
                     # --- web snapshot ---
                     try:
-                        _prf = r["payout"] - (r["payout"] / (1.0 + roi))
+                        _prf = r["profit"]
                         _bb_b = None
                         _bb_stakes_debug = []
                         if router is not None:
@@ -1250,12 +1364,10 @@ def main():
                                         })
                             except Exception as _e:
                                 _bb_stakes_debug = [{'err': str(_e)}]
-                        _pm_age = None
-                        for _b in bets:
-                            if _b.get("source") == "Polymarket":
-                                _pm_age = _b.get("pm_age")
-                                break
-                        live_snap[slug] = {
+                        _pm_leg = next((b for b in bets
+                                        if b.get("source") == "Polymarket"), {})
+                        _pm_age = _pm_leg.get("pm_age")
+                        candidate_snapshot = {
                             "slug": slug,
                             "q": m.get("q", ""),
                             "sport": detect_sport(slug),
@@ -1271,14 +1383,19 @@ def main():
                                     "c": float(b.get("c") or 0),
                                     "s": float(b.get("s") or 0),
                                     "pm_age": b.get("pm_age"),
+                                    "pm_best_ask": b.get("pm_best_ask"),
+                                    "pm_best_bid": b.get("pm_best_bid"),
+                                    "pm_avg_ask": b.get("pm_avg_ask"),
                                 } for b in bets
                             ],
                             "stakes": [float(x) for x in r["stakes"]],
                             "payout": float(r["payout"]),
                             "profit": float(_prf),
-                            "is_live": bool(is_live_slug(slug) or _is_live_by_time(m.get("start", ""))),
+                            "is_live": bool(is_live or _is_live_by_time(m.get("start", ""))),
                             "is_streamer": bool(is_streamer(slug, m.get("q", ""))),
                             "pm_age": _pm_age,
+                            "pm_best_ask": _pm_leg.get("pm_best_ask"),
+                            "pm_best_bid": _pm_leg.get("pm_best_bid"),
                             "bk_source": _bk_src,
                             "bb_match_id": (_bb_b or {}).get("match_id"),
                             "bb_tournament_id": (_bb_b or {}).get("tournament_id"),
@@ -1286,13 +1403,27 @@ def main():
                             "bb_stakes_debug": _bb_stakes_debug,
                             "ts": time.time(),
                         }
+                        current = live_snap.get(slug)
+                        if current is None or candidate_snapshot["roi"] > current["roi"]:
+                            live_snap[slug] = candidate_snapshot
                     except Exception:
                         pass
                     # --- /web snapshot ---
 
                     now = time.time()
-                    prev_sig = last_sig.get(slug)
-                    prev_roi = last_roi.get(slug)
+                    _pm_signal_leg = next((b for b in bets
+                                           if b.get("source") == "Polymarket"), {})
+                    _bk_signal_leg = next((b for b in bets
+                                           if b.get("source") != "Polymarket"), {})
+                    signal_key = (
+                        slug,
+                        str(_pm_signal_leg.get("token") or ""),
+                        str(_pm_signal_leg.get("outcome") or ""),
+                        str(_bk_src),
+                        str(_bk_signal_leg.get("outcome") or ""),
+                    )
+                    prev_sig = last_sig.get(signal_key)
+                    prev_roi = last_roi.get(signal_key)
 
                     sig = (round(float(bets[0]["o"]), 2),
                            round(float(bets[1]["o"]), 2) if len(bets) > 1 else None)
@@ -1300,21 +1431,22 @@ def main():
                     changed = (prev_sig is None
                                or sig != prev_sig
                                or (prev_roi is not None and abs(roi - prev_roi) >= 0.005))
-                    if not changed:
+                    last_alert_ts = last_alert.get(signal_key)
+                    if not alert_due(changed, last_alert_ts, now, alert_gap):
                         continue
 
-                    last_sig[slug] = sig
-                    last_alert[slug] = now
-                    last_roi[slug] = roi
+                    if changed:
+                        last_sig[signal_key] = sig
+                        last_roi[signal_key] = roi
+                    last_alert[signal_key] = now
                     fs = first_seen.setdefault(slug, now)
-                    is_live = args.live or is_live_slug(slug) or m.get("live", False)
 
-                    if slug not in printed_once:
-                        printed_once.add(slug)
-                        upd_count[slug] = 0
+                    if signal_key not in printed_once:
+                        printed_once.add(signal_key)
+                        upd_count[signal_key] = 0
                         print_arb(m, bets, r, rate, fs, bk)
                     else:
-                        upd_count[slug] = upd_count.get(slug, 0) + 1
+                        upd_count[signal_key] = upd_count.get(signal_key, 0) + 1
                         pm_o = next((b["o"] for b in bets
                                      if b.get("source") == "Polymarket"), 0.0)
                         bk_o = next((b["o"] for b in bets
@@ -1325,27 +1457,30 @@ def main():
                                 pm_st = r["stakes"][i] / rate if rate and rate > 0 else r["stakes"][i]
                             else:
                                 bk_st = r["stakes"][i]
-                        profit_upd = r["payout"] - (r["payout"] / (1.0 + roi))
-                        print("  [~] %s [%s] upd#%-3d  PM %.2f/$%.2f  %s %.2f/%.0fR  ROI %+.1f%% (was %+.1f%%)  profit +%.0fR" % (
+                        profit_upd = r["profit"]
+                        prefix = "~" if changed else "="
+                        print("  [%s] %s [%s] upd#%-3d  PM %.2f/$%.2f  %s %.2f/%.0fR  ROI %+.1f%% (was %+.1f%%)  profit +%.0fR" % (
+                            prefix,
                             slug[:38],
                             detect_market_type(slug, m.get("q", "")),
-                            upd_count[slug],
+                            upd_count[signal_key],
                             pm_o, pm_st,
                             _bk_src, bk_o, bk_st,
                             roi * 100, prev_roi * 100 if prev_roi is not None else roi * 100,
                             profit_upd,
                         ))
 
-                    profit = r["payout"] - (r["payout"] / (1.0 + roi))
-                    try:
-                        log_arb(slug, detect_sport(slug), roi, bank, profit,
-                                bets, r["stakes"])
-                        log_csv(slug, detect_sport(slug), roi, profit)
-                        log_arb_json(slug, detect_sport(slug), roi, bank,
-                                     profit, r["payout"], bets, r["stakes"],
-                                     m, rate, first_seen_ts=fs)
-                    except Exception:
-                        pass
+                    if changed:
+                        profit = r["profit"]
+                        try:
+                            log_arb(slug, detect_sport(slug), roi, bank, profit,
+                                    bets, r["stakes"])
+                            log_csv(slug, detect_sport(slug), roi, profit)
+                            log_arb_json(slug, detect_sport(slug), roi, bank,
+                                         profit, r["payout"], bets, r["stakes"],
+                                         m, rate, first_seen_ts=fs)
+                        except Exception:
+                            pass
 
             _now = time.time()
             if _now - globals().get('_last_snap_write', 0) >= 2.0:

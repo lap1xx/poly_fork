@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-bk_router.py - фасад для БК (BetBoom + 1win).
+bk_router.py - фасад legacy источников котировок.
 
-Логика (Q1 от 04.10.2026):
-  * LIVE-слаг: сначала BB, если пусто - 1win
-  * PREMATCH-слаг: ТОЛЬКО 1win (BB в прематче не отдаёт нормальные кэфы)
+По умолчанию используется только BetBoom. Модуль 1win загружается лениво и
+только при явном use_onewin=True; никакой secondary stream на старте не включён.
 
 Интерфейс:
   router = get_router()
@@ -14,8 +13,8 @@ bk_router.py - фасад для БК (BetBoom + 1win).
   router.stats()
 """
 from __future__ import annotations
+import importlib
 import threading
-import time
 
 try:
     import bb_bridge as _bb
@@ -26,14 +25,22 @@ except Exception as e:
     BB_OK = False
     _BB_ERR = e
 
-try:
-    import onewin_bridge as _ow
-    OW_OK = True
-    _OW_ERR = None
-except Exception as e:
-    _ow = None
-    OW_OK = False
-    _OW_ERR = e
+_ow = None
+_OW_ERR = None
+
+
+def _load_onewin():
+    """Load the legacy provider only after an explicit opt-in."""
+    global _ow, _OW_ERR
+    if _ow is not None:
+        return _ow
+    try:
+        _ow = importlib.import_module("onewin_bridge")
+        _OW_ERR = None
+    except Exception as exc:
+        _OW_ERR = exc
+        return None
+    return _ow
 
 
 def is_prematch_slug(slug: str) -> bool:
@@ -46,9 +53,11 @@ def is_prematch_slug(slug: str) -> bool:
 
 
 class BKRouter:
-    def __init__(self, use_bb=True, use_onewin=True):
+    def __init__(self, use_bb=True, use_onewin=False):
         self.use_bb = use_bb and BB_OK
-        self.use_onewin = use_onewin and OW_OK
+        # 1win is deliberately opt-in; importing its bridge can execute
+        # unreviewed integration code. Keep normal startup on BetBoom only.
+        self.use_onewin = bool(use_onewin and _load_onewin() is not None)
         self.bindings = {}
         self._lock = threading.RLock()
 
@@ -225,7 +234,7 @@ _ROUTER = None
 _ROUTER_LOCK = threading.Lock()
 
 
-def get_router(use_bb=True, use_onewin=True):
+def get_router(use_bb=True, use_onewin=False):
     global _ROUTER
     with _ROUTER_LOCK:
         if _ROUTER is None:
