@@ -20,14 +20,14 @@
 
 | Файл | Ответственность |
 | --- | --- |
-| `polyarb_v4.py` | PM feed notifications, dirty queue/indexes, единый dispatcher, точечный расчёт, scoped ROI diagnostics, publisher и периодическое обслуживание. |
+| `polyarb_v4.py` | PM feed notifications, dirty queue/indexes, единый dispatcher, точечный расчёт, scoped ROI и bounded recent signal-drop diagnostics с последними PM/БК котировками. |
 | `onewin_bridge.py` | Read-only каталог/odds feed, callback после фиксации цены, fail-closed matching и alias normalization. |
 | `team_aliases.json` | Проверенные вручную эквивалентные имена команд и игроков; не объединять разные составы или сущности. |
 | `bk_router.py` | 1win-first routing, callback, read-only quote lookup и подсчёт свежих пар только для текущих PM bindings. |
 | `web_app.py` | Аутентифицированный `/ws/scanner`, in-memory latest state, быстрый browser fanout и файловый fallback. |
 | `bot_live.py` | Генерация эфемерного Bearer token и передача его только процессам backend/scanner через environment. |
-| `static/app.js` | Русская health panel, свежие bound pairs, транспорт, latency и отдельные cache/batch ROI показатели. |
-| `tests/` | Регрессии coalescing/index dispatch, callbacks, WS protocol, fail-closed aliases, quote freshness, ROI и bankroll guards. |
+| `static/app.js` | Русская health panel, свежие bound pairs, транспорт, latency, cache/batch ROI и причины снятия сигналов без добавления их в active list. |
+| `tests/` | Регрессии coalescing/index dispatch, callbacks, WS protocol, fail-closed aliases, quote freshness, signal-drop diagnostics, ROI и bankroll guards. |
 
 ## Сохранение совместимости и риски
 

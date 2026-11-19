@@ -1409,6 +1409,7 @@ def build_arb_candidates(m, live_bc, slip, bank=0.0, rate=0.0,
         if avg > ba * 1.05:
             note("pm_impact_rejected")
             return []
+        pm_book_age = pm_age_sec(pm_t[i])
         pm_legs.append({
             "source": "Polymarket",
             "outcome": oc,
@@ -1419,7 +1420,10 @@ def build_arb_candidates(m, live_bc, slip, bank=0.0, rate=0.0,
             "pm_best_ask": ba,
             "pm_best_bid": best_bid(pm_t[i]),
             "pm_avg_ask": avg,
-            "pm_age": pm_age_sec(pm_t[i]),
+            "pm_age": pm_book_age,
+            "pm_book_age_sec": pm_book_age,
+            "pm_target_usd": usd_target,
+            "pm_target_shares": shares,
             "pm_verified": pm_refresh_attempted(pm_t[i]),
         })
 
@@ -1449,6 +1453,102 @@ def build_arb_candidates(m, live_bc, slip, bank=0.0, rate=0.0,
     if not pairs:
         note("no_opposite_bk_market")
     return pairs
+
+
+def _classify_signal_drop_reason(*, market_missing=False, has_fresh_bookmaker=False,
+                                 candidate_diagnostics=None, best_roi=None,
+                                 min_roi=0.0, depth_rejects=0,
+                                 invalid_calculations=0, pm_diagnostic=None):
+    if market_missing:
+        return "market_removed"
+    if not has_fresh_bookmaker:
+        return "no_fresh_bookmaker_pair"
+    if best_roi is not None and best_roi < min_roi:
+        return "below_roi_threshold"
+    diagnostics = candidate_diagnostics or {}
+    book_state = (pm_diagnostic or {}).get("book_state")
+    if book_state == "stale_book":
+        return "pm_book_stale"
+    if book_state in {"missing_book", "missing_timestamp"}:
+        return "pm_book_missing"
+    if book_state == "empty_book":
+        return "pm_book_empty"
+    if book_state == "empty_asks":
+        return "pm_ask_unavailable"
+    if diagnostics.get("pm_no_ask", 0):
+        return "pm_ask_unavailable"
+    if diagnostics.get("pm_depth_short", 0):
+        return "pm_depth_short"
+    if diagnostics.get("pm_impact_rejected", 0):
+        return "pm_impact_rejected"
+    if depth_rejects:
+        return "pm_depth_rejected"
+    if diagnostics.get("no_opposite_bk_market", 0):
+        return "no_opposite_bookmaker_outcome"
+    if invalid_calculations or diagnostics.get("invalid_market_or_no_quotes", 0):
+        return "invalid_candidate"
+    return "no_valid_candidate"
+
+
+def _make_signal_drop_diagnostic(snapshot, reason, dropped_at,
+                                 min_roi=0.0, current_best_roi=None,
+                                 current_pm_diagnostic=None):
+    snapshot = snapshot or {}
+    bets = snapshot.get("bets") or []
+    pm_leg = next((bet for bet in bets if bet.get("source") == "Polymarket"), {})
+    bookmaker_leg = next((bet for bet in bets if bet.get("source") != "Polymarket"), {})
+
+    def number(value, multiplier=1.0):
+        try:
+            result = float(value) * multiplier
+        except (TypeError, ValueError):
+            return None
+        return round(result, 3) if math.isfinite(result) else None
+
+    previous_roi = number(snapshot.get("roi"), 100.0)
+    snapshot_ts = number(snapshot.get("ts"))
+    current_pm_diagnostic = current_pm_diagnostic or {}
+    current_pm_book = None
+    if current_pm_diagnostic:
+        current_pm_book = {
+            "state": str(current_pm_diagnostic.get("book_state") or "unknown"),
+            "age_sec": number(current_pm_diagnostic.get("book_age_sec")),
+            "bid_levels": number(current_pm_diagnostic.get("bid_levels")),
+            "ask_levels": number(current_pm_diagnostic.get("ask_levels")),
+            "best_bid": number(current_pm_diagnostic.get("best_bid")),
+            "best_ask": number(current_pm_diagnostic.get("best_ask")),
+            "rest_refresh": str(current_pm_diagnostic.get("rest_refresh") or ""),
+        }
+    return {
+        "slug": str(snapshot.get("slug") or ""),
+        "q": str(snapshot.get("q") or "")[:180],
+        "sport": str(snapshot.get("sport") or ""),
+        "market_type": str(snapshot.get("market_type") or ""),
+        "reason": str(reason),
+        "dropped_at": number(dropped_at),
+        "signal_snapshot_age_sec": round(max(0.0, float(dropped_at) - snapshot_ts), 1)
+        if snapshot_ts is not None else None,
+        "previous_roi_pct": previous_roi,
+        "current_best_roi_pct": number(current_best_roi, 100.0),
+        "min_roi_pct": number(min_roi, 100.0),
+        "pm_quote": {
+            "outcome": str(pm_leg.get("outcome") or ""),
+            "effective_odds": number(pm_leg.get("o")),
+            "best_ask": number(pm_leg.get("pm_best_ask")),
+            "average_ask": number(pm_leg.get("pm_avg_ask")),
+            "best_bid": number(pm_leg.get("pm_best_bid")),
+            "book_age_sec": number(pm_leg.get("pm_book_age_sec", pm_leg.get("pm_age"))),
+            "target_usd": number(pm_leg.get("pm_target_usd")),
+            "target_shares": number(pm_leg.get("pm_target_shares")),
+        },
+        "current_pm_book": current_pm_book,
+        "bookmaker_quote": {
+            "source": str(bookmaker_leg.get("source") or snapshot.get("bk_source") or ""),
+            "outcome": str(bookmaker_leg.get("outcome") or ""),
+            "odds": number(bookmaker_leg.get("o")),
+            "age_sec": number(bookmaker_leg.get("odds_age_sec")),
+        },
+    }
 
 
 # =================================================================
@@ -1675,6 +1775,7 @@ def main():
         "source_counts": {}, "pm_catalog_complete": pm_catalog_complete,
         "pm_catalog_retained": pm_catalog_retained,
         "pm_catalog_fetch": get_pm_catalog_diagnostics(),
+        "recent_signal_drops": [],
         "min_roi_pct": round(min_roi * 100, 3),
     }
     _write_scan_status(last_scan_status)
@@ -1694,6 +1795,7 @@ def main():
             print("[!] dashboard WebSocket publisher unavailable: %s" % type(exc).__name__)
 
     live_snap = {}
+    recent_signal_drops = {}
     best_by_slug = {}
     best_by_slug_updated_at = {}
     initial_dirty = set(market_map)
@@ -1735,7 +1837,11 @@ def main():
                 removed_slugs = set(previous_market_map) - set(market_map)
                 if removed_slugs:
                     for slug in removed_slugs:
-                        live_snap.pop(slug, None)
+                        removed_snapshot = live_snap.pop(slug, None)
+                        if removed_snapshot is not None:
+                            recent_signal_drops[slug] = _make_signal_drop_diagnostic(
+                                removed_snapshot, "market_removed", time.time(), min_roi
+                            )
                         best_by_slug.pop(slug, None)
                         best_by_slug_updated_at.pop(slug, None)
                     snapshot_changed = True
@@ -1823,6 +1929,10 @@ def main():
                 best_by_slug_updated_at.pop(slug, None)
                 if m is None:
                     snapshot_changed = True
+                    if previous_snapshot is not None:
+                        recent_signal_drops[slug] = _make_signal_drop_diagnostic(
+                            previous_snapshot, "market_removed", time.time(), min_roi
+                        )
                     continue
                 market_best_roi = None
                 if router is not None:
@@ -1833,16 +1943,27 @@ def main():
                     _bk_src = "BetBoom"
                 if not live_bc:
                     scan_counts["no_fresh_bookmaker"] += 1
+                    if previous_snapshot is not None:
+                        recent_signal_drops[slug] = _make_signal_drop_diagnostic(
+                            previous_snapshot, "no_fresh_bookmaker_pair", time.time(), min_roi
+                        )
                     continue
                 scan_counts["with_fresh_bookmaker"] += 1
                 source_counts[_bk_src] = source_counts.get(_bk_src, 0) + 1
 
                 candidate_diagnostics = {}
+                market_depth_rejects = 0
+                market_invalid_calculations = 0
                 pairs = build_arb_candidates(m, live_bc, slip, bank, rate,
                                              bk_source=_bk_src,
                                              diagnostics=candidate_diagnostics,
                                              pm_diagnostics=pm_no_ask_details,
                                              market_slug=slug)
+                current_pm_diagnostic = next(
+                    (row for row in reversed(pm_no_ask_details)
+                     if row.get("market_slug") == slug),
+                    None,
+                )
                 for _reason, _count in candidate_diagnostics.items():
                     scan_counts[_reason] = scan_counts.get(_reason, 0) + _count
                 scan_counts["candidate_pairs"] += len(pairs)
@@ -1850,10 +1971,12 @@ def main():
                     r = compute(bets, bank)
                     if not r:
                         scan_counts["invalid_calculation"] += 1
+                        market_invalid_calculations += 1
                         continue
                     r = refine_stakes(bets, r, rate)
                     if not r:
                         scan_counts["pm_depth_rejects"] += 1
+                        market_depth_rejects += 1
                         continue
                     roi = r["roi"]
                     if best_candidate_roi is None or roi > best_candidate_roi:
@@ -1933,6 +2056,9 @@ def main():
                                     "pm_best_ask": b.get("pm_best_ask"),
                                     "pm_best_bid": b.get("pm_best_bid"),
                                     "pm_avg_ask": b.get("pm_avg_ask"),
+                                    "pm_book_age_sec": b.get("pm_book_age_sec"),
+                                    "pm_target_usd": b.get("pm_target_usd"),
+                                    "pm_target_shares": b.get("pm_target_shares"),
                                     "odds_age_sec": b.get("odds_age_sec"),
                                 } for b in bets
                             ],
@@ -2037,6 +2163,22 @@ def main():
                         except Exception:
                             pass
 
+                if slug in live_snap:
+                    recent_signal_drops.pop(slug, None)
+                elif previous_snapshot is not None:
+                    reason = _classify_signal_drop_reason(
+                        has_fresh_bookmaker=True,
+                        candidate_diagnostics=candidate_diagnostics,
+                        best_roi=market_best_roi,
+                        min_roi=min_roi,
+                        depth_rejects=market_depth_rejects,
+                        invalid_calculations=market_invalid_calculations,
+                        pm_diagnostic=current_pm_diagnostic,
+                    )
+                    recent_signal_drops[slug] = _make_signal_drop_diagnostic(
+                        previous_snapshot, reason, time.time(), min_roi, market_best_roi,
+                        current_pm_diagnostic,
+                    )
                 if market_best_roi is not None:
                     best_by_slug[slug] = market_best_roi
                     best_by_slug_updated_at[slug] = time.time()
@@ -2093,6 +2235,15 @@ def main():
                 best_candidate_roi = None
                 best_candidate_age_sec = None
 
+            for _drop_slug, _drop in list(recent_signal_drops.items()):
+                if _now - float(_drop.get("dropped_at") or 0.0) > 120.0:
+                    recent_signal_drops.pop(_drop_slug, None)
+            recent_signal_drop_rows = sorted(
+                recent_signal_drops.values(),
+                key=lambda row: float(row.get("dropped_at") or 0.0),
+                reverse=True,
+            )[:5]
+
             last_scan_status = {
                 "state": "running",
                 "ts": _now,
@@ -2119,6 +2270,7 @@ def main():
                 "pm_catalog_retained": pm_catalog_retained,
                 "pm_catalog_fetch": get_pm_catalog_diagnostics(),
                 "signals": len(live_snap),
+                "recent_signal_drops": recent_signal_drop_rows,
                 "min_roi_pct": round(min_roi * 100, 3),
                 "best_candidate_roi_pct": round(best_candidate_roi * 100, 3)
                 if best_candidate_roi is not None else None,

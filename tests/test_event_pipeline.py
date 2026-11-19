@@ -426,5 +426,93 @@ class ScannerPublisherTests(unittest.TestCase):
             publisher.close()
 
 
+class SignalDropDiagnosticsTests(unittest.TestCase):
+    def test_reason_classification_distinguishes_quote_loss_roi_and_market_removal(self):
+        self.assertEqual(
+            polyarb_v4._classify_signal_drop_reason(
+                market_missing=True, has_fresh_bookmaker=False,
+            ),
+            "market_removed",
+        )
+        self.assertEqual(
+            polyarb_v4._classify_signal_drop_reason(
+                has_fresh_bookmaker=False, best_roi=0.1, min_roi=0.03,
+            ),
+            "no_fresh_bookmaker_pair",
+        )
+        self.assertEqual(
+            polyarb_v4._classify_signal_drop_reason(
+                has_fresh_bookmaker=True, best_roi=0.009, min_roi=0.03,
+            ),
+            "below_roi_threshold",
+        )
+        self.assertEqual(
+            polyarb_v4._classify_signal_drop_reason(
+                has_fresh_bookmaker=True,
+                candidate_diagnostics={"pm_no_ask": 1},
+            ),
+            "pm_ask_unavailable",
+        )
+        self.assertEqual(
+            polyarb_v4._classify_signal_drop_reason(
+                has_fresh_bookmaker=True,
+                candidate_diagnostics={"pm_no_ask": 1},
+                pm_diagnostic={"book_state": "stale_book"},
+            ),
+            "pm_book_stale",
+        )
+        self.assertEqual(
+            polyarb_v4._classify_signal_drop_reason(
+                has_fresh_bookmaker=True,
+                pm_diagnostic={"book_state": "missing_book"},
+            ),
+            "pm_book_missing",
+        )
+
+    def test_drop_record_keeps_last_executable_quotes_and_ages(self):
+        previous = {
+            "slug": "wta-example-event",
+            "q": "Player A vs Player B",
+            "sport": "TENNIS",
+            "market_type": "MATCH",
+            "roi": 0.009,
+            "ts": 8.0,
+            "bets": [
+                {
+                    "source": "Polymarket", "outcome": "Player A", "o": 4.18,
+                    "pm_best_ask": 0.23, "pm_avg_ask": 0.24,
+                    "pm_best_bid": 0.22, "pm_book_age_sec": 1.4,
+                    "pm_target_usd": 20.0, "pm_target_shares": 86.96,
+                },
+                {
+                    "source": "1win", "outcome": "Player B", "o": 1.33,
+                    "odds_age_sec": 0.6,
+                },
+            ],
+        }
+        dropped = polyarb_v4._make_signal_drop_diagnostic(
+            previous, "below_roi_threshold", 10.0,
+            min_roi=0.03, current_best_roi=-0.002,
+            current_pm_diagnostic={
+                "book_state": "stale_book", "book_age_sec": 31.2,
+                "bid_levels": 3, "ask_levels": 0, "rest_refresh": "fetch_failed",
+            },
+        )
+        self.assertEqual(dropped["reason"], "below_roi_threshold")
+        self.assertEqual(dropped["signal_snapshot_age_sec"], 2.0)
+        self.assertEqual(dropped["previous_roi_pct"], 0.9)
+        self.assertEqual(dropped["current_best_roi_pct"], -0.2)
+        self.assertEqual(dropped["min_roi_pct"], 3.0)
+        self.assertEqual(dropped["pm_quote"]["best_ask"], 0.23)
+        self.assertEqual(dropped["pm_quote"]["average_ask"], 0.24)
+        self.assertEqual(dropped["pm_quote"]["book_age_sec"], 1.4)
+        self.assertEqual(dropped["bookmaker_quote"]["odds"], 1.33)
+        self.assertEqual(dropped["bookmaker_quote"]["age_sec"], 0.6)
+        self.assertEqual(dropped["current_pm_book"]["state"], "stale_book")
+        self.assertEqual(dropped["current_pm_book"]["age_sec"], 31.2)
+        self.assertEqual(dropped["current_pm_book"]["ask_levels"], 0)
+        self.assertNotIn("bets", dropped)
+
+
 if __name__ == "__main__":
     unittest.main()
