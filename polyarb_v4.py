@@ -653,6 +653,8 @@ class Feed(threading.Thread):
 
 
 BOOK_TTL = 30.0
+SIGNAL_DROP_HISTORY_TTL_SEC = 300.0
+MAX_RECENT_SIGNAL_DROPS = 10
 
 
 def best_ask(aid):
@@ -1551,6 +1553,25 @@ def _make_signal_drop_diagnostic(snapshot, reason, dropped_at,
     }
 
 
+def _prune_recent_signal_drops(drops, now):
+    for slug, row in list(drops.items()):
+        try:
+            dropped_at = float(row.get("dropped_at") or 0.0)
+        except (AttributeError, TypeError, ValueError):
+            dropped_at = 0.0
+        if (not math.isfinite(dropped_at) or dropped_at <= 0.0
+                or now - dropped_at > SIGNAL_DROP_HISTORY_TTL_SEC):
+            drops.pop(slug, None)
+    ordered = sorted(
+        drops.items(),
+        key=lambda item: float(item[1].get("dropped_at") or 0.0),
+        reverse=True,
+    )
+    for slug, _row in ordered[MAX_RECENT_SIGNAL_DROPS:]:
+        drops.pop(slug, None)
+    return [row for _slug, row in ordered[:MAX_RECENT_SIGNAL_DROPS]]
+
+
 # =================================================================
 #                              main
 # =================================================================
@@ -2235,14 +2256,9 @@ def main():
                 best_candidate_roi = None
                 best_candidate_age_sec = None
 
-            for _drop_slug, _drop in list(recent_signal_drops.items()):
-                if _now - float(_drop.get("dropped_at") or 0.0) > 120.0:
-                    recent_signal_drops.pop(_drop_slug, None)
-            recent_signal_drop_rows = sorted(
-                recent_signal_drops.values(),
-                key=lambda row: float(row.get("dropped_at") or 0.0),
-                reverse=True,
-            )[:5]
+            recent_signal_drop_rows = _prune_recent_signal_drops(
+                recent_signal_drops, _now
+            )
 
             last_scan_status = {
                 "state": "running",

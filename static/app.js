@@ -484,10 +484,10 @@ function renderScanStatus() {
         : 'В этом цикле причины отсева не зафиксированы.');
 
   const dropBox = document.getElementById('scan-signal-drop');
-  const latestDrop = Array.isArray(status.recent_signal_drops)
-    ? status.recent_signal_drops[0] : null;
+  const recentDrops = Array.isArray(status.recent_signal_drops)
+    ? status.recent_signal_drops.filter(drop => drop && typeof drop === 'object').slice(0, 5) : [];
   if (dropBox) {
-    if (!latestDrop) {
+    if (!recentDrops.length) {
       dropBox.textContent = '';
       dropBox.classList.add('hidden');
     } else {
@@ -506,46 +506,49 @@ function renderScanStatus() {
         invalid_candidate: 'кандидат не прошёл проверку расчёта',
         no_valid_candidate: 'нет валидной пары исходов',
       };
-      const pm = latestDrop.pm_quote || {};
-      const bookmaker = latestDrop.bookmaker_quote || {};
-      const age = status.ts != null && latestDrop.dropped_at != null
-        ? Math.max(0, Number(status.ts) - Number(latestDrop.dropped_at)) : null;
-      const parts = [reasonLabels[latestDrop.reason] || 'сигнал перестал проходить проверку'];
-      if (latestDrop.signal_snapshot_age_sec != null) {
-        parts.push(`последний расчёт ${Number(latestDrop.signal_snapshot_age_sec).toFixed(1)}с до снятия`);
-      }
-      const currentPm = latestDrop.current_pm_book;
-      if (currentPm) {
-        const bookStateLabels = {
-          stale_book: 'устарел', missing_book: 'отсутствует',
-          missing_timestamp: 'без timestamp', empty_book: 'пустой', empty_asks: 'без asks',
-        };
-        let currentPmText = `текущий PM book ${bookStateLabels[currentPm.state] || currentPm.state}`;
-        if (currentPm.age_sec != null) currentPmText += ` · ${Number(currentPm.age_sec).toFixed(1)}с`;
-        if (currentPm.ask_levels != null) currentPmText += ` · asks ${Number(currentPm.ask_levels)}`;
-        if (currentPm.rest_refresh && currentPm.rest_refresh !== 'not_requested') {
-          currentPmText += ` · REST ${currentPm.rest_refresh}`;
+      const bookStateLabels = {
+        stale_book: 'устарел', missing_book: 'отсутствует',
+        missing_timestamp: 'без timestamp', empty_book: 'пустой', empty_asks: 'без asks',
+      };
+      const formatDrop = (drop) => {
+        const pm = drop.pm_quote || {};
+        const bookmaker = drop.bookmaker_quote || {};
+        const age = status.ts != null && drop.dropped_at != null
+          ? Math.max(0, Number(status.ts) - Number(drop.dropped_at)) : null;
+        const parts = [reasonLabels[drop.reason] || 'сигнал перестал проходить проверку'];
+        if (drop.signal_snapshot_age_sec != null) {
+          parts.push(`последний расчёт ${Number(drop.signal_snapshot_age_sec).toFixed(1)}с до снятия`);
         }
-        parts.push(currentPmText);
-      }
-      if (pm.best_ask != null) {
-        let pmText = `PM ${pm.outcome || ''} ask последнего расчёта ${(Number(pm.best_ask) * 100).toFixed(1)}¢`;
-        if (pm.average_ask != null) pmText += ` / avg ${(Number(pm.average_ask) * 100).toFixed(1)}¢`;
-        if (pm.book_age_sec != null) pmText += ` · стакан ${Number(pm.book_age_sec).toFixed(1)}с`;
-        parts.push(pmText);
-      }
-      if (bookmaker.odds != null) {
-        let bkText = `последний ${bookmaker.source || 'БК'} ${bookmaker.outcome || ''} ${Number(bookmaker.odds).toFixed(2)}×`;
-        if (bookmaker.age_sec != null) bkText += ` · котировка ${Number(bookmaker.age_sec).toFixed(1)}с`;
-        parts.push(bkText);
-      }
-      if (latestDrop.reason === 'below_roi_threshold' && latestDrop.current_best_roi_pct != null) {
-        parts.push(`ROI ${Number(latestDrop.current_best_roi_pct).toFixed(2)}% < ${Number(latestDrop.min_roi_pct || 0).toFixed(2)}%`);
-      } else if (latestDrop.previous_roi_pct != null) {
-        parts.push(`последний ROI ${Number(latestDrop.previous_roi_pct).toFixed(2)}%`);
-      }
-      const title = String(latestDrop.q || latestDrop.slug || 'Событие').slice(0, 90);
-      dropBox.textContent = `Снят${age == null ? '' : ` ${age.toFixed(0)}с назад`}: ${title} — ${parts.join(' · ')}`;
+        const currentPm = drop.current_pm_book;
+        if (currentPm) {
+          let currentPmText = `PM book ${bookStateLabels[currentPm.state] || currentPm.state}`;
+          if (currentPm.age_sec != null) currentPmText += ` · ${Number(currentPm.age_sec).toFixed(1)}с`;
+          if (currentPm.ask_levels != null) currentPmText += ` · asks ${Number(currentPm.ask_levels)}`;
+          if (currentPm.rest_refresh && currentPm.rest_refresh !== 'not_requested') {
+            currentPmText += ` · REST ${currentPm.rest_refresh}`;
+          }
+          parts.push(currentPmText);
+        }
+        if (pm.best_ask != null) {
+          let pmText = `PM ${pm.outcome || ''} ask ${(Number(pm.best_ask) * 100).toFixed(1)}¢`;
+          if (pm.average_ask != null) pmText += ` / avg ${(Number(pm.average_ask) * 100).toFixed(1)}¢`;
+          if (pm.book_age_sec != null) pmText += ` · стакан ${Number(pm.book_age_sec).toFixed(1)}с`;
+          parts.push(pmText);
+        }
+        if (bookmaker.odds != null) {
+          let bkText = `последний ${bookmaker.source || 'БК'} ${bookmaker.outcome || ''} ${Number(bookmaker.odds).toFixed(2)}×`;
+          if (bookmaker.age_sec != null) bkText += ` · котировка ${Number(bookmaker.age_sec).toFixed(1)}с`;
+          parts.push(bkText);
+        }
+        if (drop.reason === 'below_roi_threshold' && drop.current_best_roi_pct != null) {
+          parts.push(`ROI ${Number(drop.current_best_roi_pct).toFixed(2)}% < ${Number(drop.min_roi_pct || 0).toFixed(2)}%`);
+        } else if (drop.previous_roi_pct != null) {
+          parts.push(`последний ROI ${Number(drop.previous_roi_pct).toFixed(2)}%`);
+        }
+        const title = String(drop.q || drop.slug || 'Событие').slice(0, 90);
+        return `Снят${age == null ? '' : ` ${age.toFixed(0)}с назад`}: ${title} — ${parts.join(' · ')}`;
+      };
+      dropBox.textContent = `СНЯТЫЕ СИГНАЛЫ — НЕ АКТИВНЫЕ (до 5 минут)\n${recentDrops.map(formatDrop).join('\n')}`;
       dropBox.classList.remove('hidden');
     }
   }

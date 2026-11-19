@@ -9,11 +9,11 @@ POLYARB = str(HERE / "polyarb_v4.py")
 def main():
     args = sys.argv[1:]
     if "--help" in args or "-h" in args:
-        print("Usage: python bot_live.py [--min-roi 7.0] [--bank 2000] ...")
+        print("Usage: python bot_live.py [--min-roi 3.0] [--bank 2000] ...")
         print("Any extra args are passed through to polyarb_v4.py")
         return 0
 
-    min_roi = "5.0"
+    min_roi = "3.0"
     bank = "2000"
     extra = []
     i = 0

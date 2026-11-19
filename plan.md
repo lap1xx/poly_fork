@@ -20,7 +20,7 @@
 
 | Файл | Ответственность |
 | --- | --- |
-| `polyarb_v4.py` | PM feed notifications, dirty queue/indexes, единый dispatcher, точечный расчёт, scoped ROI и bounded recent signal-drop diagnostics с последними PM/БК котировками. |
+| `polyarb_v4.py` | PM feed notifications, dirty queue/indexes, единый dispatcher, точечный расчёт, scoped ROI и bounded five-minute inactive signal-drop history с последними PM/БК котировками. |
 | `onewin_bridge.py` | Read-only каталог/odds feed, callback после фиксации цены, fail-closed matching и alias normalization. |
 | `team_aliases.json` | Проверенные вручную эквивалентные имена команд и игроков; не объединять разные составы или сущности. |
 | `bk_router.py` | 1win-first routing, callback, read-only quote lookup и подсчёт свежих пар только для текущих PM bindings. |
@@ -31,4 +31,4 @@
 
 ## Сохранение совместимости и риски
 
-Публичный browser WebSocket `/ws` и его snapshot schema сохраняются. Каталог, допустимая свежесть котировок (30 секунд), пороги ROI, глубины/impact, 40%-й ориентир банка и manual event-link не смягчаются. Сетевые partial results должны сохранять предыдущий каталог, а stale/disconnected scanner не должен маркироваться как свежий. Файловые snapshots остаются аварийным источником. Для BetBoom fallback без callback-интеграции сохраняется ограниченный polling, не возвращающий полный горячий цикл.
+Публичный browser WebSocket `/ws` и его snapshot schema сохраняются. Значение min ROI по умолчанию у launcher — 3%, соответствуя пользовательскому порогу; его можно переопределить через CLI. Допустимая свежесть PM/БК котировок (30 секунд), глубина/impact checks, 40%-й ориентир банка и manual event-link не меняются. Снятые сигналы доступны до пяти минут только в отдельной неактивной диагностике; они не возвращаются в активный список и не могут использовать устаревшие цены как свежие. Сетевые partial results должны сохранять предыдущий каталог, а stale/disconnected scanner не должен маркироваться как свежий. Файловые snapshots остаются аварийным источником. Для BetBoom fallback без callback-интеграции сохраняется ограниченный polling, не возвращающий полный горячий цикл.

@@ -77,6 +77,7 @@ class EventPhaseTests(unittest.TestCase):
             bot_live.main()
         command = run.call_args.args[0]
         self.assertIn("--watch", command)
+        self.assertEqual(command[command.index("--min-roi") + 1], "3.0")
         self.assertNotIn("--live", command)
         self.assertEqual(run.call_args.kwargs["cwd"], str(bot_live.HERE))
         popen.assert_called_once()

@@ -497,7 +497,8 @@ h1{font-size:20px;line-height:1.2;margin:7px 0 0;letter-spacing:-.025em}
 .scan-phase-line b{color:#e4edf1}
 .scan-reasons{font-size:9px;line-height:1.5;color:#b5c4cd;min-height:25px}
 .scan-drop{margin-top:6px;padding:6px 8px;border:1px solid #51452d;border-radius:6px;
-  background:#1c1a15;color:#e0c98e;font-size:9px;line-height:1.45;overflow-wrap:anywhere}
+  background:#1c1a15;color:#e0c98e;font-size:9px;line-height:1.45;overflow-wrap:anywhere;
+  white-space:pre-line;max-height:150px;overflow-y:auto}
 .arbs-list{gap:9px;flex:1;min-height:100px;padding-right:3px}
 .arbs-list .empty{padding:25px 15px;color:#a4b4c3;background:rgba(16,27,41,.45);
   border:1px dashed #314353;border-radius:10px;line-height:1.7;font-size:11px}

@@ -513,6 +513,22 @@ class SignalDropDiagnosticsTests(unittest.TestCase):
         self.assertEqual(dropped["current_pm_book"]["ask_levels"], 0)
         self.assertNotIn("bets", dropped)
 
+    def test_recent_drop_history_keeps_ten_entries_for_five_minutes(self):
+        now = 1000.0
+        drops = {
+            f"slug-{i}": {"slug": f"slug-{i}", "dropped_at": now - i * 5}
+            for i in range(12)
+        }
+        drops["expired"] = {"slug": "expired", "dropped_at": now - 301}
+
+        rows = polyarb_v4._prune_recent_signal_drops(drops, now)
+
+        self.assertEqual(len(rows), 10)
+        self.assertEqual(rows[0]["slug"], "slug-0")
+        self.assertNotIn("expired", drops)
+        self.assertNotIn("slug-10", drops)
+        self.assertNotIn("slug-11", drops)
+
 
 if __name__ == "__main__":
     unittest.main()
