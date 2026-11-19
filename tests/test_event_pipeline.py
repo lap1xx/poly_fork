@@ -77,6 +77,39 @@ class FeedCallbackTests(unittest.TestCase):
                 else:
                     polyarb_v4.BOOKS[token] = previous
 
+    def test_pm_last_trade_does_not_rejuvenate_orderbook_or_dispatch_update(self):
+        token = "event-pipeline-last-trade-token"
+        now = time.time()
+        book_ts = now - polyarb_v4.BOOK_TTL - 2.0
+        previous = polyarb_v4.BOOKS.get(token)
+        polyarb_v4.BOOKS[token] = {
+            "bids": [(0.40, 10.0)],
+            "asks": [(0.41, 12.0)],
+            "ts": book_ts,
+            "last_change": book_ts,
+        }
+        updates = []
+        try:
+            with patch.object(polyarb_v4, "_PM_UPDATE_CALLBACK", updates.append):
+                polyarb_v4.Feed([])._a({
+                    "event_type": "last_trade_price",
+                    "asset_id": token,
+                    "price": "0.41",
+                    "size": "25",
+                    "side": "BUY",
+                    "timestamp": str(int(now * 1000)),
+                })
+            with polyarb_v4.LOCK:
+                self.assertEqual(polyarb_v4.BOOKS[token]["ts"], book_ts)
+            self.assertEqual(polyarb_v4.best_ask(token), 0.0)
+            self.assertEqual(updates, [])
+        finally:
+            with polyarb_v4.LOCK:
+                if previous is None:
+                    polyarb_v4.BOOKS.pop(token, None)
+                else:
+                    polyarb_v4.BOOKS[token] = previous
+
     def test_onewin_callback_runs_after_odds_message_is_applied(self):
         module = importlib.import_module("onewin_bridge")
         try:

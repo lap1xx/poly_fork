@@ -646,19 +646,9 @@ class Feed(threading.Thread):
                 _notify_pm_update(aid)
             return
         if et == "last_trade_price":
-            aid = d.get("asset_id")
-            if not aid:
-                return
-            aid = str(aid)
-            now = time.time()
-            updated = False
-            with LOCK:
-                prev = BOOKS.get(aid)
-                if prev:
-                    prev["ts"] = now
-                    updated = True
-            if updated:
-                _notify_pm_update(aid)
+            # A completed trade is not evidence that cached resting bids/asks
+            # are current. Keep order-book TTL anchored only to book snapshots
+            # and price-level deltas, and do not trigger a quote recalculation.
             return
 
 

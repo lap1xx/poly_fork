@@ -35,6 +35,8 @@ Poly-ARB получает рыночные данные, сопоставляе�
 
 ## Поток данных
 
+Для Polymarket scanner берет метаданные рынка и `clobTokenIds` из Gamma, затем подписывается на CLOB market WebSocket по token ID исходов. Полный `book` snapshot и `price_change` delta обновляют кэш bids/asks; REST `GET /book?token_id=...` служит восстановлением при отсутствующем или устаревшем стакане. `last_trade_price` — отдельное событие об исполненной сделке, а не подтверждение текущих заявок, поэтому оно не меняет timestamp/TTL стакана и само по себе не запускает расчёт. Сканер рассчитывает покупку по ask и фактической глубине стакана; отображаемая на Polymarket вероятность обычно является midpoint bid/ask, а при спреде шире $0.10 заменяется последней сделкой. Поэтому процент на странице и эффективный десятичный коэффициент сканера могут отличаться. См. [Gamma market by slug](https://docs.polymarket.com/api-reference/markets/get-market-by-slug), [CLOB order book](https://docs.polymarket.com/api-reference/market-data/get-order-book), [Market WebSocket](https://docs.polymarket.com/api-reference/wss/market) и [Prices and Order Book](https://docs.polymarket.com/concepts/prices-orderbook).
+
 ```mermaid
 flowchart LR
     PM["Polymarket<br/>рынки и стакан"] --> SC["Сканер<br/>сопоставление и расчёт"]
