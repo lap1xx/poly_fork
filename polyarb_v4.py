@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# polyarb_v4.py - legacy Polymarket/BetBoom monitor; secondary source disabled by default.
-# 1win routing is not started by the normal CLI path.
+# polyarb_v4.py - Polymarket/1win monitor; BetBoom remains an optional fallback.
+# The scanner starts the read-only 1win odds adapter as its primary bookmaker source.
 # v40: фикс dedup-алертов (больше нет спама одинаковых вилок).
 # v41: интеграция bk_router (BB + 1win) — см. память проекта.
 import argparse
@@ -32,7 +32,7 @@ try:
 except ImportError:
     HAS_WS = False
 
-# ---------- БК: bk_router (BB + 1win) с fallback на bb_bridge ----------
+# ---------- БК: 1win primary, optional BetBoom fallback ----------
 ROUTER_ENABLED = False
 BB_ENABLED = False
 _BB_ERR = None
@@ -1098,6 +1098,7 @@ def build_arb_candidates(m, live_bc, slip, bank=0.0, rate=0.0, bk_source="BetBoo
             "o": o,
             "c": float(info.get("c", 0.0)),
             "s": slip,
+            "odds_age_sec": info.get("age_sec"),
         }
 
     pairs = []
@@ -1121,7 +1122,7 @@ def main():
     ap.add_argument("--bank", type=float, default=0.0, help="override bank size (RUB)")
     ap.add_argument("--min-roi", type=float, default=0.3,
                     help="show arbs with roi >= this %% (default 0.3)")
-    ap.add_argument("--no-bb", action="store_true", help="disable ALL BK bridge")
+    ap.add_argument("--no-bb", action="store_true", help="disable BetBoom fallback; keep 1win")
     ap.add_argument("--watch", action="store_true", help="auto-refresh PM live markets")
     ap.add_argument("--watch-sec", type=int, default=60, help="watch refresh interval")
     ap.add_argument("--alert-gap", type=int, default=120,
@@ -1159,17 +1160,21 @@ def main():
     if not market_map and not args.watch:
         return 1
 
-    # ---------- BK bridge: BetBoom-only; 1win remains disabled by default ----------
+    # ---------- BK bridge: 1win primary; BetBoom is a fallback ----------
     router = None
-    if ROUTER_ENABLED and not args.no_bb:
-        print("[*] starting bk_router (BetBoom only; secondary source disabled)...")
+    if ROUTER_ENABLED:
+        print("[*] starting bookmaker router (1win primary; BetBoom fallback %s)..."
+              % ("disabled" if args.no_bb else "enabled"))
         try:
-            router = get_router(use_bb=True, use_onewin=False)
+            router = get_router(use_bb=not args.no_bb, use_onewin=True)
             router.start()
-            ok_bb = router.wait_bb(timeout=60)
-            print("[*] BB ready: %s | secondary source: disabled" % ok_bb)
-            if not ok_bb:
-                print("[!] BetBoom is not ready — exiting")
+            ok_ow = router.wait_onewin(timeout=60, min_matches=1)
+            ok_bb = False
+            if not ok_ow and router.use_bb:
+                ok_bb = router.wait_bb(timeout=60)
+            print("[*] 1win feed ready: %s | BetBoom fallback ready: %s" % (ok_ow, ok_bb))
+            if not ok_ow and not ok_bb:
+                print("[!] neither 1win nor the enabled BetBoom fallback is ready — exiting")
                 return 1
             st = router.stats()
             print("[*] BK stats: %s" % st)
@@ -1206,8 +1211,8 @@ def main():
                     bound_bb += 1
         except Exception as e:
             print("    [!] bind %s: %s" % (slug, e))
-    print("[*] bound BetBoom=%d secondary=%d (disabled by default) / %d"
-          % (bound_bb, bound_ow, len(market_map)))
+    print("[*] bound 1win=%d BetBoom fallback=%d / %d"
+          % (bound_ow, bound_bb, len(market_map)))
 
     # ---------- CBR rate ----------
     cbr_rate = get_rate()
@@ -1329,8 +1334,7 @@ def main():
                         _bb_stakes_debug = []
                         if router is not None:
                             try:
-                                _pair = router.bindings.get(slug)
-                                _bb_b = _pair[1] if _pair else None
+                                _bb_b = router.get_binding(slug)
                                 _bb_stakes_debug = router.bb_stakes_debug(slug)
                             except Exception as _e:
                                 _bb_stakes_debug = [{'err': str(_e)}]
@@ -1367,6 +1371,9 @@ def main():
                         _pm_leg = next((b for b in bets
                                         if b.get("source") == "Polymarket"), {})
                         _pm_age = _pm_leg.get("pm_age")
+                        _bk_leg = next((b for b in bets
+                                        if b.get("source") != "Polymarket"), {})
+                        _bk_age = _bk_leg.get("odds_age_sec")
                         candidate_snapshot = {
                             "slug": slug,
                             "q": m.get("q", ""),
@@ -1386,6 +1393,7 @@ def main():
                                     "pm_best_ask": b.get("pm_best_ask"),
                                     "pm_best_bid": b.get("pm_best_bid"),
                                     "pm_avg_ask": b.get("pm_avg_ask"),
+                                    "odds_age_sec": b.get("odds_age_sec"),
                                 } for b in bets
                             ],
                             "stakes": [float(x) for x in r["stakes"]],
@@ -1397,9 +1405,15 @@ def main():
                             "pm_best_ask": _pm_leg.get("pm_best_ask"),
                             "pm_best_bid": _pm_leg.get("pm_best_bid"),
                             "bk_source": _bk_src,
-                            "bb_match_id": (_bb_b or {}).get("match_id"),
-                            "bb_tournament_id": (_bb_b or {}).get("tournament_id"),
-                            "bb_binding": _bb_b,
+                            "bk_odds_age_sec": _bk_age,
+                            "bk_event_url": (_bb_b or {}).get("event_url"),
+                            "bk_match_id": (_bb_b or {}).get("match_id"),
+                            "bk_binding": _bb_b,
+                            "bb_match_id": ((_bb_b or {}).get("match_id")
+                                            if _bk_src == "BetBoom" else None),
+                            "bb_tournament_id": ((_bb_b or {}).get("tournament_id")
+                                                 if _bk_src == "BetBoom" else None),
+                            "bb_binding": _bb_b if _bk_src == "BetBoom" else None,
                             "bb_stakes_debug": _bb_stakes_debug,
                             "ts": time.time(),
                         }

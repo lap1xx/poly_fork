@@ -221,17 +221,17 @@ function renderArbs() {
     const tags = [];
     tags.push(`<span class="tag ${escapeHtml(sportClass(a.sport))}">${escapeHtml(a.sport || '')}</span>`);
     if (a.market_type) tags.push(`<span class="tag mtype">${escapeHtml(a.market_type)}</span>`);
-    if (a.is_live) tags.push(`<span class="tag live">LIVE</span>`);
-    if (a.is_streamer) tags.push(`<span class="tag streamer">STREAMER</span>`);
+    if (a.is_live) tags.push(`<span class="tag live">ЛАЙВ</span>`);
+    if (a.is_streamer) tags.push(`<span class="tag streamer">СТРИМЕР</span>`);
     const pmAge = (pmLeg && pmLeg.pm_age) || a.pm_age;
     if (pmAge && pmAge > 60) tags.push(`<span class="tag pm-age">PM ${Math.floor(pmAge)}с</span>`);
     const sourceAge = a.source_age_sec == null ? NaN : Number(a.source_age_sec);
     if (Number.isFinite(sourceAge)) {
-      const ageLabel = `DATA ${Math.floor(sourceAge)}с`;
+      const ageLabel = `ДАННЫЕ ${Math.floor(sourceAge)}с`;
       const ageClass = a.source_state === 'stale' ? 'tag pm-age' : 'tag';
-      tags.push(`<span class="${ageClass}">${ageLabel}${a.source_state === 'stale' ? ' · STALE' : ''}</span>`);
+      tags.push(`<span class="${ageClass}">${ageLabel}${a.source_state === 'stale' ? ' · УСТАРЕЛИ' : ''}</span>`);
     } else {
-      tags.push(`<span class="tag pm-age">DATA ?</span>`);
+      tags.push(`<span class="tag pm-age">СВЕЖЕСТЬ ?</span>`);
     }
 
     const cls = ['arb'];
@@ -298,11 +298,11 @@ function refreshDetail() {
   document.getElementById('det-title').textContent = a.title
     ? (a.title + ' · ' + (a.q || ''))
     : (a.q || a.slug);
-  const tags = [`<span class="tag mtype">${escapeHtml(a.market_type || 'MATCH')}</span>`,
+  const tags = [`<span class="tag mtype">${escapeHtml(a.market_type || 'МАТЧ')}</span>`,
                 `<span class="tag ${escapeHtml(sportClass(a.sport))}">${escapeHtml(a.sport || '')}</span>`];
-  if (a.is_streamer) tags.push(`<span class="tag streamer">STREAMER</span>`);
-  if (a.source_state === 'stale') tags.push(`<span class="tag pm-age">DATA STALE</span>`);
-  else if (a.source_state === 'unknown') tags.push(`<span class="tag pm-age">DATA UNKNOWN</span>`);
+  if (a.is_streamer) tags.push(`<span class="tag streamer">СТРИМЕР</span>`);
+  if (a.source_state === 'stale') tags.push(`<span class="tag pm-age">ДАННЫЕ УСТАРЕЛИ</span>`);
+  else if (a.source_state === 'unknown') tags.push(`<span class="tag pm-age">СВЕЖЕСТЬ НЕИЗВЕСТНА</span>`);
   document.getElementById('det-tags').innerHTML = tags.join('');
 
   const roiEl = document.getElementById('kpi-roi');
@@ -523,8 +523,13 @@ function renderHowMuch(a) {
   const buyBtn = document.getElementById('btn-buy-pm');
   buyBtn.textContent = `ОТКРЫТЬ POLYMARKET · $${parseFloat(document.getElementById('hm-pm-stake').value || 0).toFixed(2)} ↗`;
   const bkBtn = document.getElementById('btn-open-bb');
-  bkBtn.disabled = bbLeg.source !== 'BetBoom';
-  bkBtn.title = bkBtn.disabled ? 'Ссылка для этого источника ещё не подключена' : 'Открыть страницу события БК';
+  const oneWinUrlReady = bbLeg.source === '1win' && Boolean(a.bk_event_url);
+  const betBoomUrlReady = bbLeg.source === 'BetBoom' && Boolean(a.bb_match_id && a.bb_tournament_id);
+  bkBtn.disabled = !(oneWinUrlReady || betBoomUrlReady);
+  bkBtn.textContent = oneWinUrlReady ? 'ОТКРЫТЬ СОБЫТИЕ 1WIN ↗'
+    : betBoomUrlReady ? 'ОТКРЫТЬ СОБЫТИЕ BETBOOM ↗' : 'ОТКРЫТЬ СОБЫТИЕ БК ↗';
+  bkBtn.title = bkBtn.disabled ? 'Ссылка на страницу события ещё не найдена' : 'Открыть страницу события без автоматической ставки';
+  document.getElementById('hm-bb-name').textContent = bbLeg.source || 'Букмекер';
 }
 
 function recalcHowMuch() {
@@ -810,21 +815,31 @@ async function checkPM() {
 }
 function refreshPMNow() { checkPM(); }
 
-function openBBCoords() {
+function openBookmakerEvent() {
   const a = getActive(); if (!a) return;
   const bkLeg = (a.bets || []).find(leg => leg.source && leg.source !== 'Polymarket');
-  if (!bkLeg || bkLeg.source !== 'BetBoom') {
-    toast('Ссылка для этого источника ещё не подключена', true);
+  if (bkLeg?.source === '1win' && a.bk_event_url) {
+    try {
+      const eventUrl = new URL(a.bk_event_url, window.location.origin);
+      if (eventUrl.protocol !== 'https:') throw new Error('Небезопасный протокол ссылки');
+      window.open(eventUrl.href, '_blank', 'noopener,noreferrer');
+    } catch (e) {
+      toast('Не удалось открыть страницу события 1win', true);
+    }
     return;
   }
-  const mid = a.bb_match_id;
-  const tour = a.bb_tournament_id;
+  if (bkLeg?.source !== 'BetBoom') {
+    toast('Ссылка на страницу события ещё не найдена', true);
+    return;
+  }
+  const mid = a.bb_match_id, tour = a.bb_tournament_id;
+  if (!(tour && mid)) {
+    toast('Точная ссылка на событие BetBoom не найдена', true);
+    return;
+  }
   const sportMap = { 'CS2': 'cs2', 'DOTA2': 'dota-2', 'LOL': 'lol', 'VALORANT': 'valorant', 'TENNIS': 'tennis' };
   const sp = sportMap[a.sport] || 'esport';
-  const url = (tour && mid)
-    ? 'https://betboom.ru/esport/' + sp + '/' + tour + '/' + mid
-    : 'https://betboom.ru/esport/' + sp + '/live';
-  if (!(tour && mid)) toast('Точная ссылка неизвестна — открывается общая страница');
+  const url = 'https://betboom.ru/esport/' + sp + '/' + tour + '/' + mid;
   window.open(url, '_blank', 'noopener,noreferrer');
 }
 async function openPMUrl() {
@@ -1009,7 +1024,7 @@ function init() {
   });
 
   const openBB = document.getElementById('btn-open-bb');
-  if (openBB) openBB.addEventListener('click', openBBCoords);
+  if (openBB) openBB.addEventListener('click', openBookmakerEvent);
   const buyPM = document.getElementById('btn-buy-pm');
   if (buyPM) buyPM.addEventListener('click', openPMUrl);
   const filled = document.getElementById('btn-filled');

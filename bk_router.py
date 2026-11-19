@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-bk_router.py - фасад legacy источников котировок.
+bk_router.py - фасад источников котировок.
 
-По умолчанию используется только BetBoom. Модуль 1win загружается лениво и
-только при явном use_onewin=True; никакой secondary stream на старте не включён.
+Когда включён use_onewin, 1win является первичным источником; BetBoom остаётся
+резервом для событий или рынков, которые 1win не смог сопоставить.
 
 Интерфейс:
   router = get_router()
@@ -15,6 +15,7 @@ bk_router.py - фасад legacy источников котировок.
 from __future__ import annotations
 import importlib
 import threading
+import time
 
 try:
     import bb_bridge as _bb
@@ -30,7 +31,7 @@ _OW_ERR = None
 
 
 def _load_onewin():
-    """Load the legacy provider only after an explicit opt-in."""
+    """Load the optional 1win adapter only after an explicit opt-in."""
     global _ow, _OW_ERR
     if _ow is not None:
         return _ow
@@ -55,10 +56,15 @@ def is_prematch_slug(slug: str) -> bool:
 class BKRouter:
     def __init__(self, use_bb=True, use_onewin=False):
         self.use_bb = use_bb and BB_OK
-        # 1win is deliberately opt-in; importing its bridge can execute
-        # unreviewed integration code. Keep normal startup on BetBoom only.
+        # Keep module loading lazy; the scanner explicitly opts into 1win.
         self.use_onewin = bool(use_onewin and _load_onewin() is not None)
         self.bindings = {}
+        self.fallback_bindings = {}
+        self._markets = {}
+        self._active_sources = {}
+        self._bb_retry_after = {}
+        self._onewin_retry_after = {}
+        self._onewin_ready = None
         self._lock = threading.RLock()
 
     def start(self):
@@ -76,6 +82,7 @@ class BKRouter:
             except Exception as e:
                 print(f"[ROUTER] 1win start failed: {e}")
                 self.use_onewin = False
+                self._onewin_ready = False
 
     def stop(self):
         if self.use_bb:
@@ -99,39 +106,96 @@ class BKRouter:
 
     def wait_onewin(self, timeout=60, min_matches=10):
         if not self.use_onewin:
+            self._onewin_ready = False
             return False
         try:
-            return _ow.wait_ready(timeout=timeout, min_matches=min_matches)
+            self._onewin_ready = bool(
+                _ow.wait_ready(timeout=timeout, min_matches=min_matches)
+            )
+            return self._onewin_ready
         except Exception:
+            self._onewin_ready = False
             return False
 
+    def _can_use_onewin(self):
+        if not self.use_onewin:
+            return False
+        if self._onewin_ready is True or self._onewin_ready is None:
+            return True
+        # Allow later binds to use the primary after a temporary outage.
+        try:
+            ready = bool(_ow.get_global_stream().is_ready())
+        except Exception:
+            ready = False
+        if ready:
+            self._onewin_ready = True
+        return ready
+
+    def _try_bind_bb_fallback(self, slug, pm_market=None, force=False):
+        if not self.use_bb:
+            return None
+        now = time.monotonic()
+        with self._lock:
+            existing = self.fallback_bindings.get(slug)
+            if existing:
+                return existing
+            if pm_market is not None:
+                self._markets[slug] = pm_market
+            market = self._markets.get(slug)
+            last_try = self._bb_retry_after.get(slug, 0.0)
+            if not force and now - last_try < 5.0:
+                return None
+            self._bb_retry_after[slug] = now
+        if not market:
+            return None
+        try:
+            binding = _bb.bind_slug(slug, market)
+        except Exception:
+            binding = None
+        if binding:
+            with self._lock:
+                self.fallback_bindings[slug] = binding
+        return binding
+
+    def _try_promote_onewin(self, slug):
+        if not self._can_use_onewin():
+            return False
+        now = time.monotonic()
+        with self._lock:
+            pair = self.bindings.get(slug)
+            market = self._markets.get(slug)
+            last_try = self._onewin_retry_after.get(slug, 0.0)
+            if not pair or pair[0] != "BetBoom" or not market or now - last_try < 5.0:
+                return False
+            self._onewin_retry_after[slug] = now
+        pm_teams = (market or {}).get("o") or []
+        if len(pm_teams) != 2:
+            return False
+        try:
+            binding = _ow.bind_slug(slug, pm_teams)
+        except Exception:
+            binding = None
+        if not binding:
+            return False
+        with self._lock:
+            pair = self.bindings.get(slug)
+            if not pair or pair[0] != "BetBoom":
+                return False
+            self.fallback_bindings.setdefault(slug, pair[1])
+            self.bindings[slug] = ("1win", binding)
+            self._active_sources[slug] = "1win"
+        return True
+
     def bind(self, slug, pm_market):
-        src_pref = "1win" if is_prematch_slug(slug) else "BetBoom"
         pm_o = (pm_market or {}).get("o") or []
         if not pm_o or len(pm_o) != 2:
             return None, None
+        with self._lock:
+            self._markets[slug] = pm_market
 
-        if src_pref == "BetBoom" and self.use_bb:
-            try:
-                b = _bb.bind_slug(slug, pm_market)
-            except Exception:
-                b = None
-            if b:
-                with self._lock:
-                    self.bindings[slug] = ("BetBoom", b)
-                return b, "BetBoom"
-            if self.use_onewin:
-                try:
-                    b = _ow.bind_slug(slug, pm_o)
-                except Exception:
-                    b = None
-                if b:
-                    with self._lock:
-                        self.bindings[slug] = ("1win", b)
-                    return b, "1win"
-            return None, None
-
-        if self.use_onewin:
+        # Prefer the verified 1win feed for supported winner markets. Keep BB
+        # bound as a live fallback for temporary/missing 1win quotes as well.
+        if self._can_use_onewin():
             try:
                 b = _ow.bind_slug(slug, pm_o)
             except Exception:
@@ -139,7 +203,20 @@ class BKRouter:
             if b:
                 with self._lock:
                     self.bindings[slug] = ("1win", b)
+                    self._active_sources[slug] = "1win"
+                self._try_bind_bb_fallback(slug, pm_market, force=True)
                 return b, "1win"
+
+        if self.use_bb:
+            try:
+                b = _bb.bind_slug(slug, pm_market)
+            except Exception:
+                b = None
+            if b:
+                with self._lock:
+                    self.bindings[slug] = ("BetBoom", b)
+                    self._active_sources[slug] = "BetBoom"
+                return b, "BetBoom"
         return None, None
 
     def live_bc(self, slug):
@@ -150,27 +227,59 @@ class BKRouter:
                 try:
                     bc = _bb.get_live_bc(slug)
                     if bc:
+                        with self._lock:
+                            self._active_sources[slug] = "BetBoom"
                         return bc
                 except Exception:
                     pass
             return {}
         src, _ = pair
         if src == "BetBoom":
+            if self._try_promote_onewin(slug):
+                return self.live_bc(slug)
             try:
-                return _bb.get_live_bc(slug) or {}
+                bc = _bb.get_live_bc(slug) or {}
+                if bc:
+                    with self._lock:
+                        self._active_sources[slug] = "BetBoom"
+                return bc
             except Exception:
                 return {}
         if src == "1win":
             try:
-                return _ow.get_live_bc(slug) or {}
+                bc = _ow.get_live_bc(slug) or {}
             except Exception:
-                return {}
+                bc = {}
+            if bc:
+                with self._lock:
+                    self._active_sources[slug] = "1win"
+                return bc
+            if self.use_bb:
+                fallback = self._try_bind_bb_fallback(slug)
+                if fallback:
+                    try:
+                        bc = _bb.get_live_bc(slug) or {}
+                    except Exception:
+                        bc = {}
+                    if bc:
+                        with self._lock:
+                            self._active_sources[slug] = "BetBoom"
+                        return bc
+            return {}
         return {}
 
     def get_src(self, slug):
         with self._lock:
             pair = self.bindings.get(slug)
-        return pair[0] if pair else None
+            return self._active_sources.get(slug) or (pair[0] if pair else None)
+
+    def get_binding(self, slug):
+        with self._lock:
+            source = self._active_sources.get(slug)
+            pair = self.bindings.get(slug)
+            if source == "BetBoom" and slug in self.fallback_bindings:
+                return self.fallback_bindings[slug]
+            return pair[1] if pair else None
 
     def bb_stakes_debug(self, slug):
         if not self.use_bb:

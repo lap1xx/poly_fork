@@ -37,5 +37,23 @@ class PanelStatsDateTests(unittest.TestCase):
         self.assertEqual(result['days'][0]['date'], '2029-12-27')
 
 
+class SourceFreshnessTests(unittest.TestCase):
+    def test_bookmaker_quote_age_marks_fresh_snapshot_stale(self):
+        raw = {
+            "cs2-team-alpha-team-bravo-winner": {
+                "ts": time.time(),
+                "bk_odds_age_sec": 7.0,
+                "bets": [],
+            }
+        }
+        with patch.object(web_app, "_load_config", return_value={"safe_fork_threshold": 0.03}), \
+             patch.object(web_app, "bk_adapter", None), \
+             patch.object(web_app, "DATA_STALE_SEC", 5.0):
+            result = web_app._build_enriched(raw)
+        item = result["cs2-team-alpha-team-bravo-winner"]
+        self.assertEqual(item["source_state"], "stale")
+        self.assertGreaterEqual(item["source_age_sec"], 7.0)
+
+
 if __name__ == '__main__':
     unittest.main()

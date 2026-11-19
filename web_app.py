@@ -210,11 +210,16 @@ def _build_enriched(raw: dict) -> dict:
         enriched["first_seen_ts"] = fs_snapshot.get(slug, now)
         enriched["age_sec"] = round(now - enriched["first_seen_ts"], 1)
         source_ts = _finite_number(arb.get("ts"), 0.0)
+        bookmaker_age = _finite_number(arb.get("bk_odds_age_sec"), 0.0, 3600.0)
         if source_ts is None or source_ts <= 0:
-            enriched["source_age_sec"] = None
-            enriched["source_state"] = "unknown"
+            if bookmaker_age is None:
+                enriched["source_age_sec"] = None
+                enriched["source_state"] = "unknown"
+            else:
+                enriched["source_age_sec"] = round(bookmaker_age, 1)
+                enriched["source_state"] = "stale" if bookmaker_age > DATA_STALE_SEC else "fresh"
         else:
-            source_age = max(0.0, now - source_ts)
+            source_age = max(0.0, now - source_ts, bookmaker_age or 0.0)
             enriched["source_age_sec"] = round(source_age, 1)
             enriched["source_state"] = "stale" if source_age > DATA_STALE_SEC else "fresh"
 
@@ -278,6 +283,10 @@ def _build_enriched(raw: dict) -> dict:
                     _home = _nm
                 elif _sn in ("win2", "п2") and not _away:
                     _away = _nm
+            if not (_home and _away):
+                _binding = arb.get("bk_binding") or {}
+                _home = (_binding.get("pm_home") or _binding.get("home") or "").strip()
+                _away = (_binding.get("pm_away") or _binding.get("away") or "").strip()
             if _home and _away:
                 enriched["team1"] = _home
                 enriched["team2"] = _away
@@ -285,7 +294,7 @@ def _build_enriched(raw: dict) -> dict:
             else:
                 enriched["team1"] = ""
                 enriched["team2"] = ""
-                enriched["title"] = ""
+                enriched["title"] = arb.get("q") or arb.get("title") or ""
         except Exception:
             enriched["team1"] = ""
             enriched["team2"] = ""
