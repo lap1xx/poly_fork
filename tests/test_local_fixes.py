@@ -1,5 +1,6 @@
 import json
 import sys
+import threading
 import unittest
 import time
 from unittest.mock import patch
@@ -112,12 +113,45 @@ class PMCatalogRefreshTests(unittest.TestCase):
         self.assertTrue(complete)
         self.assertEqual(get.call_count, 14)
 
+    def test_catalog_requests_are_parallel_and_have_bounded_timeouts(self):
+        lock = threading.Lock()
+        active = 0
+        max_active = 0
+        bad_timeouts = []
+
+        def fake_get(*args, **kwargs):
+            nonlocal active, max_active
+            if kwargs.get("timeout") != polyarb_v4.PM_CATALOG_TIMEOUT:
+                bad_timeouts.append(kwargs.get("timeout"))
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            time.sleep(0.03)
+            with lock:
+                active -= 1
+            return self.FakeResponse()
+
+        with patch.object(polyarb_v4.requests, "get", side_effect=fake_get) as get:
+            markets, complete = polyarb_v4.fetch_live_pm_markets(with_status=True)
+
+        diagnostic = polyarb_v4.get_pm_catalog_diagnostics()
+        self.assertEqual(markets, {})
+        self.assertTrue(complete)
+        self.assertEqual(get.call_count, 14)
+        self.assertGreater(max_active, 1)
+        self.assertEqual(bad_timeouts, [])
+        self.assertEqual(diagnostic["successful_queries"], 14)
+        self.assertEqual(diagnostic["failed_queries"], 0)
+
     def test_fetch_marks_any_failed_query_as_partial(self):
         responses = [self.FakeResponse() for _ in range(13)] + [OSError("temporary")]
         with patch.object(polyarb_v4.requests, "get", side_effect=responses):
             markets, complete = polyarb_v4.fetch_live_pm_markets(with_status=True)
         self.assertEqual(markets, {})
         self.assertFalse(complete)
+        diagnostic = polyarb_v4.get_pm_catalog_diagnostics()
+        self.assertEqual(diagnostic["failed_queries"], 1)
+        self.assertEqual(diagnostic["error_counts"], {"OSError": 1})
 
     def test_limit_sized_response_cannot_authorize_pruning(self):
         class CappedResponse(self.FakeResponse):

@@ -5,7 +5,7 @@
 # v41: интеграция bk_router (BB + 1win) — см. память проекта.
 import argparse
 import csv
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import math
 import os
@@ -69,6 +69,10 @@ PM_FEE_PCT = 0.04
 CBR_URL = HT + "www" + DOT + "cbr" + DOT + "ru" + "/scripts/XML_daily.asp"
 
 TIMEOUT = 15.0
+PM_CATALOG_TIMEOUT = (3.0, 5.0)
+PM_CATALOG_WORKERS = 7
+_PM_CATALOG_DIAGNOSTICS_LOCK = threading.Lock()
+_PM_CATALOG_DIAGNOSTICS = {}
 BOOKS = {}
 LOCK = threading.Lock()
 STOP = threading.Event()
@@ -1067,81 +1071,156 @@ def fetch_live_pm_slugs():
     return list(out)
 
 
+def _fetch_pm_catalog_tag(tag, query_limit):
+    results = []
+    for live_mode in ("true", None):
+        params = {"tag_slug": tag, "limit": query_limit,
+                  "active": "true", "closed": "false"}
+        if live_mode:
+            params["live"] = live_mode
+        try:
+            response = requests.get(
+                GAMMA + "/events", params=params, timeout=PM_CATALOG_TIMEOUT
+            )
+            response.raise_for_status()
+            events = response.json()
+            if not isinstance(events, list):
+                results.append((live_mode, None, "InvalidResponseShape"))
+            else:
+                results.append((live_mode, events, None))
+        except Exception as exc:
+            results.append((live_mode, None, type(exc).__name__))
+    return tag, results
+
+
+def get_pm_catalog_diagnostics():
+    with _PM_CATALOG_DIAGNOSTICS_LOCK:
+        snapshot = dict(_PM_CATALOG_DIAGNOSTICS)
+    snapshot["error_counts"] = dict(snapshot.get("error_counts") or {})
+    snapshot["failed_tags"] = list(snapshot.get("failed_tags") or [])
+    return snapshot
+
+
 def fetch_live_pm_markets(with_status=False):
     tags = ["esports", "cs2", "dota-2", "league-of-legends",
             "valorant", "tennis", "atp"]
-    PREFIXES = ("cs2-", "dota2-", "lol-", "valorant-",
+    prefixes = ("cs2-", "dota2-", "lol-", "valorant-",
                 "atp-", "wta-", "itf-")
     query_limit = 200
+    started = time.monotonic()
     out = {}
-    query_count = 0
+    query_count = len(tags) * 2
     successful_queries = 0
     catalog_complete = True
-    for tg in tags:
-        for live_mode in ("true", None):
-            query_count += 1
+    results_by_tag = {}
+    error_counts = {}
+    failed_tags = set()
+
+    # A Gamma outage must not serialize seven sports into 14 * 15s of startup
+    # waiting. Each tag has one worker; its live and general queries are kept
+    # together, bounding concurrency while preserving both catalog views.
+    with ThreadPoolExecutor(
+        max_workers=min(PM_CATALOG_WORKERS, len(tags)),
+        thread_name_prefix="pm-catalog",
+    ) as executor:
+        futures = {executor.submit(_fetch_pm_catalog_tag, tag, query_limit): tag
+                   for tag in tags}
+        for future in as_completed(futures):
+            tag = futures[future]
             try:
-                params = {"tag_slug": tg, "limit": query_limit,
-                          "active": "true", "closed": "false"}
-                if live_mode:
-                    params["live"] = live_mode
-                r = requests.get(GAMMA + "/events", params=params, timeout=TIMEOUT)
-                r.raise_for_status()
-                events = r.json()
-                if not isinstance(events, list):
-                    catalog_complete = False
-                    continue
-                successful_queries += 1
-            except Exception:
+                result_tag, results = future.result()
+                results_by_tag[result_tag] = results
+            except Exception as exc:
+                error_type = type(exc).__name__
+                results_by_tag[tag] = [("true", None, error_type),
+                                       (None, None, error_type)]
+
+    for tag in tags:
+        for live_mode, events, error_type in results_by_tag.get(
+            tag, [("true", None, "WorkerError"), (None, None, "WorkerError")]
+        ):
+            if error_type:
+                catalog_complete = False
+                failed_tags.add(tag)
+                error_counts[error_type] = error_counts.get(error_type, 0) + 1
                 continue
+            successful_queries += 1
             if len(events) >= query_limit:
                 # No pagination is implemented; a full page may be truncated.
                 catalog_complete = False
-            for ev in events:
-                if not isinstance(ev, dict):
+            for event in events:
+                if not isinstance(event, dict):
                     catalog_complete = False
                     continue
-                event_markets = ev.get("markets") or []
+                event_markets = event.get("markets") or []
                 if not isinstance(event_markets, list):
                     catalog_complete = False
                     continue
-                for mk in event_markets:
-                    if not isinstance(mk, dict):
+                for market in event_markets:
+                    if not isinstance(market, dict):
                         catalog_complete = False
                         continue
-                    sl = mk.get("slug", "")
-                    if not sl or not sl.startswith(PREFIXES):
+                    slug = market.get("slug", "")
+                    if not slug or not slug.startswith(prefixes):
                         continue
-                    if mk.get("closed") is True:
+                    if market.get("closed") is True:
                         continue
-                    if mk.get("acceptingOrders") is False:
+                    if market.get("acceptingOrders") is False:
                         continue
                     try:
-                        o = json.loads(mk.get("outcomes", "[]"))
-                        t = json.loads(mk.get("clobTokenIds", "[]"))
+                        outcomes = json.loads(market.get("outcomes", "[]"))
+                        tokens = json.loads(market.get("clobTokenIds", "[]"))
                     except Exception:
                         catalog_complete = False
                         continue
                     if (
-                        not isinstance(o, list) or not isinstance(t, list)
-                        or len(o) != 2 or len(t) != 2
-                        or any(not isinstance(value, str) or not value.strip() for value in o + t)
+                        not isinstance(outcomes, list) or not isinstance(tokens, list)
+                        or len(outcomes) != 2 or len(tokens) != 2
+                        or any(not isinstance(value, str) or not value.strip()
+                               for value in outcomes + tokens)
                     ):
                         catalog_complete = False
                         continue
-                    start = (mk.get("eventStartTime") or ev.get("startTime") or "")
-                    phase = classify_event_phase(mk, ev)
-                    out[sl] = {
-                        "slug": sl, "q": mk.get("question", ""),
-                        "o": o, "t": t, "start": start,
+                    start = (market.get("eventStartTime") or event.get("startTime") or "")
+                    phase = classify_event_phase(market, event)
+                    out[slug] = {
+                        "slug": slug, "q": market.get("question", ""),
+                        "o": outcomes, "t": tokens, "start": start,
                         "phase": phase,
                         "_phase_classified": True,
                         "live": phase == "live",
-                        "status": mk.get("status") or ev.get("status"),
-                        "closed": mk.get("closed", ev.get("closed")),
-                        "active": mk.get("active", True),
+                        "status": market.get("status") or event.get("status"),
+                        "closed": market.get("closed", event.get("closed")),
+                        "active": market.get("active", True),
                     }
+
     complete = query_count > 0 and successful_queries == query_count and catalog_complete
+    diagnostics = {
+        "query_count": query_count,
+        "successful_queries": successful_queries,
+        "failed_queries": query_count - successful_queries,
+        "error_counts": error_counts,
+        "failed_tags": sorted(failed_tags),
+        "markets": len(out),
+        "complete": complete,
+        "elapsed_ms": round((time.monotonic() - started) * 1000, 1),
+    }
+    with _PM_CATALOG_DIAGNOSTICS_LOCK:
+        _PM_CATALOG_DIAGNOSTICS.clear()
+        _PM_CATALOG_DIAGNOSTICS.update(diagnostics)
+    if diagnostics["failed_queries"]:
+        errors = ", ".join(
+            "%s=%s" % (name, count)
+            for name, count in sorted(error_counts.items())
+        ) or "invalid catalog data"
+        print(
+            "[!] Polymarket Gamma catalog: %d/%d requests succeeded; "
+            "%d failed (%s), %d markets in %.0f ms" % (
+                successful_queries, query_count, diagnostics["failed_queries"],
+                errors, len(out), diagnostics["elapsed_ms"],
+            ),
+            flush=True,
+        )
     return (out, complete) if with_status else out
 
 
@@ -1439,6 +1518,27 @@ def main():
     if not market_map and not args.watch:
         return 1
 
+    if args.watch:
+        _write_scan_status({
+            "state": "starting",
+            "ts": time.time(),
+            "cycle": 0,
+            "update_mode": "event",
+            "processed_markets": 0,
+            "source_updates": 0,
+            "pending_updates": 0,
+            "pm_markets": len(market_map),
+            "phase_counts": {"live": 0, "prematch": 0, "unknown": 0},
+            "checks": {},
+            "source_counts": {},
+            "pm_catalog_complete": pm_catalog_complete,
+            "pm_catalog_retained": pm_catalog_retained,
+            "pm_catalog_fetch": get_pm_catalog_diagnostics(),
+            "signals": 0,
+            "min_roi_pct": round(min_roi * 100, 3),
+            "bank_rub": round(bank, 2),
+        })
+
     # ---------- BK bridge: 1win primary; BetBoom is a fallback ----------
     update_queue = DirtyUpdateQueue()
     set_pm_update_callback(update_queue.put_pm_token)
@@ -1580,9 +1680,11 @@ def main():
     last_status_write = 0.0
     last_scan_status = {
         "state": "starting", "ts": time.time(), "cycle": 0,
+        "update_mode": "event",
         "pm_markets": len(market_map), "phase_counts": {}, "checks": {},
         "source_counts": {}, "pm_catalog_complete": pm_catalog_complete,
         "pm_catalog_retained": pm_catalog_retained,
+        "pm_catalog_fetch": get_pm_catalog_diagnostics(),
         "min_roi_pct": round(min_roi * 100, 3),
     }
     _write_scan_status(last_scan_status)
@@ -2014,6 +2116,7 @@ def main():
                 "bookmaker_feed_health": router_feed_health_cache,
                 "pm_catalog_complete": pm_catalog_complete,
                 "pm_catalog_retained": pm_catalog_retained,
+                "pm_catalog_fetch": get_pm_catalog_diagnostics(),
                 "signals": len(live_snap),
                 "min_roi_pct": round(min_roi * 100, 3),
                 "best_candidate_roi_pct": round(best_candidate_roi * 100, 3)

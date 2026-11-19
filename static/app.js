@@ -349,12 +349,15 @@ function renderScanStatus() {
   }
 
   const age = Math.max(0, Date.now() / 1000 - Number(status.ts));
-  const active = status.state === 'running' && age <= SCAN_STATUS_STALE_SECONDS;
+  const starting = status.state === 'starting' && age <= SCAN_STATUS_STALE_SECONDS;
+  const active = (status.state === 'running' || starting) && age <= SCAN_STATUS_STALE_SECONDS;
   box.classList.add(active ? 'running' : 'stale');
   document.getElementById('scan-health-mode').textContent = status.update_mode === 'event'
     ? 'СОБЫТИЙНОЕ ОБНОВЛЕНИЕ' : 'ЦИКЛ СКАНИРОВАНИЯ';
-  document.getElementById('scan-health-label').textContent = active
-    ? status.update_mode === 'event'
+  document.getElementById('scan-health-label').textContent = starting
+    ? 'Сканер запускается'
+    : active
+      ? status.update_mode === 'event'
       ? `Сканер активен · событие ${Number(status.cycle || 0)}`
       : `Сканер активен · цикл ${Number(status.cycle || 0)}`
     : status.state === 'stopped' ? 'Сканер остановлен' : 'Статус сканера устарел';
@@ -393,6 +396,21 @@ function renderScanStatus() {
     reasons.unshift(status.pm_catalog_retained
       ? 'каталог Polymarket неполный; прежние события временно сохранены'
       : 'каталог Polymarket неполный; состав событий может быть неполным');
+  }
+  const catalogFetch = status.pm_catalog_fetch || {};
+  const catalogQueries = Number(catalogFetch.query_count || 0);
+  const catalogFailures = Number(catalogFetch.failed_queries || 0);
+  const catalogMarkets = Number(catalogFetch.markets || 0);
+  if (catalogQueries > 0 && (catalogFailures > 0 || catalogMarkets === 0)) {
+    const errorTypes = Object.entries(catalogFetch.error_counts || {})
+      .map(([name, count]) => `${name} ${Number(count)}`).slice(0, 2);
+    const failedTags = (catalogFetch.failed_tags || []).slice(0, 3);
+    reasons.unshift(
+      `Gamma PM: ответы ${Number(catalogFetch.successful_queries || 0)}/${catalogQueries} · ` +
+      `рынков ${catalogMarkets} · ${Number(catalogFetch.elapsed_ms || 0).toFixed(0)} мс` +
+      (catalogFailures ? ` · ошибок ${catalogFailures}${errorTypes.length ? ` (${errorTypes.join(', ')})` : ''}` : ' · активных рынков нет') +
+      (failedTags.length ? ` · теги ${failedTags.join('/')}` : '')
+    );
   }
   const sources = Object.entries(status.source_counts || {})
     .filter(([, count]) => Number(count) > 0)
