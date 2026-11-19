@@ -310,11 +310,12 @@ def _build_enriched(raw: dict) -> dict:
 async def _broadcast_loop():
     last_ts = 0.0
     last_broadcast = 0.0
+    last_heartbeat = time.time()
     while True:
         try:
+            now = time.time()
             if LIVE_FILE.exists():
                 st = LIVE_FILE.stat()
-                now = time.time()
                 if st.st_mtime > last_ts or now - last_broadcast >= 1.0:
                     last_ts = st.st_mtime
                     raw = _load_json(LIVE_FILE, {})
@@ -342,6 +343,17 @@ async def _broadcast_loop():
                     for ws in dead:
                         _clients.discard(ws)
                     last_broadcast = now
+            if _clients and now - last_heartbeat >= 15.0:
+                heartbeat = json.dumps({"type": "heartbeat", "ts": now})
+                dead = []
+                for ws in list(_clients):
+                    try:
+                        await ws.send_text(heartbeat)
+                    except Exception:
+                        dead.append(ws)
+                for ws in dead:
+                    _clients.discard(ws)
+                last_heartbeat = now
         except Exception:
             pass
         await asyncio.sleep(0.5)

@@ -3,6 +3,11 @@
    ===================================================== */
 const state = {
   ws: null,
+  wsRetryMs: 1000,
+  wsReconnectTimer: null,
+  wsGeneration: 0,
+  wsLastMessageAt: 0,
+  wsState: 'connecting',
   arbs: [],          // все enriched arbs
   visible: [],       // после фильтров
   activeSlug: null,
@@ -168,46 +173,108 @@ function updateBankLimit() {
   if (state.calcEdited) updateCalcHint();
 }
 
-function setPanelStatus(connected) {
+function setPanelStatus(status, retryMs = 0) {
   const label = document.getElementById('feed-status');
   const dot = document.getElementById('feed-dot');
-  if (label) label.textContent = connected ? 'Панель подключена' : 'Нет связи с панелью';
-  if (dot) dot.classList.toggle('connected', connected);
+  const labels = {
+    connecting: 'Подключение…',
+    connected: 'Панель подключена',
+    stale: 'Поток устарел',
+    disconnected: 'Нет связи с панелью',
+  };
+  state.wsState = status;
+  if (label) {
+    label.textContent = labels[status] || labels.disconnected;
+    const last = state.wsLastMessageAt
+      ? new Date(state.wsLastMessageAt).toLocaleTimeString('ru-RU')
+      : 'нет сообщений';
+    const retry = retryMs ? ` Повторное подключение через ${Math.ceil(retryMs / 1000)} с.` : '';
+    label.title = `Последнее сообщение панели: ${last}.${retry}`;
+  }
+  if (dot) {
+    dot.classList.toggle('connected', status === 'connected');
+    dot.classList.toggle('disconnected', status === 'disconnected');
+    dot.classList.toggle('stale', status === 'stale');
+  }
 }
 
 /* ============= WS ============= */
+function scheduleWsReconnect() {
+  if (state.wsReconnectTimer) return;
+  const delay = state.wsRetryMs;
+  state.wsRetryMs = Math.min(15000, Math.max(1000, Math.round(delay * 1.7)));
+  setPanelStatus('disconnected', delay);
+  state.wsReconnectTimer = setTimeout(() => {
+    state.wsReconnectTimer = null;
+    connectWS();
+  }, delay);
+}
+
 function connectWS() {
+  if (state.ws && [WebSocket.CONNECTING, WebSocket.OPEN].includes(state.ws.readyState)) return;
+  if (state.wsReconnectTimer) {
+    clearTimeout(state.wsReconnectTimer);
+    state.wsReconnectTimer = null;
+  }
+
+  const generation = ++state.wsGeneration;
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  setPanelStatus('connecting');
   const ws = new WebSocket(`${protocol}//${location.host}/ws`);
-  ws.onopen = () => setPanelStatus(true);
-  ws.onclose = () => { setPanelStatus(false); setTimeout(connectWS, 1500); };
-  ws.onerror = () => setPanelStatus(false);
-  ws.onmessage = (ev) => {
-    try {
-      const msg = JSON.parse(ev.data);
-      if (msg.type === 'snapshot') {
-        if (msg.config) state.config = { ...state.config, ...msg.config };
-        state.scanStatus = msg.scan_status || null;
-        renderScanStatus();
-        const newArbs = msg.arbs || [];
-        let hasNew = false;
-        for (const a of newArbs) {
-          if (!state.seenSlugs.has(a.slug)) {
-            state.seenSlugs.add(a.slug);
-            state.freshSlugs.add(a.slug);
-            hasNew = true;
-            setTimeout(() => state.freshSlugs.delete(a.slug), 2600);
-          }
-        }
-        state.arbs = newArbs;
-        if (state._primed && hasNew) playArbChime();
-        state._primed = true;
-        applyFilters();
-        if (state.activeSlug) refreshDetailThrottled();
-      }
-    } catch (e) {}
-  };
   state.ws = ws;
+
+  ws.onopen = () => {
+    if (generation !== state.wsGeneration) return;
+    state.wsLastMessageAt = Date.now();
+    setPanelStatus('connected');
+  };
+  ws.onclose = () => {
+    if (generation !== state.wsGeneration) return;
+    state.ws = null;
+    scheduleWsReconnect();
+  };
+  ws.onerror = () => {
+    if (generation === state.wsGeneration) {
+      try { ws.close(); } catch (e) {}
+    }
+  };
+  ws.onmessage = (ev) => {
+    if (generation !== state.wsGeneration) return;
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch (e) { return; }
+    state.wsLastMessageAt = Date.now();
+    state.wsRetryMs = 1000;
+    setPanelStatus('connected');
+    if (msg.type === 'heartbeat') return;
+    if (msg.type !== 'snapshot') return;
+
+    if (msg.config) state.config = { ...state.config, ...msg.config };
+    state.scanStatus = msg.scan_status || null;
+    renderScanStatus();
+    const newArbs = Array.isArray(msg.arbs) ? msg.arbs : [];
+    let hasNew = false;
+    for (const a of newArbs) {
+      if (a && a.slug && !state.seenSlugs.has(a.slug)) {
+        state.seenSlugs.add(a.slug);
+        state.freshSlugs.add(a.slug);
+        hasNew = true;
+        setTimeout(() => state.freshSlugs.delete(a.slug), 2600);
+      }
+    }
+    state.arbs = newArbs;
+    if (state._primed && hasNew) playArbChime();
+    state._primed = true;
+    applyFilters();
+    if (state.activeSlug) refreshDetailThrottled();
+  };
+}
+
+function checkWsFreshness() {
+  const ws = state.ws;
+  if (document.hidden || !ws || ws.readyState !== WebSocket.OPEN || !state.wsLastMessageAt) return;
+  if (Date.now() - state.wsLastMessageAt <= 35000) return;
+  setPanelStatus('stale');
+  try { ws.close(4000, 'heartbeat timeout'); } catch (e) {}
 }
 
 /* ============= FILTERS ============= */
@@ -323,64 +390,120 @@ function renderScanStatus() {
 }
 
 /* ============= LIST ============= */
+function createArbCard() {
+  const card = document.createElement('div');
+  card.className = 'arb';
+  card.innerHTML = '<div class="arb-head"><div class="arb-title"></div><div class="arb-roi"></div></div>' +
+    '<div class="arb-tags"></div><div class="arb-meta"><div class="arb-bks"></div><span class="arb-age"></span></div>';
+  return card;
+}
+
+function setCardText(card, selector, value) {
+  const node = card.querySelector(selector);
+  const text = String(value == null ? '' : value);
+  if (node && node.textContent !== text) node.textContent = text;
+}
+
+function setCardMarkup(card, selector, markup, cacheKey) {
+  const node = card.querySelector(selector);
+  if (node && node[cacheKey] !== markup) {
+    node.innerHTML = markup;
+    node[cacheKey] = markup;
+  }
+}
+
+function updateArbCard(card, a) {
+  const slug = String(a.slug || '');
+  const legs = Array.isArray(a.bets) ? a.bets : [];
+  const pmLeg = legs.find(l => l && l.source === 'Polymarket') || {};
+  const bbLeg = legs.find(l => l && l.source && l.source !== 'Polymarket') || {};
+  const phase = ['live', 'prematch', 'unknown'].includes(a.phase) ? a.phase : 'unknown';
+  const phaseLabels = { live: 'LIVE', prematch: 'ПРЕМАТЧ', unknown: 'СТАТУС ?' };
+  const title = a.title ? `${a.title} · ${a.q || ''}` : (a.q || slug);
+  const classes = ['arb'];
+  if (slug === state.activeSlug) classes.push('active');
+  if (state.freshSlugs.has(slug)) classes.push('fresh');
+
+  if (card.className !== classes.join(' ')) card.className = classes.join(' ');
+  card.dataset.arbSlug = slug;
+  card.setAttribute('role', 'button');
+  card.tabIndex = 0;
+  card.setAttribute('aria-pressed', String(slug === state.activeSlug));
+  card.setAttribute('aria-label', `${title}; ROI ${fmtPct(a.roi)}; нажмите Enter, чтобы открыть детали`);
+  setCardText(card, '.arb-title', title);
+  setCardText(card, '.arb-roi', fmtPct(a.roi));
+  setCardText(card, '.arb-age', fmtAgo(a.age_sec));
+
+  const tags = [`<span class="tag ${escapeHtml(sportClass(a.sport))}">${escapeHtml(a.sport || '')}</span>`];
+  if (a.market_type) tags.push(`<span class="tag mtype">${escapeHtml(a.market_type)}</span>`);
+  tags.push(`<span class="tag phase-${phase}">${phaseLabels[phase]}</span>`);
+  if (a.is_streamer) tags.push('<span class="tag streamer">СТРИМЕР</span>');
+  const pmAge = pmLeg.pm_age || a.pm_age;
+  if (pmAge && pmAge > 60) tags.push(`<span class="tag pm-age">PM ${Math.floor(pmAge)}с</span>`);
+  const sourceAge = a.source_age_sec == null ? NaN : Number(a.source_age_sec);
+  if (Number.isFinite(sourceAge)) {
+    const ageLabel = `ДАННЫЕ ${Math.floor(sourceAge)}с`;
+    const ageClass = a.source_state === 'stale' ? 'tag pm-age' : 'tag';
+    tags.push(`<span class="${ageClass}">${ageLabel}${a.source_state === 'stale' ? ' · УСТАРЕЛИ' : ''}</span>`);
+  } else {
+    tags.push('<span class="tag pm-age">СВЕЖЕСТЬ ?</span>');
+  }
+  setCardMarkup(card, '.arb-tags', tags.join(''), '_renderedTags');
+
+  const bkClass = bbLeg.source === '1win' ? 'onewin' : bbLeg.source === 'Polymarket' ? 'other' : 'bb';
+  const chips = `<span class="bk-chip ${bkClass}">${escapeHtml(bbLeg.source || 'БК')}</span>` +
+    '<span class="bk-chip pm">Polymarket</span>';
+  setCardMarkup(card, '.arb-bks', chips, '_renderedBooks');
+}
+
 function renderArbs() {
   const box = document.getElementById('arbs-list');
-  if (!state.visible.length) {
+  const items = state.visible.filter(a => a && a.slug);
+  if (!items.length) {
     const phaseNames = { all: 'всех фаз', live: 'LIVE', prematch: 'прематча', unknown: 'неподтверждённого статуса' };
     const message = state.arbs.length
       ? 'Проверьте фильтры спорта и минимального ROI.'
       : (state.scanStatus ? 'Причины и число проверенных рынков показаны в сводке цикла выше.' : 'Ожидание первого статуса сканера.');
-    box.innerHTML = `<div class="empty"><b>${state.arbs.length ? 'Нет совпадений с фильтрами' : 'Нет прошедших проверку сигналов'}</b><br>` +
+    const markup = `<div class="empty"><b>${state.arbs.length ? 'Нет совпадений с фильтрами' : 'Нет прошедших проверку сигналов'}</b><br>` +
       `Раздел: ${escapeHtml(phaseNames[state.phase] || phaseNames.all)}.<small>${escapeHtml(message)}</small></div>`;
+    if (box.dataset.emptyMarkup !== markup) {
+      box.innerHTML = markup;
+      box.dataset.emptyMarkup = markup;
+    }
     return;
   }
-  box.onclick = (event) => {
-    const card = event.target.closest('[data-arb-slug]');
-    if (card && box.contains(card)) selectArb(card.dataset.arbSlug);
-  };
-  box.innerHTML = state.visible.map(a => {
-    const legs = a.bets || [];
-    const pmLeg = legs.find(l => l.source === 'Polymarket') || {};
-    const bbLeg = legs.find(l => l.source && l.source !== 'Polymarket') || {};
-    const tags = [];
-    tags.push(`<span class="tag ${escapeHtml(sportClass(a.sport))}">${escapeHtml(a.sport || '')}</span>`);
-    if (a.market_type) tags.push(`<span class="tag mtype">${escapeHtml(a.market_type)}</span>`);
-    const phase = ['live','prematch','unknown'].includes(a.phase) ? a.phase : 'unknown';
-    const phaseLabels = { live: 'LIVE', prematch: 'ПРЕМАТЧ', unknown: 'СТАТУС ?' };
-    tags.push(`<span class="tag phase-${phase}">${phaseLabels[phase]}</span>`);
-    if (a.is_streamer) tags.push(`<span class="tag streamer">СТРИМЕР</span>`);
-    const pmAge = (pmLeg && pmLeg.pm_age) || a.pm_age;
-    if (pmAge && pmAge > 60) tags.push(`<span class="tag pm-age">PM ${Math.floor(pmAge)}с</span>`);
-    const sourceAge = a.source_age_sec == null ? NaN : Number(a.source_age_sec);
-    if (Number.isFinite(sourceAge)) {
-      const ageLabel = `ДАННЫЕ ${Math.floor(sourceAge)}с`;
-      const ageClass = a.source_state === 'stale' ? 'tag pm-age' : 'tag';
-      tags.push(`<span class="${ageClass}">${ageLabel}${a.source_state === 'stale' ? ' · УСТАРЕЛИ' : ''}</span>`);
-    } else {
-      tags.push(`<span class="tag pm-age">СВЕЖЕСТЬ ?</span>`);
-    }
 
-    const cls = ['arb'];
-    if (a.slug === state.activeSlug) cls.push('active');
-    if (state.freshSlugs.has(a.slug)) cls.push('fresh');
+  if (!box.dataset.eventsBound) {
+    box.addEventListener('click', event => {
+      const card = event.target.closest('[data-arb-slug]');
+      if (card && box.contains(card)) selectArb(card.dataset.arbSlug);
+    });
+    box.addEventListener('keydown', event => {
+      if (event.key !== 'Enter' && event.key !== ' ') return;
+      const card = event.target.closest('[data-arb-slug]');
+      if (!card || !box.contains(card)) return;
+      event.preventDefault();
+      selectArb(card.dataset.arbSlug);
+    });
+    box.dataset.eventsBound = 'true';
+  }
 
-    return `
-      <div class="${cls.join(' ')}" data-arb-slug="${escapeHtml(a.slug || '')}">
-        <div class="arb-head">
-          <div class="arb-title">${escapeHtml(a.title ? (a.title + ' · ' + (a.q || '')) : (a.q || a.slug || ''))}</div>
-          <div class="arb-roi">${fmtPct(a.roi)}</div>
-        </div>
-        <div class="arb-tags">${tags.join('')}</div>
-        <div class="arb-meta">
-          <div class="arb-bks">
-            <span class="bk-chip ${bbLeg.source === '1win' ? 'onewin' : 'bb'}">${escapeHtml(bbLeg.source || 'БК')}</span>
-            <span class="bk-chip pm">Polymarket</span>
-          </div>
-          <span>${fmtAgo(a.age_sec)}</span>
-        </div>
-      </div>
-    `;
-  }).join('');
+  delete box.dataset.emptyMarkup;
+  box.querySelector(':scope > .empty')?.remove();
+  const existing = new Map(Array.from(box.querySelectorAll(':scope > .arb[data-arb-slug]'))
+    .map(card => [card.dataset.arbSlug, card]));
+  let position = 0;
+  for (const a of items) {
+    const slug = String(a.slug);
+    let card = existing.get(slug);
+    if (card) existing.delete(slug);
+    else card = createArbCard();
+    updateArbCard(card, a);
+    const current = box.children[position];
+    if (current !== card) box.insertBefore(card, current || null);
+    position += 1;
+  }
+  for (const card of existing.values()) card.remove();
 }
 
 /* ============= DETAIL ============= */
@@ -1209,6 +1332,8 @@ function init() {
   setInterval(() => {
     if (state.activeSlug) { loadPriceChart(state.activeSlug); loadPmBook(state.activeSlug); }
   }, 10000);
+  setInterval(checkWsFreshness, 5000);
+  document.addEventListener('visibilitychange', checkWsFreshness);
   setInterval(loadDaily, 30000);
   setInterval(() => { if (state.visible.length) renderArbs(); }, 2000);
 
