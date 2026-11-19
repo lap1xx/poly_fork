@@ -93,6 +93,14 @@ class BKRouterPriorityTests(unittest.TestCase):
         self.assertEqual(router.get_binding(slug), {"provider": "1win"})
         self.assertEqual(router.fallback_bindings[slug], {"provider": "BetBoom"})
 
+    def test_feed_health_reports_onewin_quote_transport_metrics(self):
+        expected = {"connected": True, "fresh_open_quotes": 21}
+        router, one_win, _ = self._router(None, None)
+        stream = SimpleNamespace(snapshot_health=Mock(return_value=expected))
+        one_win.get_global_stream = Mock(return_value=stream)
+        self.assertEqual(router.feed_health(), {"1win": expected})
+        one_win.get_global_stream.assert_called_once_with()
+
     def test_invalid_market_shape_is_rejected_before_provider_calls(self):
         router, one_win, betboom = self._router({"provider": "1win"}, {"provider": "BetBoom"})
         self.assertEqual(router.bind("cs2-something", {"o": ["Only one outcome"]}), (None, None))

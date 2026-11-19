@@ -50,10 +50,15 @@ USER_AGENT = (
 )
 WANTED_SPORTS = [142, 47, 37, 99, 33]
 MAX_MATCHES_PER_SPORT = 200
-INITIAL_SUBSCRIPTION_LIMIT = 30
+# Subscribe to odds only after a PM market is successfully bound; avoid warming
+# unrelated catalog events before the scanner knows which matches it needs.
+INITIAL_SUBSCRIPTION_LIMIT = 0
 SUBSCRIPTION_BATCH_SIZE = 30
 MATCH_REFRESH_SECONDS = 180
 MATCH_AMBIGUITY_MARGIN = 0.08
+TIME_CORROBORATED_SPORT_IDS = {33}
+TIME_CORROBORATED_MIN_SCORE = 0.60
+TIME_CORROBORATED_MAX_DELTA_HOURS = 1.0
 TEAM_ALIASES_FILE = os.getenv(
     "ONEWIN_TEAM_ALIASES_FILE",
     os.path.join(os.path.dirname(__file__), "team_aliases.json"),
@@ -79,12 +84,25 @@ ONEWIN_SPORT_NAMES = {
     136: "MOBILE_LEGENDS", 45: "R6", 170: "HEROES3",
 }
 
-_PM_MAP_RE = re.compile(r"-(?:game|map)(\d)(?:-|$)", re.I)
+_PM_MAP_RE = re.compile(r"-(?:game|map)(\d)(?=-|$)", re.I)
 _PM_UNSUPPORTED = (
     "both-teams", "dragon", "baron", "kills-", "turret", "first-blood",
     "round-", "pistol", "exact-score", "odd-even", "odd_even",
     "map-total", "handicap-", "spread-", "-total-", "-ou-",
 )
+_PM_TOTAL_RE = re.compile(
+    r"(?:^|-)(?:total|totals|over-under|overunder|ou)(?:-|$)", re.I
+)
+_PM_HANDICAP_RE = re.compile(r"(?:^|-)(?:handicap|spread)(?:-|$)", re.I)
+_PM_SET_PERIOD_RE = re.compile(
+    r"(?:^|-)(?:first-set|set(?:-\d+)?|sets|period(?:-\d+)?)(?:-|$)", re.I
+)
+_PM_PLAYER_PROP_RE = re.compile(
+    r"(?:^|-)(?:any-player|player|ultra-kill|rampage|double-kill|"
+    r"triple-kill|first-kill)(?:-|$)", re.I
+)
+_PM_EXPLICIT_WINNER_RE = re.compile(r"(?:^|-)(?:match-)?winner(?:-|$)", re.I)
+_PM_CANONICAL_MATCH_RE = re.compile(r"-20\d{2}-\d{2}-\d{2}$")
 _MAP_IN_GROUP_RE = re.compile(
     r"(?:\bmap\s*#?\s*(\d+)\b|\bкарта\s*#?\s*(\d+)\b|\b(\d+)\s*(?:st|nd|rd|th)?\s*(?:map|карта)\b)",
     re.I,
@@ -93,11 +111,26 @@ _WINNER_RE = re.compile(r"\b(?:winner|победитель|исход)\b", re.I)
 
 
 def pm_market_kind(slug: str):
-    s = (slug or "").lower()
-    if any(x in s for x in _PM_UNSUPPORTED):
-        return "unsupported", None, None
+    s = (slug or "").strip().lower()
+    if not s:
+        return "unsupported", None, "empty_slug"
+    if _PM_TOTAL_RE.search(s):
+        return "unsupported", None, "total"
+    if _PM_HANDICAP_RE.search(s):
+        return "unsupported", None, "handicap"
+    if _PM_SET_PERIOD_RE.search(s):
+        return "unsupported", None, "set_period_not_supported"
+    if _PM_PLAYER_PROP_RE.search(s) or any(x in s for x in _PM_UNSUPPORTED):
+        return "unsupported", None, "special_or_player_prop"
     m = _PM_MAP_RE.search(s)
-    return ("map_winner", int(m.group(1)), None) if m else ("winner", None, None)
+    if m:
+        tail = s[m.end():]
+        if not re.fullmatch(r"(?:-winner)?(?:-20\d{2}-\d{2}-\d{2})?", tail):
+            return "unsupported", None, "unknown_period_market"
+        return "map_winner", int(m.group(1)), None
+    if _PM_EXPLICIT_WINNER_RE.search(s) or _PM_CANONICAL_MATCH_RE.search(s):
+        return "winner", None, None
+    return "unsupported", None, "unknown_market_signature"
 
 
 def build_ws_url(api_base: str = API_BASE, language: str = LANGUAGE,
@@ -338,6 +371,11 @@ class OneWinStream:
         self._subscribed_info: set[str] = set()
         self._subscribed_odds: dict[bool, set[str]] = {True: set(), False: set()}
         self.last_error = None
+        self._odds_snapshot_count = 0
+        self._odds_delta_count = 0
+        self._price_update_count = 0
+        self._last_odds_message_at = None
+        self._last_price_update_at = None
 
     def _headers(self):
         return {
@@ -402,11 +440,17 @@ class OneWinStream:
         return list(unique.values())
 
     def _store_matches(self, items, replace_sport_ids=None):
+        items = list(items or [])
+        incoming_ids = {
+            _key(m.get("id")) for m in items
+            if isinstance(m, dict) and m.get("id") is not None
+        }
         with self.lock:
             if replace_sport_ids:
                 replace_ids = {_key(sid) for sid in replace_sport_ids}
                 for mid, old_match in list(self.matches.items()):
-                    if _key(old_match.get("sportId")) in replace_ids:
+                    if (_key(old_match.get("sportId")) in replace_ids
+                            and mid not in incoming_ids):
                         self.matches.pop(mid, None)
                         self.stakes.pop(mid, None)
             for m in items:
@@ -657,6 +701,11 @@ class OneWinStream:
         base_filter = data.get("isBaseOddsGroups")
         now = time.time()
         with self.lock:
+            if snapshot:
+                self._odds_snapshot_count += 1
+            else:
+                self._odds_delta_count += 1
+            self._last_odds_message_at = now
             bucket = self.stakes.setdefault(match_key, {})
             if snapshot and base_filter is False:
                 # The non-base subscription carries the complete odds-group
@@ -686,8 +735,17 @@ class OneWinStream:
                         odds.pop(odd_id, None)
                         continue
                     merged = dict(odds.get(odd_id) or {})
+                    old_received_at = merged.get("receivedAt")
                     merged.update(odd)
-                    merged["receivedAt"] = now
+                    if _finite_odds(odd.get("cf")) is not None:
+                        merged["receivedAt"] = now
+                        self._price_update_count += 1
+                        self._last_price_update_at = now
+                    elif old_received_at is not None:
+                        # A status/name-only delta does not reaffirm the cached price.
+                        merged["receivedAt"] = old_received_at
+                    else:
+                        merged.pop("receivedAt", None)
                     odds[odd_id] = merged
                 merged_group = dict(old)
                 for field in ("id", "name", "isBase", "renderType", "period", "periodName"):
@@ -708,8 +766,60 @@ class OneWinStream:
         with self.lock:
             return {slug: dict(value) for slug, value in self.match_diagnostics.items()}
 
+    def snapshot_health(self):
+        now = time.time()
+        with self.lock:
+            matches_count = len(self.matches)
+            bindings_count = len(self.bindings)
+            snapshot_count = self._odds_snapshot_count
+            delta_count = self._odds_delta_count
+            price_update_count = self._price_update_count
+            last_message_at = self._last_odds_message_at
+            last_price_at = self._last_price_update_at
+            fresh_open_quotes = 0
+            stale_open_quotes = 0
+            for groups in self.stakes.values():
+                for group in groups.values():
+                    for odd in (group.get("odds") or {}).values():
+                        if not _status_is_open(odd.get("status")):
+                            continue
+                        if _finite_odds(odd.get("cf")) is None:
+                            continue
+                        try:
+                            age_sec = now - float(odd.get("receivedAt"))
+                        except (TypeError, ValueError):
+                            age_sec = float("inf")
+                        if 0.0 <= age_sec <= ODDS_MAX_AGE_SECONDS:
+                            fresh_open_quotes += 1
+                        else:
+                            stale_open_quotes += 1
+        with self._send_lock:
+            subscribed_matches = len(self._subscribed_odds.get(False, set()))
+        return {
+            "connected": self._connected.is_set(),
+            "catalog_ready": self._ready.is_set() and matches_count > 0,
+            "catalog_matches": matches_count,
+            "bound_pm_markets": bindings_count,
+            "subscribed_matches": subscribed_matches,
+            "fresh_open_quotes": fresh_open_quotes,
+            "stale_open_quotes": stale_open_quotes,
+            "odds_snapshots_received": snapshot_count,
+            "odds_deltas_received": delta_count,
+            "valid_price_updates_received": price_update_count,
+            "last_odds_message_age_sec": (
+                round(max(0.0, now - last_message_at), 1)
+                if last_message_at is not None else None
+            ),
+            "last_price_update_age_sec": (
+                round(max(0.0, now - last_price_at), 1)
+                if last_price_at is not None else None
+            ),
+            "max_quote_age_sec": ODDS_MAX_AGE_SECONDS,
+            "last_error": self.last_error,
+        }
+
     def bind(self, slug: str, pm_teams, pm_context=None):
-        kind, arg, _ = pm_market_kind(slug)
+        kind, arg, unsupported_subtype = pm_market_kind(slug)
         teams_ok = isinstance(pm_teams, (list, tuple)) and len(pm_teams) == 2
         base = {
             "slug": str(slug),
@@ -737,7 +847,7 @@ class OneWinStream:
             self._record_match_diagnostic(slug, payload)
 
         if kind not in ("winner", "map_winner"):
-            record("unsupported_market_type")
+            record("unsupported_market_type", unsupported_subtype=unsupported_subtype)
             return None
         if not teams_ok:
             record("invalid_team_outcomes")
@@ -775,9 +885,28 @@ class OneWinStream:
             record("no_sport_candidates", threshold=threshold)
             return None
         best_score, _, _, _, best = scored[0]
+        used_time_corroboration = False
         if not best or best_score < threshold:
-            record("below_threshold", rows=scored, threshold=threshold)
-            return None
+            corroborated = []
+            if sport_id in TIME_CORROBORATED_SPORT_IDS:
+                corroborated = [
+                    row for row in scored
+                    if row[0] >= TIME_CORROBORATED_MIN_SCORE
+                    and row[3] is not None
+                    and row[3] <= TIME_CORROBORATED_MAX_DELTA_HOURS
+                ]
+            if len(corroborated) == 1:
+                best_score, _, _, _, best = corroborated[0]
+                used_time_corroboration = True
+            else:
+                reason = "ambiguous_time_corroboration" if len(corroborated) > 1 else "below_threshold"
+                record(
+                    reason, rows=scored, threshold=threshold,
+                    time_corroboration_candidates=len(corroborated),
+                    time_corroboration_min_score=TIME_CORROBORATED_MIN_SCORE,
+                    time_corroboration_max_delta_hours=TIME_CORROBORATED_MAX_DELTA_HOURS,
+                )
+                return None
         near_best = [row for row in scored
                      if row[0] >= threshold and best_score - row[0] < MATCH_AMBIGUITY_MARGIN]
         used_time_context = False
@@ -811,9 +940,11 @@ class OneWinStream:
         with self.lock:
             self.bindings[slug] = binding
         record(
-            "matched_time_context" if used_time_context else "matched",
+            ("matched_time_corroborated" if used_time_corroboration else
+             "matched_time_context" if used_time_context else "matched"),
             rows=scored, threshold=threshold, selected=best,
             event_key=event_key,
+            time_corroborated=used_time_corroboration,
         )
         self._subscribe_match(best["id"])
         return dict(binding)

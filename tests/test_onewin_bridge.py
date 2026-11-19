@@ -23,6 +23,10 @@ class OneWinFeedTests(unittest.TestCase):
         self.stream._connected.set()
         self.assertTrue(self.stream.is_ready())
 
+    def test_initial_subscription_skips_unbound_catalog_events(self):
+        self.stream._set_initial_ids()
+        self.assertEqual(self.stream._desired_ids, {})
+
     def test_ws_url_uses_match_odds_path_and_runtime_options(self):
         url = self.ow.build_ws_url(
             "https://api-gateway.top-parser.com", "ru-RU", "public-partner-id"
@@ -75,6 +79,29 @@ class OneWinFeedTests(unittest.TestCase):
         self.assertTrue(all(x["data"]["matchIds"] == [12345] for x in odds))
         self.assertFalse(any("make-bet" in message or "betslip" in message
                              for message in ws.sent))
+
+    def test_pm_market_kind_fails_closed_for_sets_props_and_unknown_slugs(self):
+        cases = {
+            "cs2-team-alpha-team-bravo-2026-11-19": ("winner", None, None),
+            "cs2-team-alpha-team-bravo-2026-11-19-game1": ("map_winner", 1, None),
+            "cs2-team-alpha-team-bravo-map3-winner-2026-11-19": ("map_winner", 3, None),
+            "atp-player-a-player-b-2026-11-19-set-2-winner": (
+                "unsupported", None, "set_period_not_supported"
+            ),
+            "dota2-a-b-2026-11-19-game3-any-player-ultra-kill": (
+                "unsupported", None, "special_or_player_prop"
+            ),
+            "cs2-team-alpha-team-bravo-map3-total": ("unsupported", None, "total"),
+            "cs2-team-alpha-team-bravo-2026-11-19-player-most-kills": (
+                "unsupported", None, "special_or_player_prop"
+            ),
+            "cs2-team-alpha-team-bravo-2026-11-19-unrecognized-market": (
+                "unsupported", None, "unknown_market_signature"
+            ),
+        }
+        for slug, expected in cases.items():
+            with self.subTest(slug=slug):
+                self.assertEqual(self.ow.pm_market_kind(slug), expected)
 
     def test_snapshot_maps_open_map_winner_odds_to_pm_teams(self):
         binding = self.stream.bind(self.slug, ["Team Alpha", "Team Bravo"])
@@ -138,6 +165,41 @@ class OneWinFeedTests(unittest.TestCase):
         }
         self.stream._on_match_odds(blocked)
         self.assertEqual(self.stream.live_bc(self.slug), {})
+
+    def test_status_only_delta_does_not_rejuvenate_a_stale_price(self):
+        self.stream.bind(self.slug, ["Team Alpha", "Team Bravo"])
+        self.stream._connected.set()
+        base = {
+            "matchId": 12345,
+            "isBaseOddsGroups": True,
+            "oddsGroups": [{
+                "id": "map3-winner", "name": "Map 3. Winner", "isBase": True,
+                "oddsList": [
+                    {"id": 11, "name": "Team Alpha", "cf": 1.91, "status": 1},
+                    {"id": 12, "name": "Team Bravo", "cf": 2.07, "status": 1},
+                ],
+            }],
+        }
+        self.stream._on_match_odds(base, snapshot=True)
+        stale_at = time.time() - self.ow.ODDS_MAX_AGE_SECONDS - 1
+        self.stream.stakes["12345"]["map3-winner"]["odds"]["11"]["receivedAt"] = stale_at
+        self.stream._on_match_odds({
+            "matchId": 12345,
+            "oddsGroups": [{
+                "id": "map3-winner", "name": "Map 3. Winner",
+                "oddsList": [{"id": 11, "status": 1}],
+            }],
+        })
+        odd = self.stream.stakes["12345"]["map3-winner"]["odds"]["11"]
+        self.assertEqual(odd["receivedAt"], stale_at)
+        self.assertEqual(odd["cf"], 1.91)
+        self.assertEqual(self.stream.live_bc(self.slug), {})
+        health = self.stream.snapshot_health()
+        self.assertEqual(health["odds_snapshots_received"], 1)
+        self.assertEqual(health["odds_deltas_received"], 1)
+        self.assertEqual(health["valid_price_updates_received"], 2)
+        self.assertEqual(health["fresh_open_quotes"], 1)
+        self.assertEqual(health["stale_open_quotes"], 1)
 
     def test_ambiguous_duplicate_market_groups_fail_closed(self):
         self.stream.bind(self.slug, ["Team Alpha", "Team Bravo"])
@@ -223,6 +285,69 @@ class OneWinFeedTests(unittest.TestCase):
         diagnostic = self.stream.snapshot_match_diagnostics()[self.slug]
         self.assertEqual(diagnostic["reason"], "matched_time_context")
 
+    def test_unique_near_start_time_corroborates_tennis_name_match(self):
+        first = {
+            "id": 33301, "sportId": 33,
+            "homeTeam": {"name": "Бранко Джурич"},
+            "awayTeam": {"name": "Марко Топо"},
+            "startAt": "2026-11-19T10:00:00Z",
+        }
+        distant_duplicate = dict(first, id=33302, startAt="2026-11-20T10:00:00Z")
+        self.stream._store_matches([first, distant_duplicate])
+        slug = "atp-djuric1-topo1-2026-11-19"
+        binding = self.stream.bind(
+            slug,
+            ["Branko Djuric", "Marko Topo"],
+            {"start": "2026-11-19T10:30:00Z"},
+        )
+        self.assertIsNotNone(binding)
+        self.assertEqual(binding["match_id"], 33301)
+        self.assertGreaterEqual(binding["score"], self.ow.TIME_CORROBORATED_MIN_SCORE)
+        self.assertLess(binding["score"], 0.65)
+        self.assertEqual(
+            self.stream.snapshot_match_diagnostics()[slug]["reason"],
+            "matched_time_corroborated",
+        )
+
+    def test_time_corroboration_rejects_multiple_close_tennis_events(self):
+        first = {
+            "id": 33401, "sportId": 33,
+            "homeTeam": {"name": "Бранко Джурич"},
+            "awayTeam": {"name": "Марко Топо"},
+            "startAt": "2026-11-19T10:00:00Z",
+        }
+        second = dict(first, id=33402, startAt="2026-11-19T10:40:00Z")
+        self.stream._store_matches([first, second])
+        slug = "atp-djuric1-topo1-2026-11-19"
+        self.assertIsNone(self.stream.bind(
+            slug,
+            ["Branko Djuric", "Marko Topo"],
+            {"start": "2026-11-19T10:30:00Z"},
+        ))
+        self.assertEqual(
+            self.stream.snapshot_match_diagnostics()[slug]["reason"],
+            "ambiguous_time_corroboration",
+        )
+
+    def test_time_corroboration_does_not_lower_esports_threshold(self):
+        match = {
+            "id": 33501, "sportId": 142,
+            "homeTeam": {"name": "Бранко Джурич"},
+            "awayTeam": {"name": "Марко Топо"},
+            "startAt": "2026-11-19T10:00:00Z",
+        }
+        self.stream._store_matches([match])
+        slug = "cs2-djuric-topo-2026-11-19"
+        self.assertIsNone(self.stream.bind(
+            slug,
+            ["Branko Djuric", "Marko Topo"],
+            {"start": "2026-11-19T10:30:00Z"},
+        ))
+        self.assertEqual(
+            self.stream.snapshot_match_diagnostics()[slug]["reason"],
+            "below_threshold",
+        )
+
     def test_below_threshold_diagnostic_contains_top_candidate(self):
         self.assertIsNone(self.stream.bind(self.slug, ["Completely Different", "Unknown Club"]))
         diagnostic = self.stream.snapshot_match_diagnostics()[self.slug]
@@ -238,6 +363,26 @@ class OneWinFeedTests(unittest.TestCase):
         self.assertNotIn("12345", self.stream.matches)
         self.assertIn("12346", self.stream.matches)
         self.assertIn("22345", self.stream.matches)
+
+    def test_catalog_refresh_preserves_odds_for_retained_match(self):
+        self.stream.bind(self.slug, ["Team Alpha", "Team Bravo"])
+        self.stream._connected.set()
+        self.stream._on_match_odds({
+            "matchId": 12345,
+            "isBaseOddsGroups": True,
+            "oddsGroups": [{
+                "id": "map3-winner", "name": "Map 3. Winner", "isBase": True,
+                "oddsList": [
+                    {"id": 11, "name": "Team Alpha", "cf": 1.91, "status": 1},
+                    {"id": 12, "name": "Team Bravo", "cf": 2.07, "status": 1},
+                ],
+            }],
+        }, snapshot=True)
+        refreshed = dict(self.match, name="Updated catalog metadata")
+        self.stream._store_matches([refreshed], replace_sport_ids={142})
+        result = self.stream.live_bc(self.slug)
+        self.assertEqual(result["Team Alpha"]["o"], 1.91)
+        self.assertEqual(result["Team Bravo"]["o"], 2.07)
 
     def test_other_market_types_are_not_mistaken_for_winner(self):
         self.assertEqual(self.ow._group_market_kind("Map 3. Winner"), ("map_winner", 3))

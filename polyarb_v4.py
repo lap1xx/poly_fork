@@ -1112,12 +1112,16 @@ def _write_match_diagnostics(router, market_map):
     active = set(market_map or {})
     diagnostics = {slug: row for slug, row in diagnostics.items() if slug in active}
     reason_counts = {}
+    unsupported_subtype_counts = {}
     match_ids = set()
     matched_markets = 0
     for row in diagnostics.values():
         reason = row.get("reason", "unknown")
         reason_counts[reason] = reason_counts.get(reason, 0) + 1
-        if reason in {"matched", "matched_time_context"}:
+        if reason == "unsupported_market_type":
+            subtype = row.get("unsupported_subtype", "unknown")
+            unsupported_subtype_counts[subtype] = unsupported_subtype_counts.get(subtype, 0) + 1
+        if reason in {"matched", "matched_time_context", "matched_time_corroborated"}:
             matched_markets += 1
             match_id = row.get("selected_match_id")
             if match_id is not None:
@@ -1129,6 +1133,7 @@ def _write_match_diagnostics(router, market_map):
             "matched_pm_markets": matched_markets,
             "unique_1win_events": len(match_ids),
             "reason_counts": reason_counts,
+            "unsupported_subtype_counts": unsupported_subtype_counts,
         },
         "markets": diagnostics,
     })
@@ -1671,6 +1676,7 @@ def main():
                 "phase_counts": phase_counts,
                 "checks": scan_counts,
                 "source_counts": source_counts,
+                "bookmaker_feed_health": router.feed_health() if router is not None else {},
                 "pm_catalog_complete": pm_catalog_complete,
                 "pm_catalog_retained": pm_catalog_retained,
                 "signals": len(live_snap),

@@ -338,6 +338,16 @@ class BKRouter:
                 pass
         return out
 
+    def feed_health(self):
+        """Return read-only transport and quote freshness health for enabled feeds."""
+        out = {}
+        if self.use_onewin:
+            try:
+                out["1win"] = _ow.get_global_stream().snapshot_health()
+            except Exception as exc:
+                out["1win"] = {"connected": False, "error": type(exc).__name__}
+        return out
+
 
 _ROUTER = None
 _ROUTER_LOCK = threading.Lock()
