@@ -10,7 +10,9 @@ const state = {
   hideSet: new Set(),
   seenSlugs: new Set(),
   freshSlugs: new Set(),
-  phase: 'live',     // 'live' | 'prematch'
+  phase: 'all',      // 'all' | 'live' | 'prematch' | 'unknown'
+  scanStatus: null,
+  suggestedCapped: false,
   audioCtx: null,
   soundEnabled: localStorage.getItem('poly_arb_sound') !== 'off',
   bkFilter: JSON.parse(localStorage.getItem('poly_arb_bks') || 'null'),
@@ -115,18 +117,55 @@ function toast(msg, err) {
   el._t = setTimeout(() => el.classList.add('hidden'), 2400);
 }
 
-/* Separate from the per-deal bank in config.json; kept only in this browser. */
+/* Separate from config.bank; this planner value stays in the current browser. */
+function getTotalBank() {
+  const input = document.getElementById('risk-total-bank');
+  if (!input || input.value.trim() === '') return null;
+  const bank = Number(input.value);
+  return Number.isFinite(bank) && bank > 0 ? bank : null;
+}
+
+function getPlanCap() {
+  const totalBank = getTotalBank();
+  return totalBank === null ? null : totalBank * 0.4;
+}
+
+function updatePlanRiskNote(exposureRub) {
+  const note = document.getElementById('hm-risk-note');
+  if (!note) return;
+  const cap = getPlanCap();
+  note.classList.remove('safe', 'warn');
+  if (cap === null) {
+    note.textContent = 'Укажите общий банк справа, чтобы применить 40%-ориентир к плану.';
+    return;
+  }
+  if (exposureRub > cap + 0.01) {
+    note.classList.add('warn');
+    note.textContent = `План ${fmtMoney(exposureRub)} выше 40%-ориентира ${fmtMoney(cap)} на ${fmtMoney(exposureRub - cap)}. Проверьте риск вручную.`;
+  } else if (state.suggestedCapped) {
+    note.classList.add('safe');
+    note.textContent = `Рекомендация уменьшена до 40%-ориентира (${fmtMoney(cap)}); перепроверьте глубину стакана для нового объёма.`;
+  } else {
+    note.classList.add('safe');
+    note.textContent = `План ${fmtMoney(exposureRub)} в пределах ориентира ${fmtMoney(cap)} на один план.`;
+  }
+}
+
 function updateBankLimit() {
   const input = document.getElementById('risk-total-bank');
   const output = document.getElementById('risk-limit');
   if (!input || !output) return;
-  const bank = Number(input.value);
-  const valid = input.value.trim() !== '' && Number.isFinite(bank) && bank >= 0;
-  output.textContent = valid ? fmtMoney(bank * 0.4) : '—';
+  const bank = getTotalBank();
+  output.textContent = bank !== null ? fmtMoney(bank * 0.4) : '—';
   try {
-    if (valid) localStorage.setItem('poly_arb_total_bank', String(bank));
+    if (bank !== null) localStorage.setItem('poly_arb_total_bank', String(bank));
     else localStorage.removeItem('poly_arb_total_bank');
   } catch (e) {}
+  if (state.activeSlug) {
+    if (!state.detailEdited) renderHowMuch(getActive());
+    else recalcHowMuch();
+  }
+  if (state.calcEdited) updateCalcHint();
 }
 
 function setPanelStatus(connected) {
@@ -148,6 +187,8 @@ function connectWS() {
       const msg = JSON.parse(ev.data);
       if (msg.type === 'snapshot') {
         if (msg.config) state.config = { ...state.config, ...msg.config };
+        state.scanStatus = msg.scan_status || null;
+        renderScanStatus();
         const newArbs = msg.arbs || [];
         let hasNew = false;
         for (const a of newArbs) {
@@ -179,7 +220,8 @@ function applyFilters() {
   const minRoi = parseFloat(document.getElementById('f-minroi').value || '0') / 100;
 
   state.visible = state.arbs.filter(a => {
-    if ((a.phase || 'live') !== state.phase) return false;
+    const phase = ['live','prematch','unknown'].includes(a.phase) ? a.phase : 'unknown';
+    if (state.phase !== 'all' && phase !== state.phase) return false;
     if (!sports.has(a.sport)) return false;
     if ((a.roi || 0) < minRoi) return false;
     return true;
@@ -194,6 +236,16 @@ function updateHeader() {
   const topEl = document.getElementById('st-top-roi');
   totalEl.textContent = state.visible.length;
 
+  const phaseCounts = { all: state.arbs.length, live: 0, prematch: 0, unknown: 0 };
+  for (const arb of state.arbs) {
+    const phase = ['live','prematch','unknown'].includes(arb.phase) ? arb.phase : 'unknown';
+    phaseCounts[phase] += 1;
+  }
+  for (const phase of Object.keys(phaseCounts)) {
+    const count = document.getElementById(`phase-${phase}-count`);
+    if (count) count.textContent = phaseCounts[phase];
+  }
+
   if (state.visible.length) {
     topEl.textContent = fmtPct(state.visible[0].roi);
     topEl.style.color = state.visible[0].roi >= 0 ? 'var(--green)' : 'var(--red)';
@@ -203,11 +255,83 @@ function updateHeader() {
   }
 }
 
+const SCAN_STATUS_STALE_SECONDS = 60;
+
+function renderScanStatus() {
+  const box = document.getElementById('scan-health');
+  const status = state.scanStatus;
+  if (!box) return;
+  box.classList.remove('running', 'stale');
+  if (!status || !Number.isFinite(Number(status.ts))) {
+    document.getElementById('scan-health-label').textContent = 'Ожидание сканера';
+    document.getElementById('scan-health-time').textContent = '—';
+    document.getElementById('scan-checked').textContent = '—';
+    document.getElementById('scan-quotes').textContent = '—';
+    document.getElementById('scan-signals').textContent = '—';
+    document.getElementById('scan-live').textContent = '—';
+    document.getElementById('scan-prematch').textContent = '—';
+    document.getElementById('scan-unknown').textContent = '—';
+    document.getElementById('scan-reasons').textContent = 'Сканер ещё не передал статус цикла.';
+    return;
+  }
+
+  const age = Math.max(0, Date.now() / 1000 - Number(status.ts));
+  const active = status.state === 'running' && age <= SCAN_STATUS_STALE_SECONDS;
+  box.classList.add(active ? 'running' : 'stale');
+  document.getElementById('scan-health-label').textContent = active
+    ? `Сканер активен · цикл ${Number(status.cycle || 0)}`
+    : status.state === 'stopped' ? 'Сканер остановлен' : 'Статус сканера устарел';
+  document.getElementById('scan-health-time').textContent =
+    new Date(Number(status.ts) * 1000).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  const checks = status.checks || {};
+  const phases = status.phase_counts || {};
+  document.getElementById('scan-checked').textContent = Number(status.pm_markets || 0);
+  document.getElementById('scan-quotes').textContent = Number(checks.with_fresh_bookmaker || 0);
+  document.getElementById('scan-signals').textContent = Number(status.signals || 0);
+  document.getElementById('scan-live').textContent = Number(phases.live || 0);
+  document.getElementById('scan-prematch').textContent = Number(phases.prematch || 0);
+  document.getElementById('scan-unknown').textContent = Number(phases.unknown || 0);
+
+  const reasonLabels = [
+    ['no_fresh_bookmaker', 'нет свежих котировок'],
+    ['pm_no_ask', 'нет ask в PM-стакане'],
+    ['pm_depth_short', 'недостаточно глубины PM'],
+    ['pm_depth_rejects', 'объём не прошёл проверку стакана'],
+    ['pm_impact_rejected', 'слишком высокий impact'],
+    ['no_opposite_bk_market', 'нет парного исхода букмекера'],
+    ['invalid_market_or_no_quotes', 'некорректная пара рынка'],
+    ['invalid_calculation', 'ошибка расчёта, кандидат отклонён'],
+    ['below_roi', 'ниже порога ROI'],
+  ];
+  const reasons = reasonLabels
+    .map(([key, label]) => ({ count: Number(checks[key] || 0), label }))
+    .filter(item => item.count > 0)
+    .sort((a, b) => b.count - a.count)
+    .map(item => `${item.label}: ${item.count}`);
+  if (status.pm_catalog_complete === false) {
+    reasons.unshift(status.pm_catalog_retained
+      ? 'каталог Polymarket неполный; прежние события временно сохранены'
+      : 'каталог Polymarket неполный; состав событий может быть неполным');
+  }
+  const sources = Object.entries(status.source_counts || {})
+    .filter(([, count]) => Number(count) > 0)
+    .map(([name, count]) => `${name} ${Number(count)}`);
+  if (sources.length) reasons.unshift(`Котировки: ${sources.join(' · ')}`);
+  document.getElementById('scan-reasons').textContent = reasons.length
+    ? reasons.join(' · ')
+    : (status.signals ? 'Сигналы переданы в радар.' : 'В этом цикле причины отсева не зафиксированы.');
+}
+
 /* ============= LIST ============= */
 function renderArbs() {
   const box = document.getElementById('arbs-list');
   if (!state.visible.length) {
-    box.innerHTML = `<div class="empty">Нет вилок в разделе ${escapeHtml(state.phase.toUpperCase())}<br>по текущим фильтрам...</div>`;
+    const phaseNames = { all: 'всех фаз', live: 'LIVE', prematch: 'прематча', unknown: 'неподтверждённого статуса' };
+    const message = state.arbs.length
+      ? 'Проверьте фильтры спорта и минимального ROI.'
+      : (state.scanStatus ? 'Причины и число проверенных рынков показаны в сводке цикла выше.' : 'Ожидание первого статуса сканера.');
+    box.innerHTML = `<div class="empty"><b>${state.arbs.length ? 'Нет совпадений с фильтрами' : 'Нет прошедших проверку сигналов'}</b><br>` +
+      `Раздел: ${escapeHtml(phaseNames[state.phase] || phaseNames.all)}.<small>${escapeHtml(message)}</small></div>`;
     return;
   }
   box.onclick = (event) => {
@@ -221,7 +345,9 @@ function renderArbs() {
     const tags = [];
     tags.push(`<span class="tag ${escapeHtml(sportClass(a.sport))}">${escapeHtml(a.sport || '')}</span>`);
     if (a.market_type) tags.push(`<span class="tag mtype">${escapeHtml(a.market_type)}</span>`);
-    if (a.is_live) tags.push(`<span class="tag live">ЛАЙВ</span>`);
+    const phase = ['live','prematch','unknown'].includes(a.phase) ? a.phase : 'unknown';
+    const phaseLabels = { live: 'LIVE', prematch: 'ПРЕМАТЧ', unknown: 'СТАТУС ?' };
+    tags.push(`<span class="tag phase-${phase}">${phaseLabels[phase]}</span>`);
     if (a.is_streamer) tags.push(`<span class="tag streamer">СТРИМЕР</span>`);
     const pmAge = (pmLeg && pmLeg.pm_age) || a.pm_age;
     if (pmAge && pmAge > 60) tags.push(`<span class="tag pm-age">PM ${Math.floor(pmAge)}с</span>`);
@@ -262,6 +388,7 @@ function selectArb(slug) {
   state.activeSlug = slug;
   state.detailEdited = false;
   state.calcEdited = false;
+  state.suggestedCapped = false;
   const ph = document.getElementById('detail-placeholder');
   const body = document.getElementById('detail-body');
   if (ph) { ph.classList.add('hidden'); ph.style.display = 'none'; }     // ← inline!
@@ -300,6 +427,9 @@ function refreshDetail() {
     : (a.q || a.slug);
   const tags = [`<span class="tag mtype">${escapeHtml(a.market_type || 'МАТЧ')}</span>`,
                 `<span class="tag ${escapeHtml(sportClass(a.sport))}">${escapeHtml(a.sport || '')}</span>`];
+  const detailPhase = ['live','prematch','unknown'].includes(a.phase) ? a.phase : 'unknown';
+  const detailPhaseLabel = { live: 'LIVE', prematch: 'ПРЕМАТЧ', unknown: 'СТАТУС НЕ ПОДТВЕРЖДЁН' }[detailPhase];
+  tags.push(`<span class="tag phase-${detailPhase}">${detailPhaseLabel}</span>`);
   if (a.is_streamer) tags.push(`<span class="tag streamer">СТРИМЕР</span>`);
   if (a.source_state === 'stale') tags.push(`<span class="tag pm-age">ДАННЫЕ УСТАРЕЛИ</span>`);
   else if (a.source_state === 'unknown') tags.push(`<span class="tag pm-age">СВЕЖЕСТЬ НЕИЗВЕСТНА</span>`);
@@ -498,8 +628,14 @@ function renderHowMuch(a) {
   });
   const rate = a.rate || state.config.rate || 85;
   if (!state.detailEdited) {
-    document.getElementById('hm-bb-stake').value = Math.round(bbSt);
-    document.getElementById('hm-pm-stake').value = (pmSt / rate).toFixed(2);
+    const cap = getPlanCap();
+    const fitStakes = window.PolyBankrollPlanner?.fitSuggestedStakes;
+    const plan = typeof fitStakes === 'function'
+      ? fitStakes(bbSt, pmSt, rate, cap)
+      : { bookmakerRub: 0, polymarketUsd: 0, capped: false };
+    state.suggestedCapped = plan.capped;
+    document.getElementById('hm-bb-stake').value = plan.bookmakerRub;
+    document.getElementById('hm-pm-stake').value = Number(plan.polymarketUsd).toFixed(2);
   }
   // лучшее ask из стакана, а не среднее по $50
   const cachedBook = pmBookCache[state.activeSlug]?.outcome === pmLeg.outcome
@@ -554,6 +690,7 @@ function recalcHowMuch() {
   const profitEl = document.getElementById('hm-profit');
   profitEl.textContent = (profit >= 0 ? '+' : '') + fmtMoney(profit);
   profitEl.style.color = profit >= 0 ? 'var(--green)' : 'var(--red)';
+  updatePlanRiskNote(bank);
 
   document.getElementById('btn-buy-pm').textContent =
     `ОТКРЫТЬ POLYMARKET · $${pmUsd.toFixed(2)} ↗`;
@@ -599,7 +736,14 @@ function updateCalcHint() {
     hint.style.color = 'var(--dim)';
     return;
   }
-  hint.innerHTML = `Банк: <b>${fmtMoney(bank)}</b> · Профит: <b style="color:${profit >= 0 ? 'var(--green)' : 'var(--red)'}">${profit >= 0 ? '+' : ''}${fmtMoney(profit)}</b> · ROI: <b style="color:${roi >= 0 ? 'var(--green)' : 'var(--red)'}">${fmtPct(roi)}</b>`;
+  const cap = getPlanCap();
+  const overCap = cap !== null && bank > cap + 0.01;
+  const riskText = cap === null
+    ? 'Общий банк не задан: контроль 40% не рассчитан.'
+    : overCap ? `ПРЕДУПРЕЖДЕНИЕ: выше 40%-ориентира ${fmtMoney(cap)}.`
+      : `В пределах 40%-ориентира ${fmtMoney(cap)} на один план.`;
+  const riskClass = overCap ? 'warn' : cap !== null ? 'safe' : '';
+  hint.innerHTML = `Банк: <b>${fmtMoney(bank)}</b> · Профит: <b style="color:${profit >= 0 ? 'var(--green)' : 'var(--red)'}">${profit >= 0 ? '+' : ''}${fmtMoney(profit)}</b> · ROI: <b style="color:${roi >= 0 ? 'var(--green)' : 'var(--red)'}">${fmtPct(roi)}</b><br><span class="risk-inline ${riskClass}">${riskText}</span>`;
   hint.style.color = 'var(--txt)';
 }
 
@@ -1012,10 +1156,11 @@ function init() {
   if (detClose) detClose.addEventListener('click', closeDetail);
 
   const hmBB = document.getElementById('hm-bb-stake');
-  if (hmBB) hmBB.addEventListener('input', () => { state.detailEdited = true; recalcHowMuch(); });
+  if (hmBB) hmBB.addEventListener('input', () => { state.detailEdited = true; state.suggestedCapped = false; recalcHowMuch(); });
   const hmPM = document.getElementById('hm-pm-stake');
   if (hmPM) hmPM.addEventListener('input', () => {
     state.detailEdited = true;
+    state.suggestedCapped = false;
     state.bookRequestId = (state.bookRequestId || 0) + 1;
     document.getElementById('hm-avg').textContent = '—';
     recalcHowMuch();

@@ -34,6 +34,7 @@ except Exception:
 
 HERE = pathlib.Path(__file__).parent
 LIVE_FILE = HERE / "arbs_live.json"
+STATUS_FILE = HERE / "scanner_status.json"
 TRADES_FILE = HERE / "trades.jsonl"
 HIDE_FILE = HERE / "hidden_slugs.json"
 CSV_FILE = HERE / "arbs.csv"
@@ -257,10 +258,13 @@ def _build_enriched(raw: dict) -> dict:
         )
         enriched["is_safe"] = False
 
-        phase = arb.get("phase")
-        if not phase:
-            phase = "live" if arb.get("is_live") else "prematch"
+        phase = str(arb.get("phase") or "").strip().lower()
+        if phase not in {"live", "prematch", "unknown"}:
+            # Legacy snapshots only prove LIVE when the old explicit flag was true.
+            # A missing/false flag is not sufficient evidence for PREMATCH.
+            phase = "live" if arb.get("is_live") is True else "unknown"
         enriched["phase"] = phase
+        enriched["is_live"] = phase == "live"
 
         enriched["secondary_bk"] = {
             "name": sec_name,
@@ -317,6 +321,9 @@ async def _broadcast_loop():
                     if not isinstance(raw, dict):
                         raw = {}
                     enriched = _build_enriched(raw)
+                    scan_status = _load_json(STATUS_FILE, {})
+                    if not isinstance(scan_status, dict):
+                        scan_status = {}
                     msg = json.dumps({
                         "type": "snapshot",
                         "ts": time.time(),
@@ -324,6 +331,7 @@ async def _broadcast_loop():
                         "total": len(raw),
                         "hidden_count": len(_hidden),
                         "config": _load_config(),
+                        "scan_status": scan_status,
                     }, ensure_ascii=False)
                     dead = []
                     for ws in list(_clients):
@@ -390,6 +398,9 @@ async def ws_endpoint(ws: WebSocket):
         if not isinstance(raw, dict):
             raw = {}
         enriched = _build_enriched(raw)
+        scan_status = _load_json(STATUS_FILE, {})
+        if not isinstance(scan_status, dict):
+            scan_status = {}
         await ws.send_text(json.dumps({
             "type": "snapshot",
             "ts": time.time(),
@@ -397,6 +408,7 @@ async def ws_endpoint(ws: WebSocket):
             "total": len(raw),
             "hidden_count": len(_hidden),
             "config": _load_config(),
+            "scan_status": scan_status,
         }, ensure_ascii=False))
     except Exception:
         pass

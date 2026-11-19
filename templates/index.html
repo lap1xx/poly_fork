@@ -17,8 +17,10 @@
         <span class="logo-text">POLY<span class="logo-accent">-ARB</span><small>TRADING TERMINAL</small></span>
       </div>
       <div class="hdr-tabs" aria-label="Режим событий">
-        <button class="tab active" data-phase="live"><span class="tab-live-dot" aria-hidden="true"></span> LIVE</button>
-        <button class="tab" data-phase="prematch">PREMATCH</button>
+        <button class="tab active" data-phase="all">ВСЕ <span class="tab-count" id="phase-all-count">0</span></button>
+        <button class="tab" data-phase="live"><span class="tab-live-dot" aria-hidden="true"></span> LIVE <span class="tab-count" id="phase-live-count">0</span></button>
+        <button class="tab" data-phase="prematch">ПРЕМАТЧ <span class="tab-count" id="phase-prematch-count">0</span></button>
+        <button class="tab" data-phase="unknown">НЕИЗВ. <span class="tab-count" id="phase-unknown-count">0</span></button>
       </div>
     </div>
     <div class="hdr-right">
@@ -52,6 +54,19 @@
         <label class="chk"><input type="checkbox" id="f-tennis" checked> TENNIS</label>
         <label class="chk minroi">ROI ≥ <input type="number" id="f-minroi" value="0" min="0" max="100" step="0.5">%</label>
       </div>
+      <section class="scan-health" id="scan-health" aria-live="polite">
+        <div class="scan-health-top">
+          <div><div class="eyebrow">ПОСЛЕДНИЙ ЦИКЛ</div><b id="scan-health-label">Ожидание сканера</b></div>
+          <span class="scan-health-time" id="scan-health-time">—</span>
+        </div>
+        <div class="scan-health-kpis">
+          <div><b id="scan-checked">—</b><span>рынков</span></div>
+          <div><b id="scan-quotes">—</b><span>с котировками</span></div>
+          <div><b id="scan-signals">—</b><span>сигналов</span></div>
+        </div>
+        <div class="scan-phase-line">LIVE <b id="scan-live">—</b> · ПРЕМАТЧ <b id="scan-prematch">—</b> · НЕИЗВ. <b id="scan-unknown">—</b></div>
+        <div class="scan-reasons" id="scan-reasons">Здесь будут причины отсева сигналов.</div>
+      </section>
       <div class="list-caption"><span>НАЙДЕННЫЕ ВИЛКИ</span><span>ПО ROI ↓</span></div>
       <div class="arbs-list" id="arbs-list">
         <div class="empty">Нет вилок по текущим фильтрам.<br>Попробуйте изменить параметры поиска.</div>
@@ -170,6 +185,7 @@
             <div class="hm-hl"><span>Расчётный мин. возврат</span><b id="hm-payout">—</b></div>
             <div class="hm-hl"><span>Профит</span><b id="hm-profit" class="green">—</b></div>
           </div>
+          <div class="risk-note" id="hm-risk-note">Укажите общий банк, чтобы увидеть 40%-ориентир.</div>
 
           <div class="hm-actions">
             <button class="btn dark" id="btn-open-bb">ОТКРЫТЬ СОБЫТИЕ 1WIN ↗</button>
@@ -225,9 +241,9 @@
         <div class="risk-title">ПЛАНИРОВАНИЕ БАНКА</div>
         <label for="risk-total-bank">Общий банк, ₽</label>
         <input type="number" id="risk-total-bank" min="0" placeholder="Не задан">
-        <div class="risk-result"><span>Ориентир на сделку</span><output id="risk-limit" for="risk-total-bank">—</output></div>
-        <div class="risk-hint">40% от общего банка · ориентир из вашего плана</div>
-        <div class="risk-hint risk-separate">Общий банк задаётся отдельно от банка на сделку в настройках.</div>
+        <div class="risk-result"><span>40% на один план</span><output id="risk-limit" for="risk-total-bank">—</output></div>
+        <div class="risk-hint">Общий банк хранится в этом браузере и не меняет расчётный банк сканера.</div>
+        <div class="risk-hint risk-separate">Это ориентир и предупреждение, а не автоматический запрет или ставка.</div>
       </div>
 
       <button class="btn green big" id="btn-my-arbs">МОИ ВИЛКИ</button>
@@ -379,6 +395,7 @@
   <div class="toast hidden" id="toast"></div>
 
 </div>
+<script src="/static/bankroll_plan.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>

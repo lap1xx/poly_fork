@@ -15,6 +15,9 @@ vendor.txt
 *.bin
 
 # local secrets (if any)
+arbs_live.json
+scanner_status.json
+scanner_status.json.tmp
 config.json# temp
 __pycache__/
 *.pyc

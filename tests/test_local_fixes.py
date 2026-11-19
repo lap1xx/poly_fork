@@ -1,10 +1,151 @@
+import json
 import sys
 import unittest
 import time
+from unittest.mock import patch
 
 import price_history
 import stats
 import polyarb_v4
+import bot_live
+from event_phase import classify_event_phase
+
+
+class EventPhaseTests(unittest.TestCase):
+    def setUp(self):
+        from datetime import datetime, timezone
+        self.now = datetime(2030, 1, 1, 12, 0, tzinfo=timezone.utc)
+
+    def test_explicit_live_signal_is_live(self):
+        self.assertEqual(classify_event_phase({"live": True}, now=self.now), "live")
+        self.assertEqual(classify_event_phase({}, {"status": "in-play"}, now=self.now), "live")
+
+    def test_future_start_and_scheduled_status_are_prematch(self):
+        self.assertEqual(
+            classify_event_phase({"start": "2030-01-01T13:00:00Z"}, now=self.now),
+            "prematch",
+        )
+        self.assertEqual(
+            classify_event_phase({"status": "scheduled"}, now=self.now),
+            "prematch",
+        )
+
+    def test_past_start_missing_state_and_map_slug_are_unknown(self):
+        self.assertEqual(
+            classify_event_phase({"start": "2030-01-01T11:00:00Z"}, now=self.now),
+            "unknown",
+        )
+        self.assertEqual(classify_event_phase({"slug": "cs2-alpha-beta-map3"}, now=self.now), "unknown")
+        self.assertEqual(classify_event_phase({}, now=self.now), "unknown")
+
+    def test_terminal_or_inactive_market_is_not_prematch(self):
+        self.assertEqual(
+            classify_event_phase({"closed": "true", "start": "2030-01-02T00:00:00Z"}, now=self.now),
+            "unknown",
+        )
+        self.assertEqual(classify_event_phase({"active": False}, now=self.now), "unknown")
+
+    def test_conflicting_provider_signals_fail_closed(self):
+        self.assertEqual(
+            classify_event_phase({"live": True}, {"live": False}, now=self.now),
+            "unknown",
+        )
+        self.assertEqual(
+            classify_event_phase({"status": "in-play", "live": False}, now=self.now),
+            "unknown",
+        )
+        self.assertEqual(
+            classify_event_phase({"status": "live", "eventStatus": "scheduled"}, now=self.now),
+            "unknown",
+        )
+        self.assertEqual(
+            classify_event_phase({"status": "in-play"}, {"status": "upcoming"}, now=self.now),
+            "unknown",
+        )
+        self.assertEqual(classify_event_phase({"phase": "live"}, now=self.now), "unknown")
+        self.assertEqual(
+            classify_event_phase({"phase": "live", "_phase_classified": True}, now=self.now),
+            "live",
+        )
+
+    def test_legacy_launch_does_not_force_live(self):
+        with patch.object(bot_live.sys, "argv", ["bot_live.py"]), \
+             patch.object(bot_live.subprocess, "Popen") as popen, \
+             patch.object(bot_live.subprocess, "run") as run:
+            bot_live.main()
+        command = run.call_args.args[0]
+        self.assertIn("--watch", command)
+        self.assertNotIn("--live", command)
+        self.assertEqual(run.call_args.kwargs["cwd"], str(bot_live.HERE))
+        popen.assert_called_once()
+
+
+class PMCatalogRefreshTests(unittest.TestCase):
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return []
+
+    def test_market_map_prunes_only_after_complete_refresh(self):
+        current = {"old": {"v": 1}, "keep": {"v": 1}}
+        fresh = {"keep": {"v": 2}, "new": {"v": 1}}
+        merged, added, removed = polyarb_v4.reconcile_pm_market_map(current, fresh, True)
+        self.assertEqual(set(merged), {"keep", "new"})
+        self.assertEqual(merged["keep"]["v"], 2)
+        self.assertEqual((added, removed), (1, 1))
+
+        merged, added, removed = polyarb_v4.reconcile_pm_market_map(current, fresh, False)
+        self.assertEqual(set(merged), {"old", "keep", "new"})
+        self.assertEqual((added, removed), (1, 0))
+
+    def test_fetch_reports_complete_empty_catalog(self):
+        with patch.object(polyarb_v4.requests, "get", return_value=self.FakeResponse()) as get:
+            markets, complete = polyarb_v4.fetch_live_pm_markets(with_status=True)
+        self.assertEqual(markets, {})
+        self.assertTrue(complete)
+        self.assertEqual(get.call_count, 14)
+
+    def test_fetch_marks_any_failed_query_as_partial(self):
+        responses = [self.FakeResponse() for _ in range(13)] + [OSError("temporary")]
+        with patch.object(polyarb_v4.requests, "get", side_effect=responses):
+            markets, complete = polyarb_v4.fetch_live_pm_markets(with_status=True)
+        self.assertEqual(markets, {})
+        self.assertFalse(complete)
+
+    def test_limit_sized_response_cannot_authorize_pruning(self):
+        class CappedResponse(self.FakeResponse):
+            def json(self):
+                return [{"markets": []} for _ in range(200)]
+
+        responses = [self.FakeResponse() for _ in range(13)] + [CappedResponse()]
+        with patch.object(polyarb_v4.requests, "get", side_effect=responses):
+            markets, complete = polyarb_v4.fetch_live_pm_markets(with_status=True)
+        self.assertEqual(markets, {})
+        self.assertFalse(complete)
+
+    def test_non_list_outcomes_or_tokens_mark_catalog_partial(self):
+        class WrongShapeResponse(self.FakeResponse):
+            def json(self):
+                return [{"markets": [
+                    {
+                        "slug": "cs2-scalar-shape",
+                        "outcomes": json.dumps("ab"),
+                        "clobTokenIds": json.dumps("xy"),
+                    },
+                    {
+                        "slug": "cs2-object-shape",
+                        "outcomes": json.dumps({"0": "A", "1": "B"}),
+                        "clobTokenIds": json.dumps({"0": "x", "1": "y"}),
+                    },
+                ]}]
+
+        responses = [WrongShapeResponse() for _ in range(14)]
+        with patch.object(polyarb_v4.requests, "get", side_effect=responses):
+            markets, complete = polyarb_v4.fetch_live_pm_markets(with_status=True)
+        self.assertEqual(markets, {})
+        self.assertFalse(complete)
 
 
 class CalculationTests(unittest.TestCase):

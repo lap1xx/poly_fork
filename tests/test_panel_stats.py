@@ -51,8 +51,25 @@ class SourceFreshnessTests(unittest.TestCase):
              patch.object(web_app, "DATA_STALE_SEC", 5.0):
             result = web_app._build_enriched(raw)
         item = result["cs2-team-alpha-team-bravo-winner"]
-        self.assertEqual(item["source_state"], "stale")
-        self.assertGreaterEqual(item["source_age_sec"], 7.0)
+        self.assertEqual(item['source_state'], 'stale')
+        self.assertGreaterEqual(item['source_age_sec'], 7.0)
+
+    def test_phase_is_tri_state_and_legacy_false_does_not_become_prematch(self):
+        raw = {
+            "legacy-no-phase": {"ts": time.time(), "is_live": False, "bets": []},
+            "confirmed-live": {"ts": time.time(), "phase": "live", "bets": []},
+            "confirmed-prematch": {"ts": time.time(), "phase": "prematch", "bets": []},
+            "unknown": {"ts": time.time(), "phase": "unknown", "is_live": False, "bets": []},
+        }
+        with patch.object(web_app, "_load_config", return_value={"safe_fork_threshold": 0.03}), \
+             patch.object(web_app, "bk_adapter", None):
+            result = web_app._build_enriched(raw)
+        self.assertEqual(result["legacy-no-phase"]["phase"], "unknown")
+        self.assertFalse(result["legacy-no-phase"]["is_live"])
+        self.assertEqual(result["confirmed-live"]["phase"], "live")
+        self.assertTrue(result["confirmed-live"]["is_live"])
+        self.assertEqual(result["confirmed-prematch"]["phase"], "prematch")
+        self.assertEqual(result["unknown"]["phase"], "unknown")
 
 
 if __name__ == '__main__':

@@ -19,6 +19,9 @@ def main():
     i = 0
     while i < len(args):
         a = args[i]
+        if a == "--no-web":
+            i += 1
+            continue
         if a == "--min-roi" and i + 1 < len(args):
             min_roi = args[i + 1]
             i += 2
@@ -32,7 +35,7 @@ def main():
 
     cmd = [
         sys.executable, "-B", POLYARB,
-        "--watch", "--live",
+        "--watch",
         "--watch-sec", "20",
         "--poll", "0.3",
         "--alert-gap", "120",
@@ -59,7 +62,7 @@ def main():
     print()
 
     try:
-        subprocess.run(cmd, check=False)
+        subprocess.run(cmd, check=False, cwd=str(HERE))
     except KeyboardInterrupt:
         print("\n[*] stopped by user")
     finally:

@@ -23,6 +23,7 @@ except Exception:
     pass
 
 import requests
+from event_phase import classify_event_phase
 if sys.platform == "win32":
     os.system("")
 
@@ -92,6 +93,7 @@ CFG_FILE = "config.json"
 DB_FILE = "arbs.db"
 CSV_FILE = "arbs.csv"
 JSONL_FILE = "arbs.jsonl"
+STATUS_FILE = "scanner_status.json"
 BK_FILE = "bk_profiles.json"
 
 DEFAULT_CFG = {
@@ -235,7 +237,8 @@ def log_arb_json(slug, sport, roi, bank, profit, payout_rub, bets, stakes,
             "slug": slug, "sport": sport,
             "market_type": detect_market_type(slug, m.get("q", "")),
             "question": m.get("q", "")[:200],
-            "live": bool(is_live_slug(slug) or m.get("live", False)),
+            "phase": classify_event_phase(m),
+            "live": classify_event_phase(m) == "live",
             "streamer": bool(is_streamer(slug, m.get("q", ""))),
             "roi": round(roi, 5),
             "bank_rub": round(bank, 2),
@@ -381,12 +384,9 @@ def detect_market_type(slug, question):
 
 
 def is_live_slug(slug):
-    s = slug.lower()
-    for k in ["-game1", "-game2", "-game3", "-game4", "-game5",
-              "-set-2", "-set-3", "-set-4", "-set-5", "-live", "-inplay"]:
-        if k in s:
-            return True
-    return False
+    """Legacy label helper; market fragments like map/game/set do not imply LIVE."""
+    s = str(slug or "").lower()
+    return s.endswith(("-live", "-inplay"))
 
 
 def linked_slugs(slug):
@@ -866,29 +866,22 @@ def fetch_market(slug):
     m = d[0]
     try:
         start = (m.get("eventStartTime") or m.get("gameStartTime") or "")
+        phase = classify_event_phase(m)
         return {
             "slug": m["slug"],
             "q": m.get("question", ""),
             "o": json.loads(m["outcomes"]),
             "t": json.loads(m["clobTokenIds"]),
             "start": start,
-            "live": m.get("live", False) or _is_live_by_time(start),
+            "phase": phase,
+            "_phase_classified": True,
+            "live": phase == "live",
+            "status": m.get("status"),
+            "closed": m.get("closed"),
+            "active": m.get("active"),
         }
     except Exception:
         return None
-
-
-def _is_live_by_time(iso):
-    if not iso:
-        return False
-    try:
-        s = iso.replace("Z", "+00:00").replace(" ", "T")
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt <= datetime.now(timezone.utc)
-    except Exception:
-        return False
 
 
 def fetch_live_pm_slugs():
@@ -919,26 +912,48 @@ def fetch_live_pm_slugs():
     return list(out)
 
 
-def fetch_live_pm_markets():
+def fetch_live_pm_markets(with_status=False):
     tags = ["esports", "cs2", "dota-2", "league-of-legends",
             "valorant", "tennis", "atp"]
     PREFIXES = ("cs2-", "dota2-", "lol-", "valorant-",
                 "atp-", "wta-", "itf-")
+    query_limit = 200
     out = {}
+    query_count = 0
+    successful_queries = 0
+    catalog_complete = True
     for tg in tags:
         for live_mode in ("true", None):
+            query_count += 1
             try:
-                params = {"tag_slug": tg, "limit": 200,
+                params = {"tag_slug": tg, "limit": query_limit,
                           "active": "true", "closed": "false"}
                 if live_mode:
                     params["live"] = live_mode
                 r = requests.get(GAMMA + "/events", params=params, timeout=TIMEOUT)
                 r.raise_for_status()
                 events = r.json()
+                if not isinstance(events, list):
+                    catalog_complete = False
+                    continue
+                successful_queries += 1
             except Exception:
                 continue
+            if len(events) >= query_limit:
+                # No pagination is implemented; a full page may be truncated.
+                catalog_complete = False
             for ev in events:
-                for mk in (ev.get("markets") or []):
+                if not isinstance(ev, dict):
+                    catalog_complete = False
+                    continue
+                event_markets = ev.get("markets") or []
+                if not isinstance(event_markets, list):
+                    catalog_complete = False
+                    continue
+                for mk in event_markets:
+                    if not isinstance(mk, dict):
+                        catalog_complete = False
+                        continue
                     sl = mk.get("slug", "")
                     if not sl or not sl.startswith(PREFIXES):
                         continue
@@ -950,16 +965,39 @@ def fetch_live_pm_markets():
                         o = json.loads(mk.get("outcomes", "[]"))
                         t = json.loads(mk.get("clobTokenIds", "[]"))
                     except Exception:
+                        catalog_complete = False
                         continue
-                    if len(o) != 2 or len(t) != 2:
+                    if (
+                        not isinstance(o, list) or not isinstance(t, list)
+                        or len(o) != 2 or len(t) != 2
+                        or any(not isinstance(value, str) or not value.strip() for value in o + t)
+                    ):
+                        catalog_complete = False
                         continue
                     start = (mk.get("eventStartTime") or ev.get("startTime") or "")
+                    phase = classify_event_phase(mk, ev)
                     out[sl] = {
                         "slug": sl, "q": mk.get("question", ""),
                         "o": o, "t": t, "start": start,
-                        "live": bool(mk.get("live", False) or _is_live_by_time(start)),
+                        "phase": phase,
+                        "_phase_classified": True,
+                        "live": phase == "live",
+                        "status": mk.get("status") or ev.get("status"),
+                        "closed": mk.get("closed", ev.get("closed")),
+                        "active": mk.get("active", True),
                     }
-    return out
+    complete = query_count > 0 and successful_queries == query_count and catalog_complete
+    return (out, complete) if with_status else out
+
+
+def reconcile_pm_market_map(current, fresh, refresh_complete):
+    """Replace an old Gamma catalog only after a complete successful refresh."""
+    current = current if isinstance(current, dict) else {}
+    fresh = fresh if isinstance(fresh, dict) else {}
+    added = len(set(fresh) - set(current))
+    removed = len(set(current) - set(fresh)) if refresh_complete else 0
+    merged = dict(fresh) if refresh_complete else {**current, **fresh}
+    return merged, added, removed
 
 
 def print_arb(m, bets, r, rate, first_seen, bk):
@@ -967,9 +1005,10 @@ def print_arb(m, bets, r, rate, first_seen, bk):
     sc = color_sport(sport)
     mtype = detect_market_type(m["slug"], m.get("q", ""))
     mtc = color_mtype(mtype)
-    is_live = is_live_slug(m["slug"]) or m.get("live", False)
-    live_tag = (C.Y + C.BOLD + " [LIVE]" + C.RST) if is_live \
-               else (C.B + " [PREMATCH]" + C.RST)
+    phase = classify_event_phase(m)
+    phase_label = {"live": "LIVE", "prematch": "PREMATCH", "unknown": "UNKNOWN"}[phase]
+    phase_color = C.Y if phase == "live" else C.B if phase == "prematch" else C.DIM
+    live_tag = phase_color + C.BOLD + " [" + phase_label + "]" + C.RST
     streamer_tag = (C.M + " [STREAMER]" + C.RST) \
                    if is_streamer(m["slug"], m.get("q", "")) else ""
 
@@ -1019,7 +1058,7 @@ def print_arb(m, bets, r, rate, first_seen, bk):
     profit_b = r["payout"] - (r["payout"] / (1 + r["roi"]))
     print("  Profit:   %s%.0f%s%s" % (C.G, profit_b, RUB, C.RST))
     print("  Payout:   %s%.0f%s%s" % (C.W, r["payout"], RUB, C.RST))
-    print("  Type:     " + (C.Y + "LIVE" + C.RST if is_live else C.B + "PREMATCH" + C.RST))
+    print("  Type:     " + phase_color + phase_label + C.RST)
 
 
 # =================================================================
@@ -1042,10 +1081,35 @@ def _book_top_levels(token_id, n=3):
         return list(b["asks"][:n])
 
 
-def build_arb_candidates(m, live_bc, slip, bank=0.0, rate=0.0, bk_source="BetBoom"):
+def _write_json_atomic(path, payload):
+    """Write a JSON snapshot by replace, so readers never see a partial file."""
+    tmp_path = str(path) + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+def _write_scan_status(payload):
+    """Atomically publish read-only scan diagnostics for the dashboard."""
+    _write_json_atomic(STATUS_FILE, payload)
+
+
+def build_arb_candidates(m, live_bc, slip, bank=0.0, rate=0.0,
+                         bk_source="BetBoom", diagnostics=None):
+    def note(reason):
+        if diagnostics is not None:
+            diagnostics[reason] = diagnostics.get(reason, 0) + 1
+
     pm_o = m.get("o") or []
     pm_t = m.get("t") or []
     if len(pm_o) != 2 or len(pm_t) != 2 or not live_bc:
+        note("invalid_market_or_no_quotes")
         return []
 
     usd_target = 50.0
@@ -1063,12 +1127,15 @@ def build_arb_candidates(m, live_bc, slip, bank=0.0, rate=0.0, bk_source="BetBoo
             pass
         ba = best_ask(pm_t[i])
         if ba <= 0:
+            note("pm_no_ask")
             return []
         shares = usd_target / ba
         avg = walk_book(pm_t[i], shares)
         if not avg or avg <= 0:
+            note("pm_depth_short")
             return []
         if avg > ba * 1.05:
+            note("pm_impact_rejected")
             return []
         pm_legs.append({
             "source": "Polymarket",
@@ -1107,6 +1174,8 @@ def build_arb_candidates(m, live_bc, slip, bank=0.0, rate=0.0, bk_source="BetBoo
         bb = bk_legs.get(other)
         if bb:
             pairs.append([pm_legs[i], bb])
+    if not pairs:
+        note("no_opposite_bk_market")
     return pairs
 
 
@@ -1117,7 +1186,8 @@ def build_arb_candidates(m, live_bc, slip, bank=0.0, rate=0.0, bk_source="BetBoo
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--slugs", default="", help="comma-separated PM slugs")
-    ap.add_argument("--live", action="store_true", help="force LIVE tag")
+    ap.add_argument("--live", action="store_true",
+                    help="deprecated legacy flag; Gamma metadata determines event phase")
     ap.add_argument("--poll", type=float, default=0.3, help="seconds between checks")
     ap.add_argument("--bank", type=float, default=0.0, help="override bank size (RUB)")
     ap.add_argument("--min-roi", type=float, default=0.3,
@@ -1128,6 +1198,8 @@ def main():
     ap.add_argument("--alert-gap", type=int, default=120,
                     help="minimum gap between signal updates and repeat reminders")
     args = ap.parse_args()
+    if args.live:
+        print("[!] --live is deprecated and ignored; event phase requires source evidence")
 
     cfg = load_cfg()
     bk  = load_bk()
@@ -1144,10 +1216,14 @@ def main():
         return 1
 
     market_map = {}
+    pm_catalog_complete = True
+    pm_catalog_retained = False
     if args.watch:
         print("[*] watch mode: fetching PM live markets...")
-        market_map = fetch_live_pm_markets()
+        market_map, pm_catalog_complete = fetch_live_pm_markets(with_status=True)
         print("[*] got %d real match markets" % len(market_map))
+        if not pm_catalog_complete:
+            print("[!] initial PM catalog refresh was partial; missing query batches will be retried")
     else:
         print("[*] resolving %d PM markets..." % len(slugs))
         for s in slugs:
@@ -1228,8 +1304,10 @@ def main():
     # ---------- PM feed ----------
     tokens = sorted({t for m in market_map.values() for t in (m.get("t") or [])})
     if not tokens:
-        print("[!] no tokens")
-        return 1
+        if not args.watch:
+            print("[!] no tokens")
+            return 1
+        print("[!] no current PM tokens; watch mode will retry the catalog")
     print("[*] starting PM book feed (%d tokens)..." % len(tokens))
     feed = Feed(tokens)
     feed.start()
@@ -1275,19 +1353,32 @@ def main():
 
     last_retry = time.time()
     last_pm_refresh = time.time()
+    scan_iteration = 0
+    last_status_write = 0.0
+    last_scan_status = {
+        "state": "starting", "ts": time.time(), "cycle": 0,
+        "pm_markets": len(market_map), "phase_counts": {}, "checks": {},
+        "source_counts": {}, "pm_catalog_complete": pm_catalog_complete,
+        "pm_catalog_retained": pm_catalog_retained,
+        "min_roi_pct": round(min_roi * 100, 3),
+    }
+    _write_scan_status(last_scan_status)
 
     try:
         while not STOP.is_set():
             if args.watch and time.time() - last_pm_refresh >= args.watch_sec:
-                fresh = fetch_live_pm_markets()
-                added = 0
-                for s, mm in fresh.items():
-                    if s not in market_map:
-                        added += 1
-                    market_map[s] = mm
-                if added:
-                    print("[*] watch: +%d new markets (total %d)"
-                          % (added, len(market_map)))
+                fresh, refresh_complete = fetch_live_pm_markets(with_status=True)
+                had_previous_catalog = bool(market_map)
+                market_map, added, removed = reconcile_pm_market_map(
+                    market_map, fresh, refresh_complete
+                )
+                pm_catalog_complete = refresh_complete
+                pm_catalog_retained = not refresh_complete and had_previous_catalog
+                if added or removed:
+                    print("[*] watch: +%d / -%d markets (total %d)"
+                          % (added, removed, len(market_map)))
+                if not refresh_complete:
+                    print("[!] PM catalog refresh partial; preserving prior entries until a complete refresh")
                 refreshed_tokens = sorted({
                     str(token)
                     for market in market_map.values()
@@ -1303,6 +1394,26 @@ def main():
                 retry_bind()
                 last_retry = time.time()
 
+            scan_iteration += 1
+            phase_counts = {"live": 0, "prematch": 0, "unknown": 0}
+            for _market in market_map.values():
+                _phase = classify_event_phase(_market)
+                phase_counts[_phase] = phase_counts.get(_phase, 0) + 1
+            scan_counts = {
+                "with_fresh_bookmaker": 0,
+                "no_fresh_bookmaker": 0,
+                "candidate_pairs": 0,
+                "pm_no_ask": 0,
+                "pm_depth_short": 0,
+                "pm_impact_rejected": 0,
+                "no_opposite_bk_market": 0,
+                "invalid_market_or_no_quotes": 0,
+                "invalid_calculation": 0,
+                "pm_depth_rejects": 0,
+                "below_roi": 0,
+                "roi_passed": 0,
+            }
+            source_counts = {}
             live_snap = {}
             for slug, m in market_map.items():
                 if router is not None:
@@ -1312,20 +1423,33 @@ def main():
                     live_bc = get_live_bc(slug)
                     _bk_src = "BetBoom"
                 if not live_bc:
+                    scan_counts["no_fresh_bookmaker"] += 1
                     continue
+                scan_counts["with_fresh_bookmaker"] += 1
+                source_counts[_bk_src] = source_counts.get(_bk_src, 0) + 1
 
+                candidate_diagnostics = {}
                 pairs = build_arb_candidates(m, live_bc, slip, bank, rate,
-                                             bk_source=_bk_src)
+                                             bk_source=_bk_src,
+                                             diagnostics=candidate_diagnostics)
+                for _reason, _count in candidate_diagnostics.items():
+                    scan_counts[_reason] = scan_counts.get(_reason, 0) + _count
+                scan_counts["candidate_pairs"] += len(pairs)
                 for bets in pairs:
                     r = compute(bets, bank)
-                    if r:
-                        r = refine_stakes(bets, r, rate)
                     if not r:
+                        scan_counts["invalid_calculation"] += 1
+                        continue
+                    r = refine_stakes(bets, r, rate)
+                    if not r:
+                        scan_counts["pm_depth_rejects"] += 1
                         continue
                     roi = r["roi"]
                     if roi < min_roi:
+                        scan_counts["below_roi"] += 1
                         continue
-                    is_live = args.live or is_live_slug(slug) or m.get("live", False)
+                    scan_counts["roi_passed"] += 1
+                    phase = classify_event_phase(m)
 
                     # --- web snapshot ---
                     try:
@@ -1399,7 +1523,8 @@ def main():
                             "stakes": [float(x) for x in r["stakes"]],
                             "payout": float(r["payout"]),
                             "profit": float(_prf),
-                            "is_live": bool(is_live or _is_live_by_time(m.get("start", ""))),
+                            "phase": phase,
+                            "is_live": phase == "live",
                             "is_streamer": bool(is_streamer(slug, m.get("q", ""))),
                             "pm_age": _pm_age,
                             "pm_best_ask": _pm_leg.get("pm_best_ask"),
@@ -1498,12 +1623,27 @@ def main():
 
             _now = time.time()
             if _now - globals().get('_last_snap_write', 0) >= 2.0:
-                try:
-                    with open("arbs_live.json", "w", encoding="utf-8") as _f:
-                        json.dump(live_snap, _f, ensure_ascii=False)
-                    globals()['_last_snap_write'] = _now
-                except Exception:
-                    pass
+                _write_json_atomic("arbs_live.json", live_snap)
+                globals()['_last_snap_write'] = _now
+
+            last_scan_status = {
+                "state": "running",
+                "ts": _now,
+                "cycle": scan_iteration,
+                "pm_markets": len(market_map),
+                "phase_counts": phase_counts,
+                "checks": scan_counts,
+                "source_counts": source_counts,
+                "pm_catalog_complete": pm_catalog_complete,
+                "pm_catalog_retained": pm_catalog_retained,
+                "signals": len(live_snap),
+                "min_roi_pct": round(min_roi * 100, 3),
+                "bank_rub": round(bank, 2),
+                "usd_rub": round(rate, 4),
+            }
+            if _now - last_status_write >= 1.0:
+                _write_scan_status(last_scan_status)
+                last_status_write = _now
 
             time.sleep(poll)
     except KeyboardInterrupt:
@@ -1511,6 +1651,11 @@ def main():
         print("[*] stopped")
     finally:
         STOP.set()
+        if last_scan_status:
+            last_scan_status = dict(last_scan_status)
+            last_scan_status["state"] = "stopped"
+            last_scan_status["ts"] = time.time()
+            _write_scan_status(last_scan_status)
         try:
             if router is not None:
                 router.stop()
