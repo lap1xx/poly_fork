@@ -148,6 +148,166 @@ class PMCatalogRefreshTests(unittest.TestCase):
         self.assertFalse(complete)
 
 
+class PMBookRecoveryTests(unittest.TestCase):
+    class FakeResponse:
+        def __init__(self, book):
+            self.book = book
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.book
+
+    class InlineExecutor:
+        def submit(self, function, *args):
+            return function(*args)
+
+    def setUp(self):
+        self.tokens = ["unit-test-pm-book-%s-%d" % (id(self), i) for i in range(4)]
+        self._clear_state()
+
+    def tearDown(self):
+        self._clear_state()
+
+    def _clear_state(self):
+        for token in getattr(self, "tokens", []):
+            with polyarb_v4.LOCK:
+                polyarb_v4.BOOKS.pop(token, None)
+            with polyarb_v4._PM_REFRESH_LOCK:
+                polyarb_v4._PM_REFRESH_INFLIGHT.discard(token)
+                polyarb_v4._PM_REFRESH_COOLDOWN.pop(token, None)
+                polyarb_v4._PM_REFRESH_DIAGNOSTICS.pop(token, None)
+
+    def test_book_diagnostic_distinguishes_missing_empty_stale_and_usable(self):
+        now = time.time()
+        with polyarb_v4.LOCK:
+            polyarb_v4.BOOKS[self.tokens[1]] = {
+                "bids": [(0.4, 2.0)], "asks": [], "ts": now,
+                "last_change": now,
+            }
+            polyarb_v4.BOOKS[self.tokens[2]] = {
+                "bids": [], "asks": [], "ts": now, "last_change": now,
+            }
+            polyarb_v4.BOOKS[self.tokens[3]] = {
+                "bids": [(0.4, 2.0)], "asks": [(0.5, 3.0)],
+                "ts": now - polyarb_v4.BOOK_TTL - 1,
+                "last_change": now - polyarb_v4.BOOK_TTL - 1,
+            }
+        self.assertEqual(
+            polyarb_v4.pm_book_diagnostic(self.tokens[0], now)["book_state"],
+            "missing_book",
+        )
+        self.assertEqual(
+            polyarb_v4.pm_book_diagnostic(self.tokens[1], now)["book_state"],
+            "empty_asks",
+        )
+        self.assertEqual(
+            polyarb_v4.pm_book_diagnostic(self.tokens[2], now)["book_state"],
+            "empty_book",
+        )
+        self.assertEqual(
+            polyarb_v4.pm_book_diagnostic(self.tokens[3], now)["book_state"],
+            "stale_book",
+        )
+
+    def test_missing_book_is_fetched_and_empty_ask_is_reported(self):
+        token = self.tokens[0]
+        response = self.FakeResponse({
+            "bids": [{"price": "0.40", "size": "5"}],
+            "asks": [],
+        })
+        with patch.object(polyarb_v4, "_PM_REFRESH_EXECUTOR", self.InlineExecutor()):
+            with patch.object(polyarb_v4.requests, "get", return_value=response) as get:
+                self.assertTrue(polyarb_v4._maybe_refresh_stale(token))
+        diagnostic = polyarb_v4.pm_book_diagnostic(token)
+        self.assertEqual(diagnostic["book_state"], "empty_asks")
+        self.assertEqual(diagnostic["rest_refresh"], "empty_asks")
+        self.assertEqual(diagnostic["bid_levels"], 1)
+        self.assertEqual(diagnostic["ask_levels"], 0)
+        get.assert_called_once()
+
+    def test_missing_book_recovery_restores_executable_ask(self):
+        token = self.tokens[1]
+        response = self.FakeResponse({
+            "bids": [],
+            "asks": [{"price": "0.37", "size": "12"}],
+        })
+        with patch.object(polyarb_v4, "_PM_REFRESH_EXECUTOR", self.InlineExecutor()):
+            with patch.object(polyarb_v4.requests, "get", return_value=response):
+                self.assertTrue(polyarb_v4._maybe_refresh_stale(token))
+        self.assertAlmostEqual(polyarb_v4.best_ask(token), 0.37)
+        self.assertEqual(
+            polyarb_v4.pm_book_diagnostic(token)["rest_refresh"],
+            "asks_available",
+        )
+
+    def test_rest_refresh_does_not_overwrite_newer_websocket_book(self):
+        token = self.tokens[3]
+        now = time.time()
+        with polyarb_v4.LOCK:
+            polyarb_v4.BOOKS[token] = {
+                "bids": [(0.59, 20.0)], "asks": [(0.61, 30.0)],
+                "ts": now, "last_change": now,
+            }
+        with patch.object(
+            polyarb_v4, "_fresh_pm_book",
+            return_value=([(0.20, 100.0)], [(0.30, 100.0)]),
+        ):
+            polyarb_v4._refresh_pm_book_worker(token, now - 1.0, "stale_book")
+        self.assertAlmostEqual(polyarb_v4.best_ask(token), 0.61)
+        self.assertEqual(
+            polyarb_v4.pm_book_diagnostic(token)["rest_refresh"],
+            "websocket_newer",
+        )
+
+    def test_failed_rest_refresh_is_rate_limited(self):
+        token = self.tokens[2]
+        with patch.object(polyarb_v4, "_PM_REFRESH_EXECUTOR", self.InlineExecutor()):
+            with patch.object(polyarb_v4.requests, "get", side_effect=OSError("offline")) as get:
+                self.assertTrue(polyarb_v4._maybe_refresh_stale(token))
+                self.assertFalse(polyarb_v4._maybe_refresh_stale(token))
+        get.assert_called_once()
+        self.assertEqual(
+            polyarb_v4.pm_book_diagnostic(token)["rest_refresh"],
+            "fetch_failed",
+        )
+
+    def test_fresh_asks_build_candidates_with_refresh_flag(self):
+        now = time.time()
+        with polyarb_v4.LOCK:
+            for token in self.tokens[:2]:
+                polyarb_v4.BOOKS[token] = {
+                    "bids": [(0.48, 200.0)], "asks": [(0.50, 200.0)],
+                    "ts": now, "last_change": now,
+                }
+        market = {"o": ["Yes", "No"], "t": self.tokens[:2]}
+        with patch.object(polyarb_v4, "_maybe_refresh_stale", return_value=False):
+            pairs = polyarb_v4.build_arb_candidates(
+                market,
+                {"Yes": {"o": 2.0}, "No": {"o": 2.0}},
+                0.0,
+            )
+        self.assertEqual(len(pairs), 2)
+        self.assertTrue(all(pair[0]["pm_verified"] is False for pair in pairs))
+
+    def test_no_ask_market_row_contains_market_outcome_and_book_state(self):
+        details = []
+        market = {"slug": "event-winner", "o": ["Yes", "No"], "t": self.tokens[:2]}
+        with patch.object(polyarb_v4, "_maybe_refresh_stale", return_value=False):
+            pairs = polyarb_v4.build_arb_candidates(
+                market, {"Yes": {"o": 2.0}}, 0.0,
+                diagnostics={}, pm_diagnostics=details,
+                market_slug="event-winner",
+            )
+        self.assertEqual(pairs, [])
+        self.assertEqual(len(details), 1)
+        self.assertEqual(details[0]["market_slug"], "event-winner")
+        self.assertEqual(details[0]["outcome"], "Yes")
+        self.assertEqual(details[0]["token_id"], self.tokens[0])
+        self.assertEqual(details[0]["book_state"], "missing_book")
+
+
 class CalculationTests(unittest.TestCase):
     def test_equalized_stakes_and_roi(self):
         result = polyarb_v4.compute([

@@ -5,6 +5,7 @@
 # v41: интеграция bk_router (BB + 1win) — см. память проекта.
 import argparse
 import csv
+from concurrent.futures import ThreadPoolExecutor
 import json
 import math
 import os
@@ -682,7 +683,11 @@ def pm_age_sec(aid):
         return round(time.time() - lc, 1)
 
 
-_FRESH_COOLDOWN = {}
+_PM_REFRESH_EXECUTOR = ThreadPoolExecutor(max_workers=4)
+_PM_REFRESH_LOCK = threading.RLock()
+_PM_REFRESH_INFLIGHT = set()
+_PM_REFRESH_COOLDOWN = {}
+_PM_REFRESH_DIAGNOSTICS = {}
 _FRESH_MIN_INTERVAL = 20.0
 _STALE_THRESHOLD = 15.0
 
@@ -694,6 +699,8 @@ def _fresh_pm_book(token_id, timeout=6.0):
         r.raise_for_status()
         book = r.json()
     except Exception:
+        return None
+    if not isinstance(book, dict):
         return None
     bids, asks = [], []
     for x in (book.get("bids") or []):
@@ -710,37 +717,148 @@ def _fresh_pm_book(token_id, timeout=6.0):
                 asks.append((p, s))
         except Exception:
             pass
-    if not bids and not asks:
-        return None
     bids.sort(key=lambda z: -z[0])
     asks.sort(key=lambda z: z[0])
     return bids, asks
 
 
-def _maybe_refresh_stale(token_id):
-    age = pm_age_sec(token_id)
-    if age is None or age < _STALE_THRESHOLD:
-        return False
-    now = time.time()
-    last = _FRESH_COOLDOWN.get(token_id, 0.0)
-    if now - last < _FRESH_MIN_INTERVAL:
-        return False
-    _FRESH_COOLDOWN[token_id] = now
-    fresh = _fresh_pm_book(token_id)
-    if not fresh:
-        return False
-    bids_f, asks_f = fresh
+def pm_book_diagnostic(token_id, now=None):
+    """Return cache state without treating an empty or stale book as executable."""
+    key = str(token_id)
+    now = time.time() if now is None else float(now)
     with LOCK:
-        prev = BOOKS.get(token_id)
-        prev_ask = prev["asks"][0][0] if prev and prev.get("asks") else None
-        cur_ask = asks_f[0][0] if asks_f else None
-        if prev is None or prev_ask != cur_ask:
-            last_change = now
+        book = BOOKS.get(key) or BOOKS.get(token_id)
+        if not book:
+            state = "missing_book"
+            age = None
+            bids, asks = [], []
         else:
-            last_change = prev.get("last_change", now) if prev else now
-        BOOKS[token_id] = {"bids": bids_f, "asks": asks_f,
-                           "ts": now, "last_change": last_change}
+            bids = list(book.get("bids") or [])
+            asks = list(book.get("asks") or [])
+            try:
+                ts = float(book.get("ts") or 0.0)
+            except (TypeError, ValueError):
+                ts = 0.0
+            age = max(0.0, now - ts) if ts > 0 else None
+            if ts <= 0:
+                state = "missing_timestamp"
+            elif age > BOOK_TTL:
+                state = "stale_book"
+            elif not bids and not asks:
+                state = "empty_book"
+            elif not asks:
+                state = "empty_asks"
+            else:
+                state = "ask_available"
+    with _PM_REFRESH_LOCK:
+        refresh = dict(_PM_REFRESH_DIAGNOSTICS.get(key) or {})
+    return {
+        "book_state": state,
+        "book_age_sec": round(age, 1) if age is not None else None,
+        "bid_levels": len(bids),
+        "ask_levels": len(asks),
+        "best_bid": bids[0][0] if bids else None,
+        "best_ask": asks[0][0] if asks else None,
+        "rest_refresh": refresh.get("state", "not_requested"),
+        "rest_attempted_at": refresh.get("attempted_at"),
+        "rest_completed_at": refresh.get("completed_at"),
+    }
+
+
+def _refresh_pm_book_worker(token_id, attempted_at, reason):
+    key = str(token_id)
+    result_state = "fetch_failed"
+    bid_levels = ask_levels = 0
+    try:
+        fresh = _fresh_pm_book(key, timeout=4.0)
+        if fresh is not None:
+            bids, asks = fresh
+            bid_levels, ask_levels = len(bids), len(asks)
+            now = time.time()
+            with LOCK:
+                previous = BOOKS.get(key)
+                try:
+                    previous_ts = float((previous or {}).get("ts") or 0.0)
+                except (TypeError, ValueError):
+                    previous_ts = 0.0
+                if previous_ts > attempted_at:
+                    result_state = "websocket_newer"
+                else:
+                    previous_ask = ((previous or {}).get("asks") or [None])[0]
+                    current_ask = asks[0] if asks else None
+                    previous_ask_price = previous_ask[0] if previous_ask else None
+                    current_ask_price = current_ask[0] if current_ask else None
+                    if previous is None or previous_ask_price != current_ask_price:
+                        last_change = now
+                    else:
+                        last_change = previous.get("last_change", now)
+                    BOOKS[key] = {
+                        "bids": bids, "asks": asks, "ts": now,
+                        "last_change": last_change,
+                    }
+                    if not bids and not asks:
+                        result_state = "empty_book"
+                    elif not asks:
+                        result_state = "empty_asks"
+                    else:
+                        result_state = "asks_available"
+    except Exception:
+        result_state = "fetch_failed"
+    finally:
+        with _PM_REFRESH_LOCK:
+            _PM_REFRESH_INFLIGHT.discard(key)
+            previous = _PM_REFRESH_DIAGNOSTICS.get(key, {})
+            _PM_REFRESH_DIAGNOSTICS[key] = {
+                "state": result_state,
+                "reason": reason,
+                "attempted_at": previous.get("attempted_at", attempted_at),
+                "completed_at": time.time(),
+                "bid_levels": bid_levels,
+                "ask_levels": ask_levels,
+            }
+
+
+def _schedule_pm_book_refresh(token_id, reason):
+    key = str(token_id)
+    now = time.time()
+    with _PM_REFRESH_LOCK:
+        last = _PM_REFRESH_COOLDOWN.get(key, 0.0)
+        if key in _PM_REFRESH_INFLIGHT or now - last < _FRESH_MIN_INTERVAL:
+            return False
+        _PM_REFRESH_COOLDOWN[key] = now
+        _PM_REFRESH_INFLIGHT.add(key)
+        _PM_REFRESH_DIAGNOSTICS[key] = {
+            "state": "pending", "reason": reason,
+            "attempted_at": now, "completed_at": None,
+            "bid_levels": 0, "ask_levels": 0,
+        }
+    try:
+        _PM_REFRESH_EXECUTOR.submit(_refresh_pm_book_worker, key, now, reason)
+    except Exception:
+        with _PM_REFRESH_LOCK:
+            _PM_REFRESH_INFLIGHT.discard(key)
+            _PM_REFRESH_DIAGNOSTICS[key] = {
+                "state": "schedule_failed", "reason": reason,
+                "attempted_at": now, "completed_at": time.time(),
+                "bid_levels": 0, "ask_levels": 0,
+            }
+        return False
     return True
+
+
+def pm_refresh_attempted(token_id):
+    with _PM_REFRESH_LOCK:
+        return str(token_id) in _PM_REFRESH_COOLDOWN
+
+
+def _maybe_refresh_stale(token_id):
+    details = pm_book_diagnostic(token_id)
+    state = details["book_state"]
+    if state in {"missing_book", "missing_timestamp"}:
+        return _schedule_pm_book_refresh(token_id, state)
+    if details["book_age_sec"] is None or details["book_age_sec"] < _STALE_THRESHOLD:
+        return False
+    return _schedule_pm_book_refresh(token_id, "stale_book")
 
 
 def get_rate():
@@ -1140,7 +1258,8 @@ def _write_match_diagnostics(router, market_map):
 
 
 def build_arb_candidates(m, live_bc, slip, bank=0.0, rate=0.0,
-                         bk_source="BetBoom", diagnostics=None):
+                         bk_source="BetBoom", diagnostics=None,
+                         pm_diagnostics=None, market_slug=None):
     def note(reason):
         if diagnostics is not None:
             diagnostics[reason] = diagnostics.get(reason, 0) + 1
@@ -1167,6 +1286,14 @@ def build_arb_candidates(m, live_bc, slip, bank=0.0, rate=0.0,
         ba = best_ask(pm_t[i])
         if ba <= 0:
             note("pm_no_ask")
+            if pm_diagnostics is not None:
+                row = {
+                    "market_slug": str(market_slug or m.get("slug") or ""),
+                    "outcome": str(oc),
+                    "token_id": str(pm_t[i]),
+                }
+                row.update(pm_book_diagnostic(pm_t[i]))
+                pm_diagnostics.append(row)
             return []
         shares = usd_target / ba
         avg = walk_book(pm_t[i], shares)
@@ -1187,7 +1314,7 @@ def build_arb_candidates(m, live_bc, slip, bank=0.0, rate=0.0,
             "pm_best_bid": best_bid(pm_t[i]),
             "pm_avg_ask": avg,
             "pm_age": pm_age_sec(pm_t[i]),
-            "pm_verified": pm_t[i] in _FRESH_COOLDOWN,
+            "pm_verified": pm_refresh_attempted(pm_t[i]),
         })
 
     bk_legs = {}
@@ -1457,6 +1584,9 @@ def main():
             }
             source_counts = {}
             live_snap = {}
+            best_candidate_roi = None
+            best_candidate_slug = None
+            pm_no_ask_details = []
             for slug, m in market_map.items():
                 if router is not None:
                     live_bc = router.live_bc(slug)
@@ -1473,7 +1603,9 @@ def main():
                 candidate_diagnostics = {}
                 pairs = build_arb_candidates(m, live_bc, slip, bank, rate,
                                              bk_source=_bk_src,
-                                             diagnostics=candidate_diagnostics)
+                                             diagnostics=candidate_diagnostics,
+                                             pm_diagnostics=pm_no_ask_details,
+                                             market_slug=slug)
                 for _reason, _count in candidate_diagnostics.items():
                     scan_counts[_reason] = scan_counts.get(_reason, 0) + _count
                 scan_counts["candidate_pairs"] += len(pairs)
@@ -1487,6 +1619,9 @@ def main():
                         scan_counts["pm_depth_rejects"] += 1
                         continue
                     roi = r["roi"]
+                    if best_candidate_roi is None or roi > best_candidate_roi:
+                        best_candidate_roi = roi
+                        best_candidate_slug = slug
                     if roi < min_roi:
                         scan_counts["below_roi"] += 1
                         continue
@@ -1664,6 +1799,19 @@ def main():
                             pass
 
             _now = time.time()
+            pm_book_states = {}
+            for _detail in pm_no_ask_details:
+                _state = _detail.get("book_state", "unknown")
+                pm_book_states[_state] = pm_book_states.get(_state, 0) + 1
+            _write_json_atomic("pm_book_diagnostics.json", {
+                "ts": _now,
+                "cycle": scan_iteration,
+                "summary": {
+                    "pm_no_ask_markets": len(pm_no_ask_details),
+                    "by_book_state": pm_book_states,
+                },
+                "markets": pm_no_ask_details,
+            })
             if _now - globals().get('_last_snap_write', 0) >= 2.0:
                 _write_json_atomic("arbs_live.json", live_snap)
                 globals()['_last_snap_write'] = _now
@@ -1676,11 +1824,20 @@ def main():
                 "phase_counts": phase_counts,
                 "checks": scan_counts,
                 "source_counts": source_counts,
+                "pm_book_summary": {
+                    "pm_no_ask_markets": len(pm_no_ask_details),
+                    "by_book_state": pm_book_states,
+                },
                 "bookmaker_feed_health": router.feed_health() if router is not None else {},
                 "pm_catalog_complete": pm_catalog_complete,
                 "pm_catalog_retained": pm_catalog_retained,
                 "signals": len(live_snap),
                 "min_roi_pct": round(min_roi * 100, 3),
+                "best_candidate_roi_pct": (
+                    round(best_candidate_roi * 100, 3)
+                    if best_candidate_roi is not None else None
+                ),
+                "best_candidate_slug": best_candidate_slug,
                 "bank_rub": round(bank, 2),
                 "usd_rub": round(rate, 4),
             }
