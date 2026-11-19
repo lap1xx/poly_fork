@@ -532,3 +532,88 @@ class SignalDropDiagnosticsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PinnedSignalSnapshotTests(unittest.TestCase):
+    def test_snapshot_freezes_quotes_stakes_and_roi_until_five_minute_expiry(self):
+        snapshot = {
+            "slug": "example-match",
+            "q": "Alpha vs Beta",
+            "roi": 0.061,
+            "stakes": [42.0, 58.0],
+            "bets": [
+                {"source": "1win", "outcome": "Alpha", "o": 2.2},
+                {"source": "Polymarket", "outcome": "Beta", "o": 1.9,
+                 "token": "token-x", "pm_best_ask": 0.51, "pm_avg_ask": 0.52},
+            ],
+            "ts": 1000.0,
+        }
+        pinned = {}
+        self.assertTrue(polyarb_v4._pin_signal_snapshot(pinned, snapshot, now=1000.0))
+        key = polyarb_v4._pinned_signal_key(snapshot)
+        frozen = pinned[key]
+        self.assertEqual(frozen["currency"], "USDT")
+        self.assertTrue(frozen["inactive_snapshot"])
+        self.assertAlmostEqual(frozen["expires_at"], 1300.0)
+
+        changed = json.loads(json.dumps(snapshot))
+        changed["roi"] = 0.12
+        changed["bets"][0]["o"] = 3.1
+        changed["bets"][1]["pm_best_ask"] = 0.43
+        changed["stakes"] = [99.0, 1.0]
+        self.assertFalse(polyarb_v4._pin_signal_snapshot(pinned, changed, now=1050.0))
+        self.assertEqual(pinned[key]["roi"], 0.061)
+        self.assertEqual(pinned[key]["bets"][0]["o"], 2.2)
+        self.assertEqual(pinned[key]["bets"][1]["pm_best_ask"], 0.51)
+        self.assertEqual(pinned[key]["stakes"], [42.0, 58.0])
+
+        self.assertEqual(len(polyarb_v4._prune_pinned_signal_snapshots(pinned, 1299.9)), 1)
+        self.assertEqual(polyarb_v4._prune_pinned_signal_snapshots(pinned, 1300.0), [])
+
+    def test_snapshot_threshold_is_fixed_at_five_percent(self):
+        snapshot = {
+            "slug": "below-threshold", "roi": 0.0499, "stakes": [1, 1],
+            "bets": [
+                {"source": "1win", "outcome": "A"},
+                {"source": "Polymarket", "outcome": "B", "token": "token-y"},
+            ],
+        }
+        pinned = {}
+        self.assertFalse(polyarb_v4._pin_signal_snapshot(pinned, snapshot, now=1000.0))
+        self.assertEqual(pinned, {})
+
+    def test_more_than_fifty_snapshots_keep_the_full_five_minute_ttl(self):
+        pinned = {}
+        for index in range(75):
+            snapshot = {
+                "slug": f"market-{index}", "roi": 0.06, "stakes": [1.0, 1.0],
+                "bets": [
+                    {"source": "1win", "outcome": "A"},
+                    {"source": "Polymarket", "outcome": "B", "token": f"token-{index}"},
+                ],
+            }
+            self.assertTrue(polyarb_v4._pin_signal_snapshot(pinned, snapshot, now=1000.0))
+        self.assertEqual(len(polyarb_v4._prune_pinned_signal_snapshots(pinned, 1299.9)), 75)
+        self.assertEqual(polyarb_v4._prune_pinned_signal_snapshots(pinned, 1300.0), [])
+
+
+class UsdtNormalizationTests(unittest.TestCase):
+    def test_legacy_rub_trade_amount_uses_recorded_rate(self):
+        self.assertEqual(web_app._trade_amount_usdt(
+            {"bank": 8500, "rate": 85}, "bank"), 100.0)
+
+    def test_new_usdt_trade_amount_is_not_converted(self):
+        self.assertEqual(web_app._trade_amount_usdt(
+            {"bank": 100, "rate": 85, "currency": "USDT"}, "bank"), 100.0)
+
+    def test_legacy_scanner_bank_is_migrated_to_usdt_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.json"
+            config_path.write_text(json.dumps({"bank": 8500, "rate": 85}), encoding="utf-8")
+            with patch.object(polyarb_v4, "CFG_FILE", str(config_path)):
+                migrated = polyarb_v4.load_cfg()
+                persisted = json.loads(config_path.read_text(encoding="utf-8"))
+        self.assertEqual(migrated["bank"], 100.0)
+        self.assertEqual(migrated["currency"], "USDT")
+        self.assertEqual(persisted["rate"], 1.0)
+        self.assertEqual(persisted["currency"], "USDT")

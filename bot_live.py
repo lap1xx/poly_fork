@@ -9,12 +9,12 @@ POLYARB = str(HERE / "polyarb_v4.py")
 def main():
     args = sys.argv[1:]
     if "--help" in args or "-h" in args:
-        print("Usage: python bot_live.py [--min-roi 3.0] [--bank 2000] ...")
+        print("Usage: python bot_live.py [--min-roi 3.0] [--bank USDT_AMOUNT] ...")
         print("Any extra args are passed through to polyarb_v4.py")
         return 0
 
     min_roi = "3.0"
-    bank = "2000"
+    bank = None
     extra = []
     i = 0
     while i < len(args):
@@ -40,8 +40,9 @@ def main():
         "--poll", "0.3",
         "--alert-gap", "120",
         "--min-roi", min_roi,
-        "--bank", bank,
     ] + extra
+    if bank is not None:
+        cmd.extend(["--bank", bank])
 
     print("[>] AUTO mode:")
     print("    " + " ".join(cmd))

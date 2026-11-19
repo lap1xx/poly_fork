@@ -5,20 +5,15 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
   'use strict';
 
-  function fitSuggestedStakes(bookmakerRub, polymarketRub, rubPerUsd, capRub) {
-    const rate = Number(rubPerUsd);
-    if (!Number.isFinite(rate) || rate <= 0) {
-      return { bookmakerRub: 0, polymarketUsd: 0, exposureRub: 0, capped: false };
-    }
-
-    let bookmaker = Number(bookmakerRub);
-    let polymarket = Number(polymarketRub);
+  function fitSuggestedStakes(bookmakerUsdt, polymarketUsdt, capUsdt) {
+    let bookmaker = Number(bookmakerUsdt);
+    let polymarket = Number(polymarketUsdt);
     bookmaker = Number.isFinite(bookmaker) ? Math.max(0, bookmaker) : 0;
     polymarket = Number.isFinite(polymarket) ? Math.max(0, polymarket) : 0;
 
-    const hasCap = capRub !== null && capRub !== undefined
-      && Number.isFinite(Number(capRub)) && Number(capRub) >= 0;
-    const cap = hasCap ? Number(capRub) : null;
+    const hasCap = capUsdt !== null && capUsdt !== undefined
+      && Number.isFinite(Number(capUsdt)) && Number(capUsdt) >= 0;
+    const cap = hasCap ? Number(capUsdt) : null;
     const proposedExposure = bookmaker + polymarket;
     let capped = false;
 
@@ -29,32 +24,26 @@
       capped = true;
     }
 
-    // With a cap, round both displayed legs down. Nearest rounding can exceed
-    // the cap even when the unrounded total is just below it.
-    let bookmakerOut = hasCap ? Math.floor(bookmaker + 1e-9) : Math.round(bookmaker);
-    let polymarketUsd = hasCap
-      ? Math.floor((polymarket / rate) * 100 + 1e-9) / 100
-      : Number((polymarket / rate).toFixed(2));
+    let bookmakerOut = hasCap
+      ? Math.floor(bookmaker * 100 + 1e-8) / 100
+      : Number(bookmaker.toFixed(2));
+    let polymarketOut = hasCap
+      ? Math.floor(polymarket * 100 + 1e-8) / 100
+      : Number(polymarket.toFixed(2));
 
     if (hasCap) {
-      // Floating-point guard: preserve the invariant on the actual displayed values.
       for (let i = 0; i < 1000; i += 1) {
-        const displayedExposure = bookmakerOut + polymarketUsd * rate;
-        if (displayedExposure <= cap + 1e-8) break;
-        if (polymarketUsd >= 0.01) {
-          polymarketUsd = Number((polymarketUsd - 0.01).toFixed(2));
-        } else if (bookmakerOut >= 1) {
-          bookmakerOut -= 1;
-        } else {
-          break;
-        }
+        if (bookmakerOut + polymarketOut <= cap + 1e-8) break;
+        if (polymarketOut >= 0.01) polymarketOut = Number((polymarketOut - 0.01).toFixed(2));
+        else if (bookmakerOut >= 0.01) bookmakerOut = Number((bookmakerOut - 0.01).toFixed(2));
+        else break;
       }
     }
 
     return {
-      bookmakerRub: bookmakerOut,
-      polymarketUsd,
-      exposureRub: bookmakerOut + polymarketUsd * rate,
+      bookmakerUsdt: bookmakerOut,
+      polymarketUsdt: polymarketOut,
+      exposureUsdt: Number((bookmakerOut + polymarketOut).toFixed(2)),
       capped,
     };
   }

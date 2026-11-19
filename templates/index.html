@@ -52,7 +52,7 @@
         <label class="chk"><input type="checkbox" id="f-dota2" checked> DOTA2</label>
         <label class="chk"><input type="checkbox" id="f-lol" checked> LOL</label>
         <label class="chk"><input type="checkbox" id="f-tennis" checked> TENNIS</label>
-        <label class="chk minroi">ROI ≥ <input type="number" id="f-minroi" value="0" min="0" max="100" step="0.5">%</label>
+        <label class="chk minroi">ROI ≥ <input type="number" id="f-minroi" value="3" min="0" max="100" step="0.5">%</label>
       </div>
       <section class="scan-health" id="scan-health" aria-live="polite">
         <div class="scan-health-top">
@@ -72,6 +72,10 @@
       <div class="arbs-list" id="arbs-list">
         <div class="empty">Нет вилок по текущим фильтрам.<br>Попробуйте изменить параметры поиска.</div>
       </div>
+      <section class="pinned-section" aria-live="polite">
+        <div class="pinned-heading"><span>ЗАКРЕПЛЁННЫЕ СНИМКИ · НЕАКТИВНЫЕ</span><small>ROI ≥ 5% · до 5 минут</small></div>
+        <div class="pinned-list" id="pinned-snapshots"><div class="pinned-empty">Снимков с ROI ≥ 5% пока нет.</div></div>
+      </section>
       <div class="source-note"><span class="source-title">ИСТОЧНИКИ</span><span>1win · основной</span><span>BetBoom · резерв</span></div>
     </aside>
 
@@ -139,7 +143,7 @@
             </div>
             <table class="pm-book" id="pm-book">
               <thead>
-                <tr><th>цена, ¢</th><th>кол-во</th><th>$</th></tr>
+                <tr><th>цена, ¢</th><th>кол-во</th><th>USDT</th></tr>
               </thead>
               <tbody id="pm-book-body">
                 <tr><td colspan="3" class="empty-cell">—</td></tr>
@@ -162,19 +166,19 @@
         <div class="panel how-much">
           <div class="panel-head">
             <span>СКОЛЬКО СТАВИТЬ</span>
-            <span class="panel-sub" id="hm-rate">курс —</span>
+              <span class="panel-sub" id="hm-rate">суммы в USDT</span>
           </div>
 
           <div class="hm-legs">
             <div class="hm-leg bb">
               <span class="hm-bk" id="hm-bb-name">1win</span>
-              <input type="number" step="1" id="hm-bb-stake" value="0">
-              <span class="hm-cur">₽</span>
+              <input type="number" step="0.01" id="hm-bb-stake" value="0">
+              <span class="hm-cur">USDT</span>
             </div>
             <div class="hm-leg pm">
               <span class="hm-bk">Polymarket</span>
               <input type="number" step="0.01" id="hm-pm-stake" value="0">
-              <span class="hm-cur">$</span>
+              <span class="hm-cur">USDT</span>
             </div>
           </div>
 
@@ -211,8 +215,8 @@
           <input type="number" step="0.01" id="calc-bk-odds" value="0">
         </div>
         <div class="calc-row">
-          <label for="calc-bk-stake">Ставка, ₽</label>
-          <input type="number" step="1" id="calc-bk-stake" value="0">
+          <label for="calc-bk-stake">Ставка, USDT</label>
+          <input type="number" step="0.01" id="calc-bk-stake" value="0">
         </div>
       </div>
 
@@ -223,28 +227,26 @@
           <input type="number" step="0.1" id="calc-pm-price" value="0">
         </div>
         <div class="calc-row">
-          <label for="calc-pm-stake">Купил на, $</label>
+          <label for="calc-pm-stake">Сумма, USDT</label>
           <input type="number" step="0.01" id="calc-pm-stake" value="0">
         </div>
       </div>
 
       <div class="calc-rate">
-        <label for="calc-rate">курс</label>
-        <input type="number" step="0.01" id="calc-rate" value="85">
-        <span>₽ · из настроек</span>
+        <span>Валюта обеих сторон — USDT</span>
         <button class="btn-mini" id="btn-calc-reset">Сброс</button>
       </div>
 
       <div class="calc-hint" id="calc-hint">Введи кэф и ставку на БК, цену и сумму на Полике</div>
-      <div class="calc-disclaimer">Упрощённая оценка по введённой цене, без проверки ликвидности.</div>
+      <div class="calc-disclaimer">Упрощённая оценка без проверки ликвидности; для PM принято 1 USDT ≈ 1 USD.</div>
 
       <div class="risk-block">
         <div class="risk-title">ПЛАНИРОВАНИЕ БАНКА</div>
-        <label for="risk-total-bank">Общий банк, ₽</label>
-        <input type="number" id="risk-total-bank" min="0" placeholder="Не задан">
+        <label for="risk-total-bank">Общий банк, USDT</label>
+        <input type="number" id="risk-total-bank" min="0" step="0.01" value="100" readonly aria-label="Общий банк из настроек сканера">
         <div class="risk-result"><span>40% на один план</span><output id="risk-limit" for="risk-total-bank">—</output></div>
-        <div class="risk-hint">Общий банк хранится в этом браузере и не меняет расчётный банк сканера.</div>
-        <div class="risk-hint risk-separate">Это ориентир и предупреждение, а не автоматический запрет или ставка.</div>
+        <div class="risk-hint">Общий банк единый для сканера и расчётного планировщика. Изменяется в настройках.</div>
+        <div class="risk-hint risk-separate">40% — только лимит суммы одного плана. Автоматических ставок нет.</div>
       </div>
 
       <button class="btn green big" id="btn-my-arbs">МОИ ВИЛКИ</button>
@@ -322,8 +324,8 @@
 
       <div class="dash-kpis">
         <div class="dk"><div class="lbl">ЗАПИСЕЙ</div><div class="val" id="daily-count">0</div></div>
-        <div class="dk"><div class="lbl">ОБОРОТ</div><div class="val" id="daily-bank">0 ₽</div></div>
-        <div class="dk"><div class="lbl">РАСЧЁТНЫЙ РЕЗУЛЬТАТ</div><div class="val green" id="daily-profit">+0 ₽</div></div>
+        <div class="dk"><div class="lbl">ОБОРОТ</div><div class="val" id="daily-bank">0 USDT</div></div>
+        <div class="dk"><div class="lbl">РАСЧЁТНЫЙ РЕЗУЛЬТАТ</div><div class="val green" id="daily-profit">+0 USDT</div></div>
         <div class="dk"><div class="lbl">ROI ПО ЗАПИСЯМ</div><div class="val green" id="daily-roi">+0.000%</div></div>
       </div>
 
@@ -346,7 +348,7 @@
               <div class="daily-ring-text" id="daily-ring-text">0%</div>
             </div>
             <div class="daily-meta">
-              <div><span class="lbl">ОБОРОТ</span><b id="daily-bank2">0 ₽</b></div>
+              <div><span class="lbl">ОБОРОТ</span><b id="daily-bank2">0 USDT</b></div>
               <div><span class="lbl">ROI ПО ЗАПИСЯМ</span><b id="daily-roi2">0%</b></div>
               <div><span class="lbl">ЗАПИСЕЙ</span><b id="daily-count2">0</b></div>
             </div>
@@ -380,11 +382,11 @@
         <button class="close" onclick="closeConfig()">✕</button>
       </div>
       <div class="config-grid">
-        <div class="cfg-row"><label for="cfg-bank">Банк на сделку по умолчанию, ₽</label><input type="number" id="cfg-bank" value="2500"></div>
-        <div class="cfg-row"><label>Курс ₽/$ (fallback)</label><input type="number" step="0.01" id="cfg-rate" value="85"></div>
+        <div class="cfg-row"><label for="cfg-bank">Банк по умолчанию, USDT</label><input type="number" id="cfg-bank" value="100"></div>
         <div class="cfg-row"><label>Комиссия Polymarket, %</label><input type="number" step="0.1" id="cfg-fee" value="4"></div>
         <div class="cfg-row"><label for="cfg-safe">Порог цены PM, доля 0–1</label><input type="number" step="0.01" id="cfg-safe" value="0.45"></div>
       </div>
+      <div class="modal-disclaimer">Сохранённый банк сканер подхватывает примерно за секунду. Параметр запуска <code>--bank</code>, если задан, имеет приоритет.</div>
       <div class="modal-actions">
         <button class="btn dark" onclick="closeConfig()">ОТМЕНА</button>
         <button class="btn green" onclick="saveConfig()">СОХРАНИТЬ</button>

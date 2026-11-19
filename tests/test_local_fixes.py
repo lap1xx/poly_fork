@@ -78,6 +78,7 @@ class EventPhaseTests(unittest.TestCase):
         command = run.call_args.args[0]
         self.assertIn("--watch", command)
         self.assertEqual(command[command.index("--min-roi") + 1], "3.0")
+        self.assertNotIn("--bank", command)
         self.assertNotIn("--live", command)
         self.assertEqual(run.call_args.kwargs["cwd"], str(bot_live.HERE))
         popen.assert_called_once()
@@ -349,6 +350,16 @@ class PMBookRecoveryTests(unittest.TestCase):
 
 
 class CalculationTests(unittest.TestCase):
+    def test_risk_capped_plan_bank_is_forty_percent(self):
+        plan_bank = polyarb_v4._risk_capped_plan_bank(100.0)
+        self.assertEqual(plan_bank, 40.0)
+        result = polyarb_v4.compute([
+            {"o": 2.1, "c": 0.0, "s": 0.0},
+            {"o": 2.1, "c": 0.0, "s": 0.0},
+        ], plan_bank)
+        self.assertAlmostEqual(sum(result["stakes"]), 40.0, places=8)
+        self.assertEqual(polyarb_v4._risk_capped_plan_bank(-1.0), 0.0)
+
     def test_equalized_stakes_and_roi(self):
         result = polyarb_v4.compute([
             {"o": 2.1, "c": 0.0, "s": 0.0},
@@ -393,9 +404,9 @@ class CalculationTests(unittest.TestCase):
         self.assertTrue(polyarb_v4.alert_due(False, 60.0, 100.0, 30.0))
         self.assertFalse(polyarb_v4.alert_due(False, 100.0, 100.0, 0.0))
 
-    def test_refine_uses_rub_usd_conversion_without_scaling_odds(self):
+    def test_refine_uses_usdt_stakes_without_scaling_odds_by_fx_rate(self):
         token = "unit-test-token-rate"
-        book = {"bids": [(0.49, 100.0)], "asks": [(0.50, 100.0)],
+        book = {"bids": [(0.49, 10000.0)], "asks": [(0.50, 10000.0)],
                 "ts": time.time(), "last_change": time.time()}
         with polyarb_v4.LOCK:
             old = polyarb_v4.BOOKS.get(token)
@@ -408,7 +419,7 @@ class CalculationTests(unittest.TestCase):
             outputs = []
             for rate in (85.0, 100.0):
                 bets = [dict(leg) for leg in base]
-                initial = polyarb_v4.compute(bets, 1000.0)
+                initial = polyarb_v4.compute(bets, 100.0)
                 refined = polyarb_v4.refine_stakes(bets, initial, rate)
                 self.assertIsNotNone(refined)
                 outputs.append(bets[0]["o"])

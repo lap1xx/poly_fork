@@ -17,11 +17,12 @@ const state = {
   freshSlugs: new Set(),
   phase: 'all',      // 'all' | 'live' | 'prematch' | 'unknown'
   scanStatus: null,
+  pinnedSignalSnapshots: [],
   suggestedCapped: false,
   audioCtx: null,
   soundEnabled: localStorage.getItem('poly_arb_sound') !== 'off',
   bkFilter: JSON.parse(localStorage.getItem('poly_arb_bks') || 'null'),
-  config: { rate: 85, bank: 2500, pm_fee_pct: 0.04, safe_fork_threshold: 0.45 },
+  config: { rate: 1, bank: 100, currency: 'USDT', pm_fee_pct: 0.04, safe_fork_threshold: 0.45 },
   dailyStats: null,
 };
 
@@ -96,7 +97,12 @@ function escapeHtml(s) {
 }
 function fmtMoney(n) {
   if (!isFinite(n)) n = 0;
-  return Math.round(n).toLocaleString('ru-RU') + ' ₽';
+  return Number(n).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' USDT';
+}
+function fmtHistoricalAmount(n, currency) {
+  const amount = Number(n);
+  const unit = String(currency || 'RUB').toUpperCase() === 'USDT' ? 'USDT' : '₽';
+  return (Number.isFinite(amount) ? amount.toFixed(2) : '0.00') + ' ' + unit;
 }
 function fmtOdds(n) { return (Number(n) || 0).toFixed(3); }
 function fmtPct(n, sign = true) {
@@ -122,11 +128,10 @@ function toast(msg, err) {
   el._t = setTimeout(() => el.classList.add('hidden'), 2400);
 }
 
-/* Separate from config.bank; this planner value stays in the current browser. */
+/* The same saved USDT bank drives scanner stake sizes and the dashboard's 40% guide. */
 function getTotalBank() {
   const input = document.getElementById('risk-total-bank');
-  if (!input || input.value.trim() === '') return null;
-  const bank = Number(input.value);
+  const bank = Number(state.config.bank ?? input?.value);
   return Number.isFinite(bank) && bank > 0 ? bank : null;
 }
 
@@ -135,24 +140,24 @@ function getPlanCap() {
   return totalBank === null ? null : totalBank * 0.4;
 }
 
-function updatePlanRiskNote(exposureRub) {
+function updatePlanRiskNote(exposureUsdt) {
   const note = document.getElementById('hm-risk-note');
   if (!note) return;
   const cap = getPlanCap();
   note.classList.remove('safe', 'warn');
   if (cap === null) {
-    note.textContent = 'Укажите общий банк справа, чтобы применить 40%-ориентир к плану.';
+    note.textContent = 'Укажите общий банк в настройках, чтобы применить 40%-ориентир к плану.';
     return;
   }
-  if (exposureRub > cap + 0.01) {
+  if (exposureUsdt > cap + 0.01) {
     note.classList.add('warn');
-    note.textContent = `План ${fmtMoney(exposureRub)} выше 40%-ориентира ${fmtMoney(cap)} на ${fmtMoney(exposureRub - cap)}. Проверьте риск вручную.`;
+    note.textContent = `План ${fmtMoney(exposureUsdt)} выше 40%-ориентира ${fmtMoney(cap)} на ${fmtMoney(exposureUsdt - cap)}. Проверьте риск вручную.`;
   } else if (state.suggestedCapped) {
     note.classList.add('safe');
     note.textContent = `Рекомендация уменьшена до 40%-ориентира (${fmtMoney(cap)}); перепроверьте глубину стакана для нового объёма.`;
   } else {
     note.classList.add('safe');
-    note.textContent = `План ${fmtMoney(exposureRub)} в пределах ориентира ${fmtMoney(cap)} на один план.`;
+    note.textContent = `План ${fmtMoney(exposureUsdt)} в пределах ориентира ${fmtMoney(cap)} на один план.`;
   }
 }
 
@@ -162,10 +167,6 @@ function updateBankLimit() {
   if (!input || !output) return;
   const bank = getTotalBank();
   output.textContent = bank !== null ? fmtMoney(bank * 0.4) : '—';
-  try {
-    if (bank !== null) localStorage.setItem('poly_arb_total_bank', String(bank));
-    else localStorage.removeItem('poly_arb_total_bank');
-  } catch (e) {}
   if (state.activeSlug) {
     if (!state.detailEdited) renderHowMuch(getActive());
     else recalcHowMuch();
@@ -249,8 +250,18 @@ function connectWS() {
     if (msg.type === 'heartbeat') return;
     if (msg.type !== 'snapshot') return;
 
-    if (msg.config) state.config = { ...state.config, ...msg.config };
     state.scanStatus = msg.scan_status || null;
+    if (msg.config) state.config = { ...state.config, ...msg.config };
+    const reportedBank = Number(state.scanStatus?.bank_usdt || msg.config?.bank || 0);
+    const bankInput = document.getElementById('risk-total-bank');
+    if (reportedBank > 0 && Number.isFinite(reportedBank)) {
+      const changed = Math.abs(Number(state.config.bank) - reportedBank) >= 0.005;
+      state.config.bank = reportedBank;
+      if (bankInput) bankInput.value = reportedBank.toFixed(2);
+      if (changed) updateBankLimit();
+    }
+    state.pinnedSignalSnapshots = Array.isArray(state.scanStatus?.pinned_signal_snapshots)
+      ? state.scanStatus.pinned_signal_snapshots : [];
     const newArbs = Array.isArray(msg.arbs) ? msg.arbs : [];
     let hasNew = false;
     for (const a of newArbs) {
@@ -299,6 +310,7 @@ function applyFilters() {
   });
   state.visible.sort((a, b) => (b.roi || 0) - (a.roi || 0));
   renderArbs();
+  renderPinnedSnapshots();
   updateHeader();
 }
 
@@ -559,7 +571,8 @@ function createArbCard() {
   const card = document.createElement('div');
   card.className = 'arb';
   card.innerHTML = '<div class="arb-head"><div class="arb-title"></div><div class="arb-roi"></div></div>' +
-    '<div class="arb-tags"></div><div class="arb-meta"><div class="arb-bks"></div><span class="arb-age"></span></div>';
+    '<div class="arb-tags"></div><div class="arb-meta"><div class="arb-bks"></div><span class="arb-age"></span></div>' +
+    '<div class="arb-stakes"></div>';
   return card;
 }
 
@@ -619,6 +632,55 @@ function updateArbCard(card, a) {
   const chips = `<span class="bk-chip ${bkClass}">${escapeHtml(bbLeg.source || 'БК')}</span>` +
     '<span class="bk-chip pm">Polymarket</span>';
   setCardMarkup(card, '.arb-bks', chips, '_renderedBooks');
+  const stakes = Array.isArray(a.stakes) ? a.stakes : [];
+  const legRows = legs.map((leg, i) => {
+    if (!leg || !leg.source) return '';
+    const amount = Number(stakes[i] || 0);
+    if (!Number.isFinite(amount) || amount <= 0) return '';
+    const outcome = escapeHtml(leg.outcome || 'исход');
+    if (leg.source === 'Polymarket') {
+      const price = Number(leg.pm_avg_ask || leg.pm_best_ask || 0);
+      const shares = price > 0 ? ` · ${(amount / price).toFixed(2)} долей` : '';
+      const priceText = price > 0 ? ` @ ${(price * 100).toFixed(1)}¢` : '';
+      return `<span>${outcome} · ${amount.toFixed(2)} USDT${shares}${priceText}</span>`;
+    }
+    return `<span>${escapeHtml(leg.source)} · ${outcome} · ${amount.toFixed(2)} USDT @ ${fmtOdds(leg.o)}×</span>`;
+  }).filter(Boolean).join('');
+  setCardMarkup(card, '.arb-stakes', legRows, '_renderedStakes');
+}
+
+function renderPinnedSnapshots() {
+  const box = document.getElementById('pinned-snapshots');
+  if (!box) return;
+  const rows = Array.isArray(state.pinnedSignalSnapshots)
+    ? state.pinnedSignalSnapshots.filter(row => row && typeof row === 'object') : [];
+  if (!rows.length) {
+    box.innerHTML = '<div class="pinned-empty">Снимков с ROI ≥ 5% пока нет.</div>';
+    return;
+  }
+  const now = Date.now() / 1000;
+  box.innerHTML = rows.map(row => {
+    const bets = Array.isArray(row.bets) ? row.bets : [];
+    const stakes = Array.isArray(row.stakes) ? row.stakes : [];
+    const pm = bets.find(leg => leg?.source === 'Polymarket') || {};
+    const bkIndex = bets.findIndex(leg => leg && leg.source !== 'Polymarket');
+    const bk = bkIndex >= 0 ? bets[bkIndex] : {};
+    const pmIndex = bets.findIndex(leg => leg?.source === 'Polymarket');
+    const pmStake = Number(stakes[pmIndex] || 0);
+    const bkStake = Number(stakes[bkIndex] || 0);
+    const pmPrice = Number(pm.pm_avg_ask || pm.pm_best_ask || 0);
+    const expires = Math.max(0, Math.ceil(Number(row.expires_at || 0) - now));
+    const locked = Number(row.locked_at || row.ts || 0);
+    const lockedText = locked > 0 ? new Date(locked * 1000).toLocaleTimeString('ru-RU') : '—';
+    const pmLine = `${escapeHtml(pm.outcome || 'Polymarket')} · ${pmStake.toFixed(2)} USDT` +
+      (pmPrice > 0 ? ` · ${(pmStake / pmPrice).toFixed(2)} долей @ ${(pmPrice * 100).toFixed(1)}¢` : '');
+    const bkLine = `${escapeHtml(bk.source || '1win')} · ${escapeHtml(bk.outcome || 'исход')} · ${bkStake.toFixed(2)} USDT @ ${fmtOdds(bk.o)}×`;
+    const title = escapeHtml(row.title || row.q || row.slug || 'Событие');
+    return `<article class="pinned-card"><div class="pinned-top"><b>${title}</b><strong>${Number(row.snapshot_roi_pct ?? Number(row.roi || 0) * 100).toFixed(2)}%</strong></div>` +
+      `<div class="pinned-warning">СНИМОК · НЕАКТИВНО · цены заморожены ${lockedText}</div>` +
+      `<div class="pinned-leg">${bkLine}</div><div class="pinned-leg">${pmLine}</div>` +
+      `<div class="pinned-countdown">Удаление через ${Math.floor(expires / 60)}:${String(expires % 60).padStart(2, '0')}</div></article>`;
+  }).join('');
 }
 
 function renderArbs() {
@@ -807,7 +869,7 @@ async function loadPmBook(slug) {
       rows += '<tr class="' + (inOrder ? 'in-order' : 'out-order') + '">' +
         '<td>' + (price * 100).toFixed(1) + '\u00A2</td>' +
         '<td>' + Math.round(size) + '</td>' +
-        '<td>$' + Math.round(usd) + '</td>' +
+        '<td>' + usd.toFixed(2) + '</td>' +
       '</tr>';
     }
     const newRows = rows || '<tr><td colspan="3" class="empty-cell">пусто</td></tr>';
@@ -817,12 +879,12 @@ async function loadPmBook(slug) {
       ? book.ask_depth_usd
       : asks.reduce((s, l) => s + l.price * l.size, 0);
     const totalLevels = (book.asks || []).length;
-    let footTxt = 'показано ' + Math.min(totalLevels, 7) + ' уровней · глубина ask $' + Math.round(totalUsd).toLocaleString('ru-RU');
-    if (book.avg_for_size && !book.avg_for_size.full) footTxt += ' · недостаточно для $' + requestedUsd.toFixed(2);
+    let footTxt = 'показано ' + Math.min(totalLevels, 7) + ' уровней · глубина ask ' + Number(totalUsd).toFixed(2) + ' USDT';
+    if (book.avg_for_size && !book.avg_for_size.full) footTxt += ' · недостаточно для ' + requestedUsd.toFixed(2) + ' USDT';
     foot.textContent = footTxt;
     const avg = book.avg_for_size;
     document.getElementById('hm-avg').textContent = avg && avg.avg_price
-      ? (avg.avg_price * 100).toFixed(1) + '¢ · $' + requestedUsd.toFixed(2) + (avg.full ? '' : ' · неполный объём') : '—';
+      ? (avg.avg_price * 100).toFixed(1) + '¢ · ' + requestedUsd.toFixed(2) + ' USDT' + (avg.full ? '' : ' · неполный объём') : '—';
   } catch (e) {
     if (requestId === state.bookRequestId && state.activeSlug === slug) {
       tbody.innerHTML = '<tr><td colspan="3" class="empty-cell">Ошибка сети</td></tr>';
@@ -906,7 +968,7 @@ function renderHowMuch(a) {
   const pmLeg = (a.bets || []).find(l => l.source === 'Polymarket') || {};
   const bbLeg = (a.bets || []).find(l => l.source && l.source !== 'Polymarket') || {};
   document.getElementById('hm-bb-name').textContent = bbLeg.source || 'Букмекер';
-  document.getElementById('hm-rate').textContent = 'курс ' + (a.rate || state.config.rate || 85);
+  document.getElementById('hm-rate').textContent = 'суммы в USDT';
 
   const stakes = a.stakes || [0, 0];
   let pmSt = 0, bbSt = 0;
@@ -914,16 +976,15 @@ function renderHowMuch(a) {
     if (l.source === 'Polymarket') pmSt = stakes[i] || 0;
     if (l.source && l.source !== 'Polymarket') bbSt = stakes[i] || 0;
   });
-  const rate = a.rate || state.config.rate || 85;
   if (!state.detailEdited) {
     const cap = getPlanCap();
     const fitStakes = window.PolyBankrollPlanner?.fitSuggestedStakes;
     const plan = typeof fitStakes === 'function'
-      ? fitStakes(bbSt, pmSt, rate, cap)
-      : { bookmakerRub: 0, polymarketUsd: 0, capped: false };
+      ? fitStakes(bbSt, pmSt, cap)
+      : { bookmakerUsdt: 0, polymarketUsdt: 0, capped: false };
     state.suggestedCapped = plan.capped;
-    document.getElementById('hm-bb-stake').value = plan.bookmakerRub;
-    document.getElementById('hm-pm-stake').value = Number(plan.polymarketUsd).toFixed(2);
+    document.getElementById('hm-bb-stake').value = Number(plan.bookmakerUsdt).toFixed(2);
+    document.getElementById('hm-pm-stake').value = Number(plan.polymarketUsdt).toFixed(2);
   }
   // лучшее ask из стакана, а не среднее по $50
   const cachedBook = pmBookCache[state.activeSlug]?.outcome === pmLeg.outcome
@@ -939,13 +1000,13 @@ function renderHowMuch(a) {
   const avg = cachedBook?.avg_for_size;
   const enteredUsd = Number(document.getElementById('hm-pm-stake').value);
   document.getElementById('hm-avg').textContent = avg && avg.avg_price && Math.abs(cachedBook.requested_usd - enteredUsd) < 0.005
-    ? (avg.avg_price * 100).toFixed(1) + '¢ · $' + cachedBook.requested_usd.toFixed(2) + (avg.full ? '' : ' · неполный объём') : '—';
+      ? (avg.avg_price * 100).toFixed(1) + '¢ · ' + cachedBook.requested_usd.toFixed(2) + ' USDT' + (avg.full ? '' : ' · неполный объём') : '—';
   document.getElementById('hm-eff').textContent = pmLeg.o ? fmtOdds(pmLeg.o) : '—';
 
   recalcHowMuch();
 
   const buyBtn = document.getElementById('btn-buy-pm');
-  buyBtn.textContent = `ОТКРЫТЬ POLYMARKET · $${parseFloat(document.getElementById('hm-pm-stake').value || 0).toFixed(2)} ↗`;
+  buyBtn.textContent = `ОТКРЫТЬ POLYMARKET · ${parseFloat(document.getElementById('hm-pm-stake').value || 0).toFixed(2)} USDT ↗`;
   const bkBtn = document.getElementById('btn-open-bb');
   const oneWinUrlReady = bbLeg.source === '1win' && Boolean(a.bk_event_url);
   const betBoomUrlReady = bbLeg.source === 'BetBoom' && Boolean(a.bb_match_id && a.bb_tournament_id);
@@ -958,18 +1019,16 @@ function renderHowMuch(a) {
 
 function recalcHowMuch() {
   const a = getActive(); if (!a) return;
-  const rate = parseFloat(document.getElementById('hm-rate').textContent.replace('курс ', '')) || state.config.rate || 85;
   const bbStake = parseFloat(document.getElementById('hm-bb-stake').value || '0');
-  const pmUsd = parseFloat(document.getElementById('hm-pm-stake').value || '0');
-  const pmStakeRub = pmUsd * rate;
+  const pmStakeUsdt = parseFloat(document.getElementById('hm-pm-stake').value || '0');
 
   const pmLeg = (a.bets || []).find(l => l.source === 'Polymarket') || {};
   const bbLeg = (a.bets || []).find(l => l.source && l.source !== 'Polymarket') || {};
   const pmO = pmLeg.o || 0, bbO = bbLeg.o || 0;
 
-  const pay1 = pmStakeRub * pmO;
+  const pay1 = pmStakeUsdt * pmO;
   const pay2 = bbStake * bbO;
-  const bank = pmStakeRub + bbStake;
+  const bank = pmStakeUsdt + bbStake;
   const minPay = Math.min(pay1, pay2);
   const profit = minPay - bank;
 
@@ -981,23 +1040,22 @@ function recalcHowMuch() {
   updatePlanRiskNote(bank);
 
   document.getElementById('btn-buy-pm').textContent =
-    `ОТКРЫТЬ POLYMARKET · $${pmUsd.toFixed(2)} ↗`;
+    `ОТКРЫТЬ POLYMARKET · ${pmStakeUsdt.toFixed(2)} USDT ↗`;
 
-  if (!state.calcEdited) syncCalcFromDetail(pmLeg, bbLeg, pmUsd, bbStake, rate);
+  if (!state.calcEdited) syncCalcFromDetail(pmLeg, bbLeg, pmStakeUsdt, bbStake);
 }
 
 /* ============= RIGHT CALC ============= */
-function syncCalcFromDetail(pmLeg, bbLeg, pmUsd, bbStake, rate) {
+function syncCalcFromDetail(pmLeg, bbLeg, pmStakeUsdt, bbStake) {
   document.getElementById('calc-bk-name').textContent = bbLeg.source || '—';
   document.getElementById('calc-bk-odds').value = (bbLeg.o || 0).toFixed(2);
-  document.getElementById('calc-bk-stake').value = Math.round(bbStake);
+  document.getElementById('calc-bk-stake').value = Number(bbStake).toFixed(2);
   const a = getActive();
   const cachedAsk = pmBookCache[state.activeSlug]?.outcome === pmLeg.outcome
     ? pmBookCache[state.activeSlug].best_ask : null;
   const rawAsk = Number(cachedAsk || pmLeg.pm_best_ask || (a && a.pm_best_ask));
   document.getElementById('calc-pm-price').value = rawAsk > 0 && rawAsk < 1 ? (rawAsk * 100).toFixed(1) : '0';
-  document.getElementById('calc-pm-stake').value = pmUsd.toFixed(2);
-  document.getElementById('calc-rate').value = rate.toFixed(2);
+  document.getElementById('calc-pm-stake').value = pmStakeUsdt.toFixed(2);
   updateCalcHint();
 }
 
@@ -1006,21 +1064,19 @@ function updateCalcHint() {
   const bkSt = parseFloat(document.getElementById('calc-bk-stake').value || '0');
   const pmP = parseFloat(document.getElementById('calc-pm-price').value || '0') / 100;
   const pmSt = parseFloat(document.getElementById('calc-pm-stake').value || '0');
-  const rate = parseFloat(document.getElementById('calc-rate').value || '85');
   const FEE = state.config.pm_fee_pct ?? 0.04;
 
   const pmO = pmP > 0 ? (1 / pmP) / (1 + FEE) : 0;
-  const pmRub = pmSt * rate;
-  const bank = bkSt + pmRub;
+  const bank = bkSt + pmSt;
   const payBK = bkSt * bkO;
-  const payPM = pmRub * pmO;
+  const payPM = pmSt * pmO;
   const minPay = Math.min(payBK, payPM);
   const profit = minPay - bank;
   const roi = bank > 0 ? profit / bank : 0;
 
   const hint = document.getElementById('calc-hint');
-  if (!(bkO > 1 && bkSt > 0 && pmP > 0 && pmP < 1 && pmSt > 0 && rate > 0)) {
-    hint.textContent = 'Укажи обе суммы, кэф БК, цену PM и курс';
+  if (!(bkO > 1 && bkSt > 0 && pmP > 0 && pmP < 1 && pmSt > 0)) {
+    hint.textContent = 'Укажи обе суммы в USDT, кэф БК и цену PM';
     hint.style.color = 'var(--dim)';
     return;
   }
@@ -1062,8 +1118,10 @@ async function openConfig() {
   try {
     const r = await fetch('/api/config');
     const j = await r.json();
-    document.getElementById('cfg-bank').value = j.bank || 2500;
-    document.getElementById('cfg-rate').value = j.rate || 85;
+    state.config = { ...state.config, ...j };
+    const bankInput = document.getElementById('risk-total-bank');
+    if (bankInput) bankInput.value = Number(j.bank || 100).toFixed(2);
+    document.getElementById('cfg-bank').value = j.bank || 100;
     document.getElementById('cfg-fee').value = ((j.pm_fee_pct ?? 0.04) * 100).toFixed(1);
     document.getElementById('cfg-safe').value = (j.safe_fork_threshold || 0.45);
   } catch (e) {}
@@ -1072,8 +1130,8 @@ async function openConfig() {
 function closeConfig() { document.getElementById('modal-config').classList.add('hidden'); }
 async function saveConfig() {
   const payload = {
-    bank: parseFloat(document.getElementById('cfg-bank').value || '2500'),
-    rate: parseFloat(document.getElementById('cfg-rate').value || '85'),
+    bank: parseFloat(document.getElementById('cfg-bank').value || '100'),
+    currency: 'USDT',
     pm_fee_pct: parseFloat(document.getElementById('cfg-fee').value || '4') / 100,
     safe_fork_threshold: parseFloat(document.getElementById('cfg-safe').value || '0.45'),
   };
@@ -1085,7 +1143,10 @@ async function saveConfig() {
     });
     const j = await r.json();
     if (j.ok) {
-      state.config = { ...state.config, ...payload };
+      state.config = { ...state.config, ...(j.config || payload) };
+      const bankInput = document.getElementById('risk-total-bank');
+      if (bankInput) bankInput.value = Number(state.config.bank || 100).toFixed(2);
+      updateBankLimit();
       toast('Настройки сохранены');
       closeConfig();
     } else {
@@ -1117,27 +1178,25 @@ function renderEditor() {
     if (l.source === 'Polymarket') pmSt = (a.stakes || [])[i] || 0;
     if (l.source && l.source !== 'Polymarket') bbSt = (a.stakes || [])[i] || 0;
   });
-  const rate = a.rate || state.config.rate || 85;
   document.getElementById('ed-match').textContent = a.title
     ? (a.title + ' — ' + (a.q || ''))
     : (a.q || a.slug);
   document.getElementById('ed-sub').textContent = `${a.market_type || ''} · ${a.sport || ''} · ${a.slug}`;
-  const pmUsd = rate > 0 ? pmSt / rate : pmSt;
+  const pmUsdt = pmSt;
 
   document.getElementById('ed-leg-0').innerHTML = `
     <div class="leg-head"><span class="lbl">Плечо 1</span><span class="leg-bk">${escapeHtml(bb.source || 'Букмекер')}</span></div>
     <div class="leg-field"><span class="lbl">Исход</span><input type="text" id="ed-bb-outcome" value="${escapeHtml(bb.outcome || '')}" readonly></div>
     <div class="leg-field"><span class="lbl">Коэффициент</span><input type="number" step="0.01" id="ed-bb-odds" value="${bb.o || 0}"></div>
-    <div class="leg-field"><span class="lbl">Ставка, ₽</span><input type="number" step="1" id="ed-bb-stake" value="${bbSt.toFixed(0)}"></div>
+    <div class="leg-field"><span class="lbl">Ставка, USDT</span><input type="number" step="0.01" id="ed-bb-stake" value="${bbSt.toFixed(2)}"></div>
   `;
   document.getElementById('ed-leg-1').innerHTML = `
     <div class="leg-head"><span class="lbl">Плечо 2</span><span class="leg-bk">Polymarket</span></div>
     <div class="leg-field"><span class="lbl">Исход</span><input type="text" id="ed-pm-outcome" value="${escapeHtml(pm.outcome || '')}" readonly></div>
     <div class="leg-field"><span class="lbl">Цена, ¢</span><input type="number" step="0.1" id="ed-pm-price" value="${Number(pm.pm_best_ask || a.pm_best_ask) > 0 ? (Number(pm.pm_best_ask || a.pm_best_ask) * 100).toFixed(1) : '0'}"></div>
-    <div class="leg-field"><span class="lbl">Ордер, $</span><input type="number" step="0.01" id="ed-pm-amount" value="${pmUsd.toFixed(2)}"></div>
-    <div class="leg-field"><span class="lbl">Курс ₽/$</span><input type="number" step="0.01" id="ed-rate" value="${rate.toFixed(2)}"></div>
+    <div class="leg-field"><span class="lbl">Ордер, USDT</span><input type="number" step="0.01" id="ed-pm-amount" value="${pmUsdt.toFixed(2)}"></div>
   `;
-  ['ed-bb-odds','ed-bb-stake','ed-pm-price','ed-pm-amount','ed-rate'].forEach(id => {
+  ['ed-bb-odds','ed-bb-stake','ed-pm-price','ed-pm-amount'].forEach(id => {
     const el = document.getElementById(id);
     if (el) el.addEventListener('input', recalcEditor);
   });
@@ -1150,13 +1209,11 @@ function recalcEditor() {
   const bbSt = parseFloat(document.getElementById('ed-bb-stake').value || '0');
   const pmPrice = parseFloat(document.getElementById('ed-pm-price').value || '0') / 100;
   const pmUsd = parseFloat(document.getElementById('ed-pm-amount').value || '0');
-  const rate = parseFloat(document.getElementById('ed-rate').value || '85');
   const FEE = state.config.pm_fee_pct ?? 0.04;
   const pmO = pmPrice > 0 ? (1 / pmPrice) / (1 + FEE) : 0;
-  const pmRub = pmUsd * rate;
-  const bank = bbSt + pmRub;
+  const bank = bbSt + pmUsd;
   const pay1 = bbSt * bbO;
-  const pay2 = pmRub * pmO;
+  const pay2 = pmUsd * pmO;
   const minPay = Math.min(pay1, pay2);
   const profit = minPay - bank;
   const roi = bank > 0 ? profit / bank : 0;
@@ -1167,8 +1224,8 @@ function recalcEditor() {
   roiEl.textContent = fmtPct(roi);
   roiEl.style.color = roi >= 0 ? 'var(--green)' : 'var(--red)';
   a._calc = {
-    bb_odds: bbO, bb_stake_rub: bbSt,
-    pm_price: pmPrice, pm_amount_usd: pmUsd, rate,
+    bb_odds: bbO, bb_stake_usdt: bbSt,
+    pm_price: pmPrice, pm_amount_usdt: pmUsd, rate: 1.0,
     bank, payout: minPay, profit, roi,
   };
 }
@@ -1178,13 +1235,13 @@ async function saveTrade() {
   const payload = {
     slug: a.slug, q: a.q, sport: a.sport, market_type: a.market_type,
     bank: a._calc.bank, profit: a._calc.profit, roi: a._calc.roi,
-    payout: a._calc.payout, rate: a._calc.rate,
+    payout: a._calc.payout, rate: 1.0, currency: 'USDT',
     legs: [
       { book: ((a.bets.find(b => b.source && b.source !== 'Polymarket') || {}).source) || 'Букмекер', outcome: ((a.bets.find(b => b.source && b.source !== 'Polymarket') || {}).outcome) || '',
-        odds: a._calc.bb_odds, stake_rub: a._calc.bb_stake_rub },
+        odds: a._calc.bb_odds, stake_usdt: a._calc.bb_stake_usdt },
       { book: 'Polymarket', outcome: ((a.bets.find(b => b.source === 'Polymarket') || {}).outcome) || '',
-        price_usd: a._calc.pm_price, amount_usd: a._calc.pm_amount_usd,
-        stake_rub: a._calc.pm_amount_usd * a._calc.rate },
+        price_usd: a._calc.pm_price, amount_usd: a._calc.pm_amount_usdt,
+        amount_usdt: a._calc.pm_amount_usdt, stake_usdt: a._calc.pm_amount_usdt },
     ],
   };
   try {
@@ -1240,7 +1297,7 @@ async function checkPM() {
               '<td>' + (b.best_bid ? b.best_bid.toFixed(4) : '\u2014') + '</td>' +
               '<td>' + (b.best_ask ? b.best_ask.toFixed(4) : '\u2014') + '</td>' +
               '<td>k=' + (b.best_ask ? ((1 / b.best_ask) / (1 + FEE)).toFixed(4) : '\u2014') + '</td>' +
-              '<td>$' + (b.ask_depth_usd || 0) + '</td></tr>'
+              '<td>' + Number(b.ask_depth_usd || 0).toFixed(2) + ' USDT</td></tr>'
         ).join('') + '</tbody>' +
       '</table>';
   } catch (e) { body.innerHTML = '<div class="pm-check-err">' + escapeHtml(e.message) + '</div>'; }
@@ -1305,12 +1362,12 @@ async function showTrades() {
       return '<div class="trade-item">' +
         '<div class="head">' +
           '<span class="slug">' + escapeHtml(t.q || t.slug || '') + '</span>' +
-          '<span class="profit ' + cls + '">' + (profit >= 0 ? '+' : '') + Math.round(profit) + ' \u20BD</span>' +
+          '<span class="profit ' + cls + '">' + (profit >= 0 ? '+' : '') + fmtHistoricalAmount(profit, t.currency) + '</span>' +
         '</div>' +
         '<div class="legs"><div>1) ' + escapeHtml(leg1) + '</div><div>2) ' + escapeHtml(leg2) + '</div></div>' +
         '<div class="meta">' +
           '<span>' + escapeHtml((t.ts || '').replace('T', ' ')) + '</span>' +
-          '<span>\u0431\u0430\u043D\u043A: <b>' + Math.round(Number(t.bank || 0)) + '\u20BD</b></span>' +
+          '<span>\u0431\u0430\u043D\u043A: <b>' + fmtHistoricalAmount(t.bank, t.currency) + '</b></span>' +
           '<span>ROI: <b>' + (Number(t.roi || 0) * 100).toFixed(3) + '%</b></span>' +
         '</div>' +
       '</div>';
@@ -1363,7 +1420,7 @@ async function loadWeekly() {
       const pct = Math.abs(roi) / maxAbs * 100;
       const isProfit = roi >= 0;
       const dt = (d.date || '').slice(5);
-      const profitTxt = d.profit ? (d.profit >= 0 ? '+' : '') + Math.round(d.profit) + '\u20BD' : '';
+      const profitTxt = d.profit ? (d.profit >= 0 ? '+' : '') + fmtMoney(d.profit) : '';
       return '<div class="wk-col">' +
         '<div class="wk-profit ' + (isProfit ? 'pos' : 'neg') + '">' + profitTxt + '</div>' +
         '<div class="wk-bar-wrap"><div class="wk-bar ' + (isProfit ? 'pos' : 'neg') + '" style="height:' + pct + '%"></div></div>' +
@@ -1387,11 +1444,11 @@ async function loadRecent() {
       return '<div class="rt-item">' +
         '<div class="rt-head">' +
           '<div class="rt-slug">' + escapeHtml((t.q || t.slug || '').slice(0, 42)) + '</div>' +
-          '<div class="rt-profit ' + cls + '">' + (profit >= 0 ? '+' : '') + Math.round(profit) + '\u20BD</div>' +
+          '<div class="rt-profit ' + cls + '">' + (profit >= 0 ? '+' : '') + fmtHistoricalAmount(profit, t.currency) + '</div>' +
         '</div>' +
         '<div class="rt-meta">' +
           '<span>ROI ' + (Number(t.roi || 0) * 100).toFixed(2) + '%</span>' +
-          '<span>\u0431\u0430\u043D\u043A ' + Math.round(Number(t.bank || 0)) + '\u20BD</span>' +
+          '<span>\u0431\u0430\u043D\u043A ' + fmtHistoricalAmount(t.bank, t.currency) + '</span>' +
         '</div>' +
       '</div>';
     }).join('');
@@ -1463,7 +1520,7 @@ function init() {
   const filled = document.getElementById('btn-filled');
   if (filled) filled.addEventListener('click', markFilled);
 
-  ['calc-bk-odds','calc-bk-stake','calc-pm-price','calc-pm-stake','calc-rate'].forEach(id => {
+  ['calc-bk-odds','calc-bk-stake','calc-pm-price','calc-pm-stake'].forEach(id => {
     const el = document.getElementById(id);
     if (el) el.addEventListener('input', () => { state.calcEdited = true; updateCalcHint(); });
   });
@@ -1474,7 +1531,6 @@ function init() {
     document.getElementById('calc-bk-stake').value = 0;
     document.getElementById('calc-pm-price').value = 0;
     document.getElementById('calc-pm-stake').value = 0;
-    document.getElementById('calc-rate').value = state.config.rate || 85;
     updateCalcHint();
   });
   const myArbsBtn = document.getElementById('btn-my-arbs');
@@ -1482,8 +1538,7 @@ function init() {
 
   const totalBank = document.getElementById('risk-total-bank');
   if (totalBank) {
-    try { totalBank.value = localStorage.getItem('poly_arb_total_bank') || ''; } catch (e) {}
-    totalBank.addEventListener('input', updateBankLimit);
+    totalBank.value = Number(state.config.bank || 100).toFixed(2);
     updateBankLimit();
   }
 
@@ -1500,7 +1555,10 @@ function init() {
   setInterval(checkWsFreshness, 5000);
   document.addEventListener('visibilitychange', checkWsFreshness);
   setInterval(loadDaily, 30000);
-  setInterval(() => { if (state.visible.length) renderArbs(); }, 2000);
+  setInterval(() => {
+    if (state.visible.length) renderArbs();
+    renderPinnedSnapshots();
+  }, 1000);
 
   loadDaily();
   connectWS();

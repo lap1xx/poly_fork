@@ -67,6 +67,9 @@ GAMMA = HT + "gamma-api" + DOT + "polymarket" + DOT + "com"
 WS_URL = WSS + "ws-subscriptions-clob" + DOT + "polymarket" + DOT + "com" + "/ws/market"
 PM_FEE_PCT = 0.04
 CBR_URL = HT + "www" + DOT + "cbr" + DOT + "ru" + "/scripts/XML_daily.asp"
+BANKROLL_PLAN_LIMIT = 0.40
+PINNED_SIGNAL_TTL_SEC = 300.0
+PINNED_SIGNAL_MIN_ROI = 0.05
 
 TIMEOUT = 15.0
 PM_CATALOG_TIMEOUT = (3.0, 5.0)
@@ -93,7 +96,7 @@ def _notify_pm_update(token_id):
         except Exception:
             pass
 
-RUB = " RUB"
+USDT = " USDT"
 
 
 class C:
@@ -123,8 +126,9 @@ STATUS_FILE = "scanner_status.json"
 BK_FILE = "bk_profiles.json"
 
 DEFAULT_CFG = {
-    "bank": 20000,
-    "rate": 0,
+    "bank": 100,
+    "currency": "USDT",
+    "rate": 1.0,
     "poll": 1.0,
     "slip": 0.0,
     "live_min_roi_show": -3.0,
@@ -163,6 +167,22 @@ def load_cfg():
             c = json.load(f)
         o = dict(DEFAULT_CFG)
         o.update(c)
+        if str(c.get("currency", "")).upper() != "USDT":
+            legacy_bank = c.get("bank")
+            legacy_rate = c.get("rate")
+            try:
+                legacy_bank = float(legacy_bank)
+                legacy_rate = float(legacy_rate)
+                if math.isfinite(legacy_bank) and legacy_bank > 0 and math.isfinite(legacy_rate) and legacy_rate > 0:
+                    o["bank"] = round(legacy_bank / legacy_rate, 2)
+                elif math.isfinite(legacy_bank) and legacy_bank > 0:
+                    o["bank"] = 100.0
+            except (TypeError, ValueError):
+                o["bank"] = 100.0
+            o["currency"] = "USDT"
+            o["rate"] = 1.0
+            with open(CFG_FILE, "w", encoding="utf-8") as f:
+                json.dump(o, f, ensure_ascii=False, indent=2)
         return o
     except Exception:
         return dict(DEFAULT_CFG)
@@ -237,26 +257,20 @@ def log_csv(slug, sport, roi, profit):
         pass
 
 
-def log_arb_json(slug, sport, roi, bank, profit, payout_rub, bets, stakes,
+def log_arb_json(slug, sport, roi, bank, profit, payout_usdt, bets, stakes,
                  m, rate, first_seen_ts=0.0):
     try:
         legs = []
         for i, b in enumerate(bets):
-            stake_rub = float(stakes[i]) if i < len(stakes) else 0.0
+            stake_usdt = float(stakes[i]) if i < len(stakes) else 0.0
             src = b.get("source", "")
-            if src == "Polymarket":
-                currency = "USD"
-                stake_native = stake_rub / rate if rate > 0 else 0.0
-            else:
-                currency = "RUB"
-                stake_native = stake_rub
             legs.append({
                 "book": src,
                 "selection": b.get("outcome", ""),
                 "odds": round(float(b.get("o", 0)), 4),
-                "stake_native": round(stake_native, 2),
-                "currency": currency,
-                "stake_rub": round(stake_rub, 2),
+                "stake_native": round(stake_usdt, 2),
+                "currency": "USDT",
+                "stake_usdt": round(stake_usdt, 2),
             })
         rec = {
             "ts": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
@@ -267,10 +281,12 @@ def log_arb_json(slug, sport, roi, bank, profit, payout_rub, bets, stakes,
             "live": classify_event_phase(m) == "live",
             "streamer": bool(is_streamer(slug, m.get("q", ""))),
             "roi": round(roi, 5),
-            "bank_rub": round(bank, 2),
-            "profit_rub": round(profit, 2),
-            "payout_rub": round(payout_rub, 2),
-            "rate_usdrub": round(rate, 4),
+            "currency": "USDT",
+            "bank_usdt": round(bank, 2),
+            "plan_exposure_usdt": round(sum(float(x) for x in stakes), 2),
+            "risk_limit_pct": round(BANKROLL_PLAN_LIMIT * 100.0, 2),
+            "profit_usdt": round(profit, 2),
+            "payout_usdt": round(payout_usdt, 2),
             "first_seen_ts": round(first_seen_ts, 3),
             "legs": legs,
         }
@@ -923,6 +939,16 @@ def resolve_usd_rub_rate(cbr_rate, configured_rate):
     return None
 
 
+def _risk_capped_plan_bank(total_bank):
+    try:
+        bank = float(total_bank)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(bank) or bank <= 0:
+        return 0.0
+    return bank * BANKROLL_PLAN_LIMIT
+
+
 def eff_mult(odds, comm, slip):
     try:
         odds, comm, slip = float(odds), float(comm), float(slip)
@@ -970,7 +996,7 @@ def alert_due(changed, last_alert_ts, now, alert_gap):
 
 
 def refine_stakes(bets, result, rate):
-    if not result or not rate or rate <= 0:
+    if not result:
         return None
     bank = sum(float(x) for x in result.get("stakes", []))
     if not math.isfinite(bank) or bank <= 0:
@@ -980,19 +1006,18 @@ def refine_stakes(bets, result, rate):
         for i, b in enumerate(bets):
             if b.get("source") != "Polymarket":
                 continue
-            stake_rub = result["stakes"][i]
-            if stake_rub <= 0:
+            stake_usdt = result["stakes"][i]
+            if stake_usdt <= 0:
                 continue
             ba = best_ask(b.get("token", ""))
             if ba <= 0:
                 return None
-            shares = stake_rub / (ba * rate)
+            shares = stake_usdt / ba
             avg = walk_book(b.get("token", ""), shares)
             if not avg or avg <= 0:
                 return None
-            # A RUB stake buys stake_rub/(price_usd*rate) shares, then pays
-            # one USD per winning share. Converting the payout back to RUB
-            # cancels `rate`; the multiplier is 1/avg_price, not 1/(avg*rate).
+            # Both legs are denominated in USDT; a PM share costs its ask in
+            # USDT-equivalent and pays one USDT per winning share.
             new_o = (1.0 / avg) / (1.0 + PM_FEE_PCT)
             if abs(new_o - b["o"]) / b["o"] > 0.0005:
                 b["o"] = new_o
@@ -1263,12 +1288,7 @@ def print_arb(m, bets, r, rate, first_seen, bk):
         else:
             src_col = C.G
 
-        if src == "Polymarket" and rate and rate > 0:
-            stake_str = "$%.2f" % (st / rate)
-            if (st / rate) < 1.0:
-                stake_str += " !"
-        else:
-            stake_str = "%.0f RUB" % st
+        stake_str = "%.2f USDT" % st
 
         row1 = "  %s%-12s%s %-12s %-26s" % (
             src_col, src, C.RST, speed_str, b["outcome"][:26],
@@ -1282,8 +1302,8 @@ def print_arb(m, bets, r, rate, first_seen, bk):
     roi_col = color_roi(r["roi"])
     print("  ROI:      %s%+.2f%%%s" % (roi_col, r["roi"] * 100, C.RST))
     profit_b = r["payout"] - (r["payout"] / (1 + r["roi"]))
-    print("  Profit:   %s%.0f%s%s" % (C.G, profit_b, RUB, C.RST))
-    print("  Payout:   %s%.0f%s%s" % (C.W, r["payout"], RUB, C.RST))
+    print("  Profit:   %s%.2f%s%s" % (C.G, profit_b, USDT, C.RST))
+    print("  Payout:   %s%.2f%s%s" % (C.W, r["payout"], USDT, C.RST))
     print("  Type:     " + phase_color + phase_label + C.RST)
 
 
@@ -1380,8 +1400,8 @@ def build_arb_candidates(m, live_bc, slip, bank=0.0, rate=0.0,
 
     usd_target = 50.0
     try:
-        if bank and rate and rate > 0:
-            usd_target = max(20.0, min(200.0, bank / rate * 0.5))
+        if bank and bank > 0:
+            usd_target = max(20.0, min(200.0, bank * 0.5))
     except Exception:
         pass
 
@@ -1572,6 +1592,58 @@ def _prune_recent_signal_drops(drops, now):
     return [row for _slug, row in ordered[:MAX_RECENT_SIGNAL_DROPS]]
 
 
+def _pinned_signal_key(snapshot):
+    bets = snapshot.get("bets") or []
+    pm_leg = next((leg for leg in bets if leg.get("source") == "Polymarket"), {})
+    bk_leg = next((leg for leg in bets if leg.get("source") != "Polymarket"), {})
+    return "|".join((
+        str(snapshot.get("slug") or ""),
+        str(pm_leg.get("token") or ""),
+        str(pm_leg.get("outcome") or ""),
+        str(bk_leg.get("source") or ""),
+        str(bk_leg.get("outcome") or ""),
+    ))
+
+
+def _prune_pinned_signal_snapshots(snapshots, now):
+    for key, row in list(snapshots.items()):
+        try:
+            expires_at = float(row.get("expires_at") or 0.0)
+        except (AttributeError, TypeError, ValueError):
+            expires_at = 0.0
+        if not math.isfinite(expires_at) or expires_at <= now:
+            snapshots.pop(key, None)
+    ordered = sorted(
+        snapshots.items(),
+        key=lambda item: float(item[1].get("locked_at") or 0.0),
+        reverse=True,
+    )
+    return [row for _key, row in ordered]
+
+
+def _pin_signal_snapshot(snapshots, snapshot, now=None):
+    now = time.time() if now is None else float(now)
+    _prune_pinned_signal_snapshots(snapshots, now)
+    try:
+        roi = float(snapshot.get("roi"))
+    except (AttributeError, TypeError, ValueError):
+        return False
+    if not math.isfinite(roi) or roi < PINNED_SIGNAL_MIN_ROI:
+        return False
+    key = _pinned_signal_key(snapshot)
+    if not key or key in snapshots:
+        return False
+    frozen = json.loads(json.dumps(snapshot, ensure_ascii=False))
+    frozen["currency"] = "USDT"
+    frozen["locked_at"] = now
+    frozen["expires_at"] = now + PINNED_SIGNAL_TTL_SEC
+    frozen["snapshot_roi_pct"] = round(roi * 100.0, 3)
+    frozen["inactive_snapshot"] = True
+    snapshots[key] = frozen
+    _prune_pinned_signal_snapshots(snapshots, now)
+    return True
+
+
 # =================================================================
 #                              main
 # =================================================================
@@ -1582,9 +1654,9 @@ def main():
     ap.add_argument("--live", action="store_true",
                     help="deprecated legacy flag; Gamma metadata determines event phase")
     ap.add_argument("--poll", type=float, default=0.3, help="seconds between checks")
-    ap.add_argument("--bank", type=float, default=0.0, help="override bank size (RUB)")
-    ap.add_argument("--min-roi", type=float, default=0.3,
-                    help="show arbs with roi >= this %% (default 0.3)")
+    ap.add_argument("--bank", type=float, default=0.0, help="override total bank size (USDT)")
+    ap.add_argument("--min-roi", type=float, default=3.0,
+                    help="show arbs with roi >= this %% (default 3.0)")
     ap.add_argument("--no-bb", action="store_true", help="disable BetBoom fallback; keep 1win")
     ap.add_argument("--watch", action="store_true", help="auto-refresh PM live markets")
     ap.add_argument("--watch-sec", type=int, default=60, help="watch refresh interval")
@@ -1598,7 +1670,7 @@ def main():
     bk  = load_bk()
     init_db()
 
-    bank    = args.bank if args.bank > 0 else float(cfg.get("bank", 20000))
+    bank    = args.bank if args.bank > 0 else float(cfg.get("bank", 100))
     slip    = float(cfg.get("slip", 0.0))
     poll    = args.poll if args.poll > 0 else float(cfg.get("poll", 1.0))
     min_roi = args.min_roi / 100.0
@@ -1647,7 +1719,8 @@ def main():
             "pm_catalog_fetch": get_pm_catalog_diagnostics(),
             "signals": 0,
             "min_roi_pct": round(min_roi * 100, 3),
-            "bank_rub": round(bank, 2),
+            "bank_usdt": round(bank, 2),
+            "currency": "USDT",
         })
 
     # ---------- BK bridge: 1win primary; BetBoom is a fallback ----------
@@ -1708,16 +1781,9 @@ def main():
           % (bound_ow, bound_bb, len(market_map)))
     _write_match_diagnostics(router, market_map)
 
-    # ---------- CBR rate ----------
-    cbr_rate = get_rate()
-    rate = resolve_usd_rub_rate(cbr_rate, cfg.get("rate"))
-    if rate is None:
-        print("[!] no valid USD/RUB rate; set config.rate or restore CBR access")
-        return 1
-    if resolve_usd_rub_rate(cbr_rate, None) is None:
-        print("[!] CBR unavailable; using configured USD/RUB = %.3f" % rate)
-    else:
-        print("[*] USD/RUB = %.3f" % rate)
+    # Both bookmaker stakes and PM shares are displayed and calculated in USDT.
+    rate = 1.0
+    print("[*] stake currency: USDT (1 USDT assumed as 1 USD-equivalent for PM quotes)")
 
     # ---------- PM feed ----------
     tokens = sorted({t for m in market_map.values() for t in (m.get("t") or [])})
@@ -1797,6 +1863,8 @@ def main():
         "pm_catalog_retained": pm_catalog_retained,
         "pm_catalog_fetch": get_pm_catalog_diagnostics(),
         "recent_signal_drops": [],
+        "pinned_signal_snapshots": [],
+        "currency": "USDT",
         "min_roi_pct": round(min_roi * 100, 3),
     }
     _write_scan_status(last_scan_status)
@@ -1817,6 +1885,7 @@ def main():
 
     live_snap = {}
     recent_signal_drops = {}
+    pinned_signal_snapshots = {}
     best_by_slug = {}
     best_by_slug_updated_at = {}
     initial_dirty = set(market_map)
@@ -1825,6 +1894,7 @@ def main():
     last_publish = 0.0
     last_phase_refresh = 0.0
     last_router_health_refresh = 0.0
+    last_bank_config_check = 0.0
     router_stats_cache = {}
     router_feed_health_cache = {}
     phase_counts_cache = {"live": 0, "prematch": 0, "unknown": 0}
@@ -1833,6 +1903,17 @@ def main():
     try:
         while not STOP.is_set():
             now = time.time()
+            if args.bank <= 0 and now - last_bank_config_check >= 1.0:
+                last_bank_config_check = now
+                try:
+                    configured_bank = float(load_cfg().get("bank", bank))
+                    if math.isfinite(configured_bank) and configured_bank > 0 \
+                            and abs(configured_bank - bank) >= 0.005:
+                        bank = configured_bank
+                        initial_dirty.update(market_map)
+                        print("[*] bankroll updated from dashboard config: %.2f USDT" % bank)
+                except (TypeError, ValueError):
+                    pass
             source_events = update_queue.drain(timeout=min(0.1, max(0.01, poll)))
             dirty_slugs = resolve_dirty_slugs(source_events, token_index, match_index)
             source_event_at = min(
@@ -1975,7 +2056,8 @@ def main():
                 candidate_diagnostics = {}
                 market_depth_rejects = 0
                 market_invalid_calculations = 0
-                pairs = build_arb_candidates(m, live_bc, slip, bank, rate,
+                plan_bank = _risk_capped_plan_bank(bank)
+                pairs = build_arb_candidates(m, live_bc, slip, plan_bank, rate,
                                              bk_source=_bk_src,
                                              diagnostics=candidate_diagnostics,
                                              pm_diagnostics=pm_no_ask_details,
@@ -1989,7 +2071,7 @@ def main():
                     scan_counts[_reason] = scan_counts.get(_reason, 0) + _count
                 scan_counts["candidate_pairs"] += len(pairs)
                 for bets in pairs:
-                    r = compute(bets, bank)
+                    r = compute(bets, plan_bank)
                     if not r:
                         scan_counts["invalid_calculation"] += 1
                         market_invalid_calculations += 1
@@ -2058,14 +2140,17 @@ def main():
                         _bk_leg = next((b for b in bets
                                         if b.get("source") != "Polymarket"), {})
                         _bk_age = _bk_leg.get("odds_age_sec")
+                        _display_stakes = [float(x) for x in r["stakes"]]
                         candidate_snapshot = {
                             "slug": slug,
                             "q": m.get("q", ""),
                             "sport": detect_sport(slug),
                             "market_type": detect_market_type(slug, m.get("q", "")),
                             "roi": float(roi),
-                            "bank": float(bank),
-                            "rate": float(rate or 0),
+                            "bank": sum(_display_stakes),
+                            "total_bank": float(bank),
+                            "currency": "USDT",
+                            "rate": 1.0,
                             "bets": [
                                 {
                                     "source": b.get("source"),
@@ -2083,7 +2168,7 @@ def main():
                                     "odds_age_sec": b.get("odds_age_sec"),
                                 } for b in bets
                             ],
-                            "stakes": [float(x) for x in r["stakes"]],
+                            "stakes": _display_stakes,
                             "payout": float(r["payout"]),
                             "profit": float(_prf),
                             "phase": phase,
@@ -2105,6 +2190,10 @@ def main():
                             "bb_stakes_debug": _bb_stakes_debug,
                             "ts": time.time(),
                         }
+                        _pin_signal_snapshot(
+                            pinned_signal_snapshots, candidate_snapshot,
+                            now=candidate_snapshot["ts"],
+                        )
                         current = live_snap.get(slug)
                         if current is None or candidate_snapshot["roi"] > current["roi"]:
                             live_snap[slug] = candidate_snapshot
@@ -2156,12 +2245,12 @@ def main():
                         pm_st = bk_st = 0.0
                         for i, b in enumerate(bets):
                             if b.get("source") == "Polymarket":
-                                pm_st = r["stakes"][i] / rate if rate and rate > 0 else r["stakes"][i]
+                                pm_st = r["stakes"][i]
                             else:
                                 bk_st = r["stakes"][i]
                         profit_upd = r["profit"]
                         prefix = "~" if changed else "="
-                        print("  [%s] %s [%s] upd#%-3d  PM %.2f/$%.2f  %s %.2f/%.0fR  ROI %+.1f%% (was %+.1f%%)  profit +%.0fR" % (
+                        print("  [%s] %s [%s] upd#%-3d  PM %.2f/%.2f USDT  %s %.2f/%.2f USDT  ROI %+.1f%% (was %+.1f%%)  profit +%.2f USDT" % (
                             prefix,
                             slug[:38],
                             detect_market_type(slug, m.get("q", "")),
@@ -2259,6 +2348,9 @@ def main():
             recent_signal_drop_rows = _prune_recent_signal_drops(
                 recent_signal_drops, _now
             )
+            pinned_signal_rows = _prune_pinned_signal_snapshots(
+                pinned_signal_snapshots, _now
+            )
 
             last_scan_status = {
                 "state": "running",
@@ -2287,6 +2379,7 @@ def main():
                 "pm_catalog_fetch": get_pm_catalog_diagnostics(),
                 "signals": len(live_snap),
                 "recent_signal_drops": recent_signal_drop_rows,
+                "pinned_signal_snapshots": pinned_signal_rows,
                 "min_roi_pct": round(min_roi * 100, 3),
                 "best_candidate_roi_pct": round(best_candidate_roi * 100, 3)
                 if best_candidate_roi is not None else None,
@@ -2299,8 +2392,8 @@ def main():
                 if batch_best_candidate_roi is not None else None,
                 "best_candidate_batch_slug": batch_best_candidate_slug,
                 "best_candidate_batch_scope": "last_dispatch_batch",
-                "bank_rub": round(bank, 2),
-                "usd_rub": round(rate, 4),
+                "bank_usdt": round(bank, 2),
+                "currency": "USDT",
             }
             if _now - last_status_write >= 1.0:
                 _write_scan_status(last_scan_status)

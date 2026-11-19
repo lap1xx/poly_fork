@@ -126,8 +126,12 @@ def _load_config():
     if not isinstance(cfg, dict):
         cfg = {}
 
-    rate = _finite_number(cfg.get("rate"), 0.01, 100_000.0) or 85.0
-    bank = _finite_number(cfg.get("bank"), 1.0, 1_000_000_000.0) or 2500.0
+    raw_bank = _finite_number(cfg.get("bank"), 0.01, 1_000_000_000.0)
+    bank = raw_bank if raw_bank is not None else 100.0
+    if raw_bank is not None and str(cfg.get("currency", "")).upper() != "USDT":
+        legacy_rate = _finite_number(cfg.get("rate"), 0.01, 100_000.0) or 85.0
+        bank = round(raw_bank / legacy_rate, 2)
+    rate = 1.0
 
     bot_cfg = cfg.get("bot") if isinstance(cfg.get("bot"), dict) else {}
     poll = _finite_number((bot_cfg or {}).get("poll", cfg.get("poll", 0.3)),
@@ -153,6 +157,7 @@ def _load_config():
     return {
         "rate": rate,
         "bank": bank,
+        "currency": "USDT",
         "poll": poll,
         "pm_fee_pct": pm_fee_pct,
         "safe_fork_threshold": safe_threshold,
@@ -592,7 +597,6 @@ async def api_config_save(payload: dict):
             cfg = {}
         limits = {
             "bank": (1.0, 1_000_000_000.0),
-            "rate": (0.01, 100_000.0),
             "pm_fee_pct": (0.0, 1.0),
             "safe_fork_threshold": (0.01, 0.99),
         }
@@ -603,6 +607,8 @@ async def api_config_save(payload: dict):
                     return JSONResponse({"ok": False, "err": "invalid " + k},
                                         status_code=422)
                 cfg[k] = value
+        cfg["currency"] = "USDT"
+        cfg["rate"] = 1.0
         _save_json(CONFIG_FILE, cfg)
         return {"ok": True, "config": _load_config()}
     except Exception as e:
@@ -624,6 +630,20 @@ async def api_unhide(slug: str):
     _save_hidden()
     return {"ok": True, "hidden": sorted(_hidden)}
 
+
+def _trade_amount_usdt(trade, field):
+    """Normalize legacy RUB records with their saved FX rate; new records are USDT."""
+    amount = _finite_number(trade.get(field), -1_000_000_000.0, 1_000_000_000.0)
+    if amount is None:
+        return None
+    currency = str(trade.get("currency") or "RUB").upper()
+    if currency == "USDT":
+        return amount
+    if currency != "RUB":
+        return None
+    rate = _finite_number(trade.get("rate"), 0.01, 100_000.0)
+    return amount / rate if rate else None
+
 @app.post("/api/trade")
 async def api_trade(payload: dict):
     if not isinstance(payload, dict):
@@ -637,13 +657,19 @@ async def api_trade(payload: dict):
     roi = _finite_number(payload.get("roi"), -1.0, 1000.0)
     payout = _finite_number(payload.get("payout"), 0.0, 1_000_000_000.0)
     rate = _finite_number(payload.get("rate"), 0.01, 100_000.0)
+    currency = str(payload.get("currency") or "RUB").upper()
     legs = payload.get("legs")
-    if None in (bank, profit, roi, payout, rate) or not isinstance(legs, list) or len(legs) != 2:
+    if (None in (bank, profit, roi, payout, rate)
+            or currency not in {"USDT", "RUB"}
+            or not isinstance(legs, list) or len(legs) != 2):
         return JSONResponse({"ok": False, "err": "invalid trade fields"}, status_code=422)
     clean_legs = []
     numeric_leg_fields = {
-        "odds": (1.000001, 1_000_000.0), "stake_rub": (0.01, 1_000_000_000.0),
+        "odds": (1.000001, 1_000_000.0),
+        "stake_rub": (0.01, 1_000_000_000.0),
+        "stake_usdt": (0.01, 1_000_000_000.0),
         "price_usd": (0.000001, 0.999999), "amount_usd": (0.01, 1_000_000_000.0),
+        "amount_usdt": (0.01, 1_000_000_000.0),
     }
     for leg in legs:
         if not isinstance(leg, dict):
@@ -667,7 +693,8 @@ async def api_trade(payload: dict):
         "q": payload.get("q", "") if isinstance(payload.get("q", ""), str) else "",
         "sport": payload.get("sport", "") if isinstance(payload.get("sport", ""), str) else "",
         "market_type": payload.get("market_type", "") if isinstance(payload.get("market_type", ""), str) else "",
-        "bank": bank, "profit": profit, "roi": roi, "payout": payout, "rate": rate,
+        "bank": bank, "profit": profit, "roi": roi, "payout": payout,
+        "rate": rate, "currency": currency,
         "legs": clean_legs,
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
@@ -716,12 +743,18 @@ async def api_daily(date: str = ""):
                     trades.append(rec)
             except Exception:
                 continue
-    n = len(trades)
-    bank_sum = sum(float(t.get("bank", 0)) for t in trades)
-    profit_sum = sum(float(t.get("profit", 0)) for t in trades)
+    normalized = []
+    for trade in trades:
+        bank_usdt = _trade_amount_usdt(trade, "bank")
+        profit_usdt = _trade_amount_usdt(trade, "profit")
+        if bank_usdt is not None and profit_usdt is not None:
+            normalized.append((bank_usdt, profit_usdt))
+    n = len(normalized)
+    bank_sum = sum(row[0] for row in normalized)
+    profit_sum = sum(row[1] for row in normalized)
     roi = (profit_sum / bank_sum) if bank_sum > 0 else 0.0
     return {
-        "date": date, "count": n,
+        "date": date, "count": n, "currency": "USDT",
         "bank": bank_sum, "profit": profit_sum, "roi": roi,
     }
 
@@ -744,17 +777,22 @@ async def api_weekly():
                         trades.append(rec)
                 except Exception:
                     continue
-        bank = sum(float(t.get("bank", 0)) for t in trades)
-        profit = sum(float(t.get("profit", 0)) for t in trades)
+        normalized = [
+            (_trade_amount_usdt(t, "bank"), _trade_amount_usdt(t, "profit"))
+            for t in trades
+        ]
+        normalized = [row for row in normalized if None not in row]
+        bank = sum(row[0] for row in normalized)
+        profit = sum(row[1] for row in normalized)
         roi = (profit / bank) if bank > 0 else 0.0
-        out.append({"date": d, "roi": roi, "profit": profit, "count": len(trades)})
+        out.append({"date": d, "roi": roi, "profit": profit, "count": len(normalized), "currency": "USDT"})
     return {"days": out}
 
 @app.get("/api/export_csv")
 async def api_export_csv():
     output = io.StringIO(newline="")
     writer = csv.writer(output)
-    writer.writerow(["ts", "slug", "q", "sport", "market_type", "bank", "profit", "roi"])
+    writer.writerow(["ts", "slug", "q", "sport", "market_type", "currency", "bank", "profit", "roi"])
     if not TRADES_FILE.exists():
         return PlainTextResponse(output.getvalue(), media_type="text/csv")
     for line in TRADES_FILE.read_text(encoding="utf-8").splitlines():
@@ -763,8 +801,9 @@ async def api_export_csv():
             continue
         try:
             r = json.loads(line)
+            r.setdefault("currency", "RUB")
             writer.writerow([_csv_safe(r.get(key, "")) for key in
-                             ("ts", "slug", "q", "sport", "market_type", "bank", "profit", "roi")])
+                             ("ts", "slug", "q", "sport", "market_type", "currency", "bank", "profit", "roi")])
         except Exception:
             continue
     return PlainTextResponse(output.getvalue(), media_type="text/csv",
