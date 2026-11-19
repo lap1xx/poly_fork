@@ -1,3 +1,4 @@
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -100,6 +101,33 @@ class BKRouterPriorityTests(unittest.TestCase):
         one_win.get_global_stream = Mock(return_value=stream)
         self.assertEqual(router.feed_health(), {"1win": expected})
         one_win.get_global_stream.assert_called_once_with()
+
+    def test_stats_counts_fresh_pairs_only_for_current_onewin_bindings(self):
+        router, one_win, _ = self._router(None, None)
+        live_slug = "cs2-alpha-bravo-winner"
+        stale_slug = "cs2-charlie-delta-winner"
+        bb_slug = "cs2-echo-foxtrot-winner"
+        stream = SimpleNamespace(
+            matches={"501": {}},
+            lock=threading.RLock(),
+            live_bc=Mock(side_effect=lambda slug: {"pair": True} if slug == live_slug else {}),
+        )
+        one_win.get_global_stream = Mock(return_value=stream)
+        router.bindings = {
+            live_slug: ("1win", {"match_id": 501}),
+            stale_slug: ("1win", {"match_id": 502}),
+            bb_slug: ("BetBoom", {"match_id": 503}),
+        }
+
+        stats = router.stats([live_slug, stale_slug, bb_slug])
+
+        self.assertEqual(stats["bindings"], 3)
+        self.assertEqual(stats["bound_1win"], 2)
+        self.assertEqual(stats["bound_betboom"], 1)
+        self.assertEqual(stats["onewin_fresh_pairs"], 1)
+        self.assertEqual(stream.live_bc.call_count, 2)
+        stream.live_bc.assert_any_call(live_slug)
+        stream.live_bc.assert_any_call(stale_slug)
 
     def test_invalid_market_shape_is_rejected_before_provider_calls(self):
         router, one_win, betboom = self._router({"provider": "1win"}, {"provider": "BetBoom"})

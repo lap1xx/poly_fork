@@ -351,13 +351,18 @@ class BKRouter:
 
     def stats(self, slugs=None):
         with self._lock:
-            bindings = (
-                list(self.bindings.values()) if slugs is None
-                else [self.bindings[slug] for slug in slugs if slug in self.bindings]
+            binding_items = (
+                list(self.bindings.items()) if slugs is None
+                else [(slug, self.bindings[slug]) for slug in slugs
+                      if slug in self.bindings]
             )
+        bindings = [pair for _, pair in binding_items]
+        onewin_slugs = [slug for slug, pair in binding_items
+                        if pair and pair[0] == "1win"]
         out = {
             "bb_matches": 0,
             "onewin_matches": 0,
+            "onewin_fresh_pairs": 0,
             "bindings": len(bindings),
             "bound_1win": sum(1 for pair in bindings if pair and pair[0] == "1win"),
             "bound_betboom": sum(1 for pair in bindings if pair and pair[0] == "BetBoom"),
@@ -374,6 +379,14 @@ class BKRouter:
                 s = _ow.get_global_stream()
                 with s.lock:
                     out["onewin_matches"] = len(s.matches)
+                live_bc = getattr(s, "live_bc", None)
+                if callable(live_bc):
+                    for slug in onewin_slugs:
+                        try:
+                            if live_bc(slug):
+                                out["onewin_fresh_pairs"] += 1
+                        except Exception:
+                            continue
             except Exception:
                 pass
         return out

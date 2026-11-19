@@ -1,4 +1,14 @@
 {
-  "_comment": "Each group contains names for one verified team, e.g. [\"Virtus.pro\", \"Virtus Pro\"]. Do not add distinct academy/youth teams to the same group.",
-  "groups": []
+  "_comment": "Each group is one verified team/player entity. These exact esports abbreviation and Russian/Latin full-name variants were observed in cross-source diagnostics; never merge distinct academy/youth teams or players.",
+  "groups": [
+    ["NIP", "Ninjas in Pyjamas"],
+    ["Carlos Alcaraz", "Карлос Алькарас"],
+    ["Flavio Cobolli", "Флавио Коболли"],
+    ["Daniil Medvedev", "Даниил Медведев"],
+    ["Frances Tiafoe", "Френсис Тиафо"],
+    ["Anastasia Zolotareva", "Анастасия Золотарева"],
+    ["Irene Burillo Escorihuela", "Ирен Бурильо-Эскориуэла"],
+    ["Valeriya Strakhova", "Страхова, Валерия"],
+    ["Veronika Erjavec", "Вероника Эрьявец"]
+  ]
 }

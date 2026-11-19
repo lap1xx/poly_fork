@@ -263,6 +263,55 @@ class OneWinFeedTests(unittest.TestCase):
         finally:
             self.ow._TEAM_ALIAS_INDEX = previous
 
+    def test_live_diagnostic_full_name_aliases_are_loaded(self):
+        pairs = [
+            ("NIP", "Ninjas in Pyjamas"),
+            ("Carlos Alcaraz", "Карлос Алькарас"),
+            ("Flavio Cobolli", "Флавио Коболли"),
+            ("Daniil Medvedev", "Даниил Медведев"),
+            ("Frances Tiafoe", "Френсис Тиафо"),
+            ("Anastasia Zolotareva", "Анастасия Золотарева"),
+            ("Irene Burillo Escorihuela", "Ирен Бурильо-Эскориуэла"),
+            ("Valeriya Strakhova", "Страхова, Валерия"),
+            ("Veronika Erjavec", "Вероника Эрьявец"),
+        ]
+        previous = self.ow._TEAM_ALIAS_INDEX
+        try:
+            self.ow._TEAM_ALIAS_INDEX = self.ow._load_alias_index()
+            for left, right in pairs:
+                with self.subTest(left=left, right=right):
+                    self.assertEqual(self.ow._name_score(left, right), 1.0)
+        finally:
+            self.ow._TEAM_ALIAS_INDEX = previous
+
+    def test_live_nip_alias_binds_big_match_in_reverse_order(self):
+        previous = self.ow._TEAM_ALIAS_INDEX
+        try:
+            self.ow._TEAM_ALIAS_INDEX = self.ow._load_alias_index()
+            self.stream._store_matches([{
+                "id": 43474970,
+                "sportId": 142,
+                "homeTeam": {"name": "Ninjas in Pyjamas"},
+                "awayTeam": {"name": "BIG"},
+                "startAt": "2026-11-19T10:00:00Z",
+            }])
+            slug = "cs2-big5-nip-2026-11-19"
+            binding = self.stream.bind(
+                slug,
+                ["BIG", "NIP"],
+                {"start": "2026-11-19T10:00:00Z"},
+            )
+            self.assertIsNotNone(binding)
+            self.assertEqual(binding["match_id"], 43474970)
+            self.assertEqual(binding["score"], 1.0)
+            self.assertTrue(binding["swap"])
+            self.assertEqual(
+                self.stream.snapshot_match_diagnostics()[slug]["reason"],
+                "matched",
+            )
+        finally:
+            self.ow._TEAM_ALIAS_INDEX = previous
+
     def test_alias_shared_by_two_groups_is_disabled(self):
         index = self.ow._build_alias_index([
             ["Alpha Pro", "Alpha"],

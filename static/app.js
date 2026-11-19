@@ -418,11 +418,14 @@ function renderScanStatus() {
   if (sources.length) reasons.unshift(`Котировки: ${sources.join(' · ')}`);
   const matching = status.matching_stats || {};
   if (matching.pm_markets != null) {
+    const freshPairsLabel = matching.fresh_1win_pairs == null
+      ? '' : ` · свежие пары 1win ${Number(matching.fresh_1win_pairs || 0)}/${Number(matching.bound_1win || 0)}`;
     reasons.unshift(
       `Сопоставление PM: ${Number(matching.matched_pm_markets || 0)}/${Number(matching.pm_markets || 0)} · ` +
       `без пары ${Number(matching.unmatched_pm_markets || 0)} · ` +
       `1win/BetBoom ${Number(matching.bound_1win || 0)}/${Number(matching.bound_betboom || 0)} · ` +
-      `каталоги ${Number(matching.onewin_catalog_matches || 0)}/${Number(matching.betboom_catalog_matches || 0)}`
+      `каталоги ${Number(matching.onewin_catalog_matches || 0)}/${Number(matching.betboom_catalog_matches || 0)}` +
+      freshPairsLabel
     );
   }
   const oneWinHealth = (status.bookmaker_feed_health || {})['1win'];
@@ -430,8 +433,20 @@ function renderScanStatus() {
     reasons.unshift(
       `1win feed ${oneWinHealth.connected ? 'соединён' : 'нет соединения'} · ` +
       `событий ${Number(oneWinHealth.catalog_matches || 0)} · ` +
-      `свежих котировок ${Number(oneWinHealth.fresh_open_quotes || 0)} · ` +
+      `в кэше свеж./устар. котировок ${Number(oneWinHealth.fresh_open_quotes || 0)}/` +
+      `${Number(oneWinHealth.stale_open_quotes || 0)} · ` +
       `обновлений цены ${Number(oneWinHealth.valid_price_updates_received || 0)}`
+    );
+  }
+  if (status.best_candidate_roi_pct != null && Number.isFinite(Number(status.best_candidate_roi_pct))) {
+    const candidateAge = status.best_candidate_age_sec == null
+      ? '' : ` · измерен ${Number(status.best_candidate_age_sec).toFixed(1)} с назад`;
+    const batchCandidate = status.best_candidate_batch_roi_pct == null
+      ? 'в пакете нет пригодной пары'
+      : `ROI пакета ${Number(status.best_candidate_batch_roi_pct).toFixed(2)}%`;
+    reasons.unshift(
+      `Лучший ROI-кандидат в кэше ${Number(status.best_candidate_roi_pct).toFixed(2)}%` +
+      candidateAge + ` · ${batchCandidate}`
     );
   }
   const transportLabels = {

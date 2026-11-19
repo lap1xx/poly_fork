@@ -2,28 +2,32 @@
 
 ## Цель и ограничения
 
-Уменьшить локальную задержку между обновлением PM/1win котировки и карточкой в панели, заменив постоянный полный обход рынков точечным пересчётом затронутых PM-рынков и прямой передачей состояния сканера в backend панели по аутентифицированному WebSocket. Проект остаётся строго read-only: никаких ставок, купонов или действий аккаунта.
+Снизить локальную задержку между обновлением PM/1win котировки и карточкой в панели через точечный пересчёт затронутых PM-рынков и прямую передачу scanner state в backend по аутентифицированному WebSocket. Поддерживаемые группы остаются CS2, Dota 2, LoL, Valorant и Tennis. Проект строго read-only: никаких ставок, купонов или действий аккаунта.
 
 ## Архитектура реализации
 
 - При запуске выполняется полный начальный проход: загрузка каталога, binding источников, индексы token/match → PM slug и первичная оценка каждого рынка.
-- PM CLOB feed и 1win odds feed после фиксации изменений кэша только ставят идентификаторы в потокобезопасную coalescing-очередь. Единственный scanner dispatcher преобразует их в список затронутых PM slug и последовательно пересчитывает только эти рынки.
+- PM CLOB feed и 1win odds feed после фиксации изменений кэша ставят ID в потокобезопасную coalescing-очередь. Единственный dispatcher разрешает события через обратные индексы и последовательно пересчитывает только затронутые PM slug.
 - Индексы перестраиваются при первичной привязке и изменении PM-каталога/1win binding. Повторные события объединяются; обновление, пришедшее во время расчёта, остаётся в очереди.
-- Периодическое обслуживание сохраняет каталог, повторную привязку, freshness/status и expiry-контроль активных сигналов. Оно не является штатным способом переоценки всех рынков.
-- Сканер сохраняет атомарные JSON snapshots для восстановления/диагностики, но отдельный publisher посылает актуальный snapshot по постоянному локальному WebSocket. Backend принимает только версионированные scanner snapshots с bearer-токеном, который launcher передаёт дочерним процессам через окружение; браузерный `/ws` остаётся read-only.
-- Backend будит broadcast-loop сразу при scanner update и посылает существующий `type: snapshot` клиентам. UI сохраняет прежний контракт и русские надписи; при отсутствии scanner-ingest остаётся файловый fallback.
+- Периодическое обслуживание сохраняет каталог, повторную привязку, freshness/status и expiry-контроль активных сигналов, но не возвращает полный обход рынка в горячий цикл. Gamma catalog fetch ограничен по времени и выполняет категории параллельно; partial refresh сохраняет прежние неполученные записи.
+- Сопоставление остаётся fail-closed. Ручные aliases допускаются только для подтверждённых вариантов имени той же команды/игрока; пороги, защита от неоднозначных кандидатов, время-corrobation и фильтры типов рынка не ослабляются.
+- Matching diagnostics разделяют общее число открытых котировок в кэше и число свежих двухсторонних пар для текущих bound PM-slugs, проверенных тем же `live_bc` path, который используется scanner. Best ROI последнего dispatch-пакета показывается отдельно от retained-market cache ROI и сопровождается возрастом наблюдения.
+- Сканер сохраняет атомарные JSON snapshots для восстановления/диагностики и посылает актуальный согласованный snapshot через постоянный loopback WebSocket. Backend принимает версионированные scanner snapshots с Bearer token из child-process environment; browser `/ws` остаётся read-only.
+- Backend будит broadcast-loop сразу после scanner update. При отсутствии свежего scanner heartbeat возвращается файловый fallback; publisher после reconnect повторно отправляет последний snapshot.
 
 ## Структура проекта и ответственность
 
 | Файл | Ответственность |
 | --- | --- |
-| `polyarb_v4.py` | PM feed notifications, dirty queue/indexes, единый последовательный dispatcher, точечный расчёт, publisher и периодическое обслуживание. |
-| `onewin_bridge.py` | Уведомление scanner callback после применения snapshot/delta odds к кэшу и освобождения lock. |
-| `bk_router.py` | Передача 1win quote-update callback и read-only разрешение match ID в привязанные PM markets. |
-| `web_app.py` | Аутентифицированный `/ws/scanner`, in-memory latest state, мгновенное пробуждение read-only browser fanout, файловый fallback. |
-| `bot_live.py` | Сгенерировать эфемерный bearer secret и передать его только процессам backend/scanner через environment. |
-| `tests/` | Регрессии coalescing/index dispatch, callback и scanner-ingest protocol; существующие тесты ROI, свежести и bankroll остаются неизменными. |
+| `polyarb_v4.py` | PM feed notifications, dirty queue/indexes, единый dispatcher, точечный расчёт, scoped ROI diagnostics, publisher и периодическое обслуживание. |
+| `onewin_bridge.py` | Read-only каталог/odds feed, callback после фиксации цены, fail-closed matching и alias normalization. |
+| `team_aliases.json` | Проверенные вручную эквивалентные имена команд и игроков; не объединять разные составы или сущности. |
+| `bk_router.py` | 1win-first routing, callback, read-only quote lookup и подсчёт свежих пар только для текущих PM bindings. |
+| `web_app.py` | Аутентифицированный `/ws/scanner`, in-memory latest state, быстрый browser fanout и файловый fallback. |
+| `bot_live.py` | Генерация эфемерного Bearer token и передача его только процессам backend/scanner через environment. |
+| `static/app.js` | Русская health panel, свежие bound pairs, транспорт, latency и отдельные cache/batch ROI показатели. |
+| `tests/` | Регрессии coalescing/index dispatch, callbacks, WS protocol, fail-closed aliases, quote freshness, ROI и bankroll guards. |
 
 ## Сохранение совместимости и риски
 
-Публичный browser WebSocket `/ws` и его snapshot schema сохраняются. Каталог, срок годности котировок, пороги глубины/ROI, 40%-й лимит и manual event-link не меняются. Медленный или отключённый scanner не должен маркироваться как свежий; file snapshots остаются аварийным источником. Периодический fallback ограничивается BetBoom-bound рынками и активными сигналами, чтобы не возвращать полный горячий цикл.
+Публичный browser WebSocket `/ws` и его snapshot schema сохраняются. Каталог, допустимая свежесть котировок (30 секунд), пороги ROI, глубины/impact, 40%-й ориентир банка и manual event-link не смягчаются. Сетевые partial results должны сохранять предыдущий каталог, а stale/disconnected scanner не должен маркироваться как свежий. Файловые snapshots остаются аварийным источником. Для BetBoom fallback без callback-интеграции сохраняется ограниченный polling, не возвращающий полный горячий цикл.

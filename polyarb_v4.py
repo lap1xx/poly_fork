@@ -1705,6 +1705,7 @@ def main():
 
     live_snap = {}
     best_by_slug = {}
+    best_by_slug_updated_at = {}
     initial_dirty = set(market_map)
     last_fallback_refresh = 0.0
     last_expiry_sweep = 0.0
@@ -1746,6 +1747,7 @@ def main():
                     for slug in removed_slugs:
                         live_snap.pop(slug, None)
                         best_by_slug.pop(slug, None)
+                        best_by_slug_updated_at.pop(slug, None)
                     snapshot_changed = True
                 dirty_slugs.update(changed_slugs)
                 pm_catalog_complete = refresh_complete
@@ -1828,6 +1830,7 @@ def main():
                 if previous_snapshot is not None:
                     snapshot_changed = True
                 best_by_slug.pop(slug, None)
+                best_by_slug_updated_at.pop(slug, None)
                 if m is None:
                     snapshot_changed = True
                     continue
@@ -2046,8 +2049,11 @@ def main():
 
                 if market_best_roi is not None:
                     best_by_slug[slug] = market_best_roi
+                    best_by_slug_updated_at[slug] = time.time()
                 snapshot_changed = True
 
+            batch_best_candidate_roi = best_candidate_roi
+            batch_best_candidate_slug = best_candidate_slug
             _now = time.time()
             pm_book_states = {}
             for _detail in pm_no_ask_details:
@@ -2067,6 +2073,7 @@ def main():
                     "bound_1win": int(router_stats_cache.get("bound_1win", 0)),
                     "bound_betboom": int(router_stats_cache.get("bound_betboom", 0)),
                     "onewin_catalog_matches": int(router_stats_cache.get("onewin_matches", 0)),
+                    "fresh_1win_pairs": int(router_stats_cache.get("onewin_fresh_pairs", 0)),
                     "betboom_catalog_matches": int(router_stats_cache.get("bb_matches", 0)),
                 }
             if _now - last_pm_diag_write >= 2.0:
@@ -2088,9 +2095,13 @@ def main():
                 best_candidate_slug, best_candidate_roi = max(
                     best_by_slug.items(), key=lambda item: item[1]
                 )
+                best_candidate_age_sec = round(max(
+                    0.0, _now - best_by_slug_updated_at.get(best_candidate_slug, _now)
+                ), 1)
             else:
                 best_candidate_slug = None
                 best_candidate_roi = None
+                best_candidate_age_sec = None
 
             last_scan_status = {
                 "state": "running",
@@ -2122,6 +2133,14 @@ def main():
                 "best_candidate_roi_pct": round(best_candidate_roi * 100, 3)
                 if best_candidate_roi is not None else None,
                 "best_candidate_slug": best_candidate_slug,
+                "best_candidate_roi_scope": (
+                    "retained_market_cache" if best_candidate_slug is not None else None
+                ),
+                "best_candidate_age_sec": best_candidate_age_sec,
+                "best_candidate_batch_roi_pct": round(batch_best_candidate_roi * 100, 3)
+                if batch_best_candidate_roi is not None else None,
+                "best_candidate_batch_slug": batch_best_candidate_slug,
+                "best_candidate_batch_scope": "last_dispatch_batch",
                 "bank_rub": round(bank, 2),
                 "usd_rub": round(rate, 4),
             }
