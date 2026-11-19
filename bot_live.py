@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # bot_live.py - AUTO launcher for polyarb_v4.py
 # No imports from clob_utils. Just spawns polyarb_v4.py as subprocess.
-import sys, subprocess, os, pathlib
+import sys, subprocess, os, pathlib, secrets
 
 HERE = pathlib.Path(__file__).parent
 POLYARB = str(HERE / "polyarb_v4.py")
@@ -48,21 +48,25 @@ def main():
 
     # --- web_app (опционально) ---
     web_proc = None
+    child_env = os.environ.copy()
     web_path = HERE / "web_app.py"
     if web_path.exists() and "--no-web" not in args:
         try:
+            child_env["POLYARB_SCANNER_WS_TOKEN"] = secrets.token_urlsafe(32)
             web_proc = subprocess.Popen(
                 [sys.executable, "-B", str(web_path)],
                 cwd=str(HERE),
+                env=child_env,
             )
             print("[>] web_app started: http://localhost:8080")
         except Exception as e:
+            child_env.pop("POLYARB_SCANNER_WS_TOKEN", None)
             print("[!] web_app failed:", e)
             web_proc = None
     print()
 
     try:
-        subprocess.run(cmd, check=False, cwd=str(HERE))
+        subprocess.run(cmd, check=False, cwd=str(HERE), env=child_env)
     except KeyboardInterrupt:
         print("\n[*] stopped by user")
     finally:

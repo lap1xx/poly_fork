@@ -240,6 +240,7 @@ function connectWS() {
   };
   ws.onmessage = (ev) => {
     if (generation !== state.wsGeneration) return;
+    const uiRenderStarted = performance.now();
     let msg;
     try { msg = JSON.parse(ev.data); } catch (e) { return; }
     state.wsLastMessageAt = Date.now();
@@ -250,7 +251,6 @@ function connectWS() {
 
     if (msg.config) state.config = { ...state.config, ...msg.config };
     state.scanStatus = msg.scan_status || null;
-    renderScanStatus();
     const newArbs = Array.isArray(msg.arbs) ? msg.arbs : [];
     let hasNew = false;
     for (const a of newArbs) {
@@ -266,6 +266,10 @@ function connectWS() {
     state._primed = true;
     applyFilters();
     if (state.activeSlug) refreshDetailThrottled();
+    if (state.scanStatus) {
+      state.scanStatus.ui_render_ms = Math.round((performance.now() - uiRenderStarted) * 10) / 10;
+    }
+    renderScanStatus();
   };
 }
 
@@ -330,9 +334,11 @@ function renderScanStatus() {
   if (!box) return;
   box.classList.remove('running', 'stale');
   if (!status || !Number.isFinite(Number(status.ts))) {
+    document.getElementById('scan-health-mode').textContent = 'ОЖИДАНИЕ СКАНЕРА';
     document.getElementById('scan-health-label').textContent = 'Ожидание сканера';
     document.getElementById('scan-health-time').textContent = '—';
     document.getElementById('scan-checked').textContent = '—';
+    document.getElementById('scan-checked-label').textContent = 'в пакете / каталог';
     document.getElementById('scan-quotes').textContent = '—';
     document.getElementById('scan-signals').textContent = '—';
     document.getElementById('scan-live').textContent = '—';
@@ -345,14 +351,22 @@ function renderScanStatus() {
   const age = Math.max(0, Date.now() / 1000 - Number(status.ts));
   const active = status.state === 'running' && age <= SCAN_STATUS_STALE_SECONDS;
   box.classList.add(active ? 'running' : 'stale');
+  document.getElementById('scan-health-mode').textContent = status.update_mode === 'event'
+    ? 'СОБЫТИЙНОЕ ОБНОВЛЕНИЕ' : 'ЦИКЛ СКАНИРОВАНИЯ';
   document.getElementById('scan-health-label').textContent = active
-    ? `Сканер активен · цикл ${Number(status.cycle || 0)}`
+    ? status.update_mode === 'event'
+      ? `Сканер активен · событие ${Number(status.cycle || 0)}`
+      : `Сканер активен · цикл ${Number(status.cycle || 0)}`
     : status.state === 'stopped' ? 'Сканер остановлен' : 'Статус сканера устарел';
   document.getElementById('scan-health-time').textContent =
     new Date(Number(status.ts) * 1000).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
   const checks = status.checks || {};
   const phases = status.phase_counts || {};
-  document.getElementById('scan-checked').textContent = Number(status.pm_markets || 0);
+  document.getElementById('scan-checked').textContent = status.update_mode === 'event'
+    ? `${Number(status.processed_markets || 0)}/${Number(status.pm_markets || 0)}`
+    : Number(status.pm_markets || 0);
+  document.getElementById('scan-checked-label').textContent = status.update_mode === 'event'
+    ? 'в пакете / каталог' : 'рынков проверено';
   document.getElementById('scan-quotes').textContent = Number(checks.with_fresh_bookmaker || 0);
   document.getElementById('scan-signals').textContent = Number(status.signals || 0);
   document.getElementById('scan-live').textContent = Number(phases.live || 0);
@@ -384,9 +398,57 @@ function renderScanStatus() {
     .filter(([, count]) => Number(count) > 0)
     .map(([name, count]) => `${name} ${Number(count)}`);
   if (sources.length) reasons.unshift(`Котировки: ${sources.join(' · ')}`);
+  const matching = status.matching_stats || {};
+  if (matching.pm_markets != null) {
+    reasons.unshift(
+      `Сопоставление PM: ${Number(matching.matched_pm_markets || 0)}/${Number(matching.pm_markets || 0)} · ` +
+      `без пары ${Number(matching.unmatched_pm_markets || 0)} · ` +
+      `1win/BetBoom ${Number(matching.bound_1win || 0)}/${Number(matching.bound_betboom || 0)} · ` +
+      `каталоги ${Number(matching.onewin_catalog_matches || 0)}/${Number(matching.betboom_catalog_matches || 0)}`
+    );
+  }
+  const oneWinHealth = (status.bookmaker_feed_health || {})['1win'];
+  if (oneWinHealth) {
+    reasons.unshift(
+      `1win feed ${oneWinHealth.connected ? 'соединён' : 'нет соединения'} · ` +
+      `событий ${Number(oneWinHealth.catalog_matches || 0)} · ` +
+      `свежих котировок ${Number(oneWinHealth.fresh_open_quotes || 0)} · ` +
+      `обновлений цены ${Number(oneWinHealth.valid_price_updates_received || 0)}`
+    );
+  }
+  const transportLabels = {
+    scanner_ws: 'прямой WebSocket',
+    file_fallback: 'файловый fallback',
+  };
+  if (transportLabels[status.delivery_transport]) {
+    const stateAge = status.scanner_state_age_ms == null
+      ? '' : ` · snapshot ${Number(status.scanner_state_age_ms).toFixed(1)} мс`;
+    reasons.unshift(`Доставка: ${transportLabels[status.delivery_transport]}${stateAge}`);
+  }
+  if (status.update_mode === 'event') {
+    const timings = [];
+    if (status.event_to_snapshot_ms != null && Number.isFinite(Number(status.event_to_snapshot_ms))) {
+      timings.push(`feed→расчёт ${Number(status.event_to_snapshot_ms).toFixed(1)} мс`);
+    }
+    if (status.scanner_to_backend_ms != null && Number.isFinite(Number(status.scanner_to_backend_ms))) {
+      timings.push(`сканер→сервер ${Number(status.scanner_to_backend_ms).toFixed(1)} мс`);
+    }
+    if (status.ui_render_ms != null && Number.isFinite(Number(status.ui_render_ms))) {
+      timings.push(`DOM ${Number(status.ui_render_ms).toFixed(1)} мс`);
+    }
+    reasons.unshift(
+      `Событийный пакет: ${Number(status.source_updates || 0)} обновл. · ` +
+      `обработано ${Number(status.processed_markets || 0)}/${Number(status.pm_markets || 0)} · ` +
+      `очередь ${Number(status.pending_updates || 0)}` +
+      (timings.length ? ` · ${timings.join(' · ')}` : '')
+    );
+  }
   document.getElementById('scan-reasons').textContent = reasons.length
     ? reasons.join(' · ')
-    : (status.signals ? 'Сигналы переданы в радар.' : 'В этом цикле причины отсева не зафиксированы.');
+    : (status.signals ? 'Сигналы переданы в радар.'
+      : status.update_mode === 'event' && Number(status.source_updates || 0) === 0
+        ? 'Ожидание обновлений котировок; проверка свежести активных сигналов идёт отдельно.'
+        : 'В этом цикле причины отсева не зафиксированы.');
 }
 
 /* ============= LIST ============= */

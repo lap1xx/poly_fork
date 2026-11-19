@@ -123,6 +123,14 @@ Windows-файлы `.bat` в Linux/macOS не используются. Для B
 
 Сопоставление рынка работает fail-closed: totals, handicaps, неизвестные типы, player props и tennis set-winner не связываются с рынком победителя матча. Единственное послабление для поиска — tennis (`sportId=33`): если обе команды достаточно похожи (score ≥ 0.60) и ровно один кандидат имеет время начала в пределах часа от Polymarket, его можно принять с причиной `matched_time_corroborated`; неоднозначные пары остаются отклонёнными. В `match_diagnostics.json` доступны подтипы неподдерживаемых рынков, а `scanner_status.json` содержит `bookmaker_feed_health.1win` с состоянием соединения, свежими/устаревшими открытыми котировками и временем последнего сообщения/валидной цены.
 
+## Событийный пересчёт и доставка в панель
+
+После начальной оценки каталога сканер ставит в coalescing-очередь ID изменившихся PM token books и 1win matches. Обратные индексы разрешают эти ID только в связанные PM slug; единственный scanner dispatcher пересчитывает их последовательно, а не перебирает весь каталог на каждом изменении. Полный расчёт остаётся при первичной загрузке и изменении каталога. Повторный binding выполняется раз в 10 секунд; активные сигналы перепроверяются на истечение свежести раз в секунду. Для рынков, где фактически выбран BetBoom fallback (у него пока нет callback-интеграции), остаётся ограниченный односекундный polling; основной 1win путь и Polymarket book идут по событиям.
+
+`bot_live.py` генерирует одноразовый случайный `POLYARB_SCANNER_WS_TOKEN` и передаёт его backend/scanner только через окружение дочерних процессов. Scanner отправляет полные согласованные snapshots на локальный `ws://127.0.0.1:8080/ws/scanner`; endpoint принимает только loopback bearer-authenticated сообщения со схемой/сессией/монотонным sequence и размером до 8 MiB. Токен не попадает в URL, командную строку, конфиг или браузер. Публичный для локального UI endpoint `/ws` остаётся read-only; backend будит fanout сразу после получения scanner snapshot. Если scanner heartbeat отсутствует более 3 секунд, backend автоматически возвращается к `arbs_live.json` и `scanner_status.json`; в health panel этот канал явно помечается как `файловый fallback`. Файлы продолжают писаться атомарно, а восстановленный publisher начинает прямую доставку заново после reconnect.
+
+В карточке здоровья панели показываются количество рынков текущего событийного пакета, размер очереди, прямой/fallback канал доставки, сопоставленные и несопоставленные PM-рынки, число событий в каталоге 1win, количество свежих открытых котировок и задержки `feed→расчёт`, `сканер→backend` и локального рендера DOM. Эти метрики измеряют только участки внутри нашего процесса/локального контура; задержка публикации исходной площадкой и внешней сети в них не входит. `--no-web` сохраняет старый режим: прямой ingest используется только если задан совместимый `POLYARB_SCANNER_WS_TOKEN`, иначе работает файловый fallback.
+
 ## Проверки
 
 Из корня репозитория запусти offline-тесты:
@@ -135,7 +143,7 @@ node tests/test_bankroll_plan.cjs
 Проверки синтаксиса основных модулей и dashboard JavaScript:
 
 ```bash
-python -m py_compile event_phase.py onewin_bridge.py bk_router.py polyarb_v4.py web_app.py bot_live.py
+python -m py_compile event_phase.py event_dispatch.py scanner_publisher.py onewin_bridge.py bk_router.py polyarb_v4.py web_app.py bot_live.py
 node --check static/app.js
 node --check static/bankroll_plan.js
 ```
@@ -160,6 +168,8 @@ Smoke test требует сетевого доступа к настроенн�
 
 ```text
 polyarb_v4.py       Сканер, Polymarket рынки, расчёты и диагностика циклов
+event_dispatch.py   Coalescing-очередь и обратные индексы dirty markets
+scanner_publisher.py Локальный аутентифицированный WebSocket publisher
 event_phase.py      Консервативная классификация LIVE/PREMATCH/UNKNOWN
 onewin_bridge.py    Read-only каталог и odds feed 1win
 bk_router.py        1win primary и BetBoom fallback

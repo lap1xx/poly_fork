@@ -71,13 +71,18 @@ class EventPhaseTests(unittest.TestCase):
     def test_legacy_launch_does_not_force_live(self):
         with patch.object(bot_live.sys, "argv", ["bot_live.py"]), \
              patch.object(bot_live.subprocess, "Popen") as popen, \
-             patch.object(bot_live.subprocess, "run") as run:
+             patch.object(bot_live.subprocess, "run") as run, \
+             patch.object(bot_live.secrets, "token_urlsafe", return_value="test-ephemeral-token"):
             bot_live.main()
         command = run.call_args.args[0]
         self.assertIn("--watch", command)
         self.assertNotIn("--live", command)
         self.assertEqual(run.call_args.kwargs["cwd"], str(bot_live.HERE))
         popen.assert_called_once()
+        backend_token = popen.call_args.kwargs["env"]["POLYARB_SCANNER_WS_TOKEN"]
+        scanner_token = run.call_args.kwargs["env"]["POLYARB_SCANNER_WS_TOKEN"]
+        self.assertEqual(backend_token, "test-ephemeral-token")
+        self.assertEqual(scanner_token, backend_token)
 
 
 class PMCatalogRefreshTests(unittest.TestCase):

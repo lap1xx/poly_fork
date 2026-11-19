@@ -65,7 +65,18 @@ class BKRouter:
         self._bb_retry_after = {}
         self._onewin_retry_after = {}
         self._onewin_ready = None
+        self._odds_update_callback = None
+        self._onewin_stream = None
         self._lock = threading.RLock()
+
+    def set_odds_update_callback(self, callback):
+        """Set a lightweight listener for read-only 1win odds-cache updates."""
+        self._odds_update_callback = callback
+        if self._onewin_stream is not None:
+            try:
+                self._onewin_stream.set_odds_update_callback(callback)
+            except Exception:
+                pass
 
     def start(self):
         if self.use_bb:
@@ -77,7 +88,10 @@ class BKRouter:
                 self.use_bb = False
         if self.use_onewin:
             try:
-                _ow.get_global_stream(verbose=False)
+                stream = _ow.get_global_stream(verbose=False)
+                self._onewin_stream = stream
+                if self._odds_update_callback is not None:
+                    stream.set_odds_update_callback(self._odds_update_callback)
                 print("[ROUTER] 1win stream started")
             except Exception as e:
                 print(f"[ROUTER] 1win start failed: {e}")
@@ -281,6 +295,21 @@ class BKRouter:
                 return self.fallback_bindings[slug]
             return pair[1] if pair else None
 
+    def onewin_match_index(self):
+        """Return canonical 1win match IDs mapped to every bound PM market."""
+        index = {}
+        with self._lock:
+            pairs = list(self.bindings.items())
+        for slug, pair in pairs:
+            if not pair or pair[0] != "1win":
+                continue
+            binding = pair[1] or {}
+            match_id = binding.get("match_id") if isinstance(binding, dict) else None
+            if match_id is None:
+                continue
+            index.setdefault(str(match_id).strip(), set()).add(str(slug))
+        return index
+
     def bb_stakes_debug(self, slug):
         if not self.use_bb:
             return []
@@ -320,8 +349,19 @@ class BKRouter:
         except Exception as e:
             return [{"err": str(e)}]
 
-    def stats(self):
-        out = {"bb_matches": 0, "onewin_matches": 0, "bindings": len(self.bindings)}
+    def stats(self, slugs=None):
+        with self._lock:
+            bindings = (
+                list(self.bindings.values()) if slugs is None
+                else [self.bindings[slug] for slug in slugs if slug in self.bindings]
+            )
+        out = {
+            "bb_matches": 0,
+            "onewin_matches": 0,
+            "bindings": len(bindings),
+            "bound_1win": sum(1 for pair in bindings if pair and pair[0] == "1win"),
+            "bound_betboom": sum(1 for pair in bindings if pair and pair[0] == "BetBoom"),
+        }
         if self.use_bb:
             try:
                 s = _bb.get_global_stream()

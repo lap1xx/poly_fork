@@ -6,7 +6,9 @@ web_app.py - Poly-ARB web radar v4 (СБП-style).
 """
 import asyncio
 import csv
+import hmac
 import io
+import ipaddress
 import json
 import math
 import os
@@ -53,6 +55,12 @@ _clients: Set[WebSocket] = set()
 _hidden: Set[str] = set()
 _first_seen: Dict[str, float] = {}
 _first_seen_lock = threading.Lock()
+_scanner_state = None
+_scanner_session_id = None
+_scanner_seq = -1
+_broadcast_wakeup = None
+SCANNER_WS_MAX_BYTES = 8 * 1024 * 1024
+SCANNER_STATE_STALE_SECONDS = 3.0
 
 def _load_json(path: pathlib.Path, default):
     if not path.exists():
@@ -311,38 +319,74 @@ async def _broadcast_loop():
     last_ts = 0.0
     last_broadcast = 0.0
     last_heartbeat = time.time()
+    last_scanner_seq = -1
     while True:
         try:
+            wakeup = _broadcast_wakeup
+            if wakeup is not None:
+                try:
+                    await asyncio.wait_for(wakeup.wait(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    pass
+                if wakeup.is_set():
+                    wakeup.clear()
             now = time.time()
-            if LIVE_FILE.exists():
+            raw = None
+            scan_status = None
+            should_broadcast = False
+            scanner_state = _scanner_state
+            scanner_received_at = (
+                scanner_state.get("received_at")
+                if isinstance(scanner_state, dict) else None
+            )
+            scanner_fresh = (
+                scanner_received_at is not None
+                and now - float(scanner_received_at) <= SCANNER_STATE_STALE_SECONDS
+            )
+            if scanner_fresh:
+                seq = scanner_state.get("seq", -1)
+                if seq != last_scanner_seq or now - last_broadcast >= 1.0:
+                    raw = scanner_state.get("arbs", {})
+                    scan_status = dict(scanner_state.get("scan_status", {}))
+                    scan_status["delivery_transport"] = "scanner_ws"
+                    scan_status["scanner_state_age_ms"] = round(
+                        max(0.0, now - float(scanner_received_at)) * 1000, 1
+                    )
+                    last_scanner_seq = seq
+                    should_broadcast = True
+            elif LIVE_FILE.exists():
                 st = LIVE_FILE.stat()
                 if st.st_mtime > last_ts or now - last_broadcast >= 1.0:
                     last_ts = st.st_mtime
                     raw = _load_json(LIVE_FILE, {})
                     if not isinstance(raw, dict):
                         raw = {}
-                    enriched = _build_enriched(raw)
                     scan_status = _load_json(STATUS_FILE, {})
                     if not isinstance(scan_status, dict):
                         scan_status = {}
-                    msg = json.dumps({
-                        "type": "snapshot",
-                        "ts": time.time(),
-                        "arbs": list(enriched.values()),
-                        "total": len(raw),
-                        "hidden_count": len(_hidden),
-                        "config": _load_config(),
-                        "scan_status": scan_status,
-                    }, ensure_ascii=False)
-                    dead = []
-                    for ws in list(_clients):
-                        try:
-                            await ws.send_text(msg)
-                        except Exception:
-                            dead.append(ws)
-                    for ws in dead:
-                        _clients.discard(ws)
-                    last_broadcast = now
+                    scan_status.pop("scanner_to_backend_ms", None)
+                    scan_status["delivery_transport"] = "file_fallback"
+                    should_broadcast = True
+            if should_broadcast:
+                enriched = _build_enriched(raw or {})
+                msg = json.dumps({
+                    "type": "snapshot",
+                    "ts": time.time(),
+                    "arbs": list(enriched.values()),
+                    "total": len(raw or {}),
+                    "hidden_count": len(_hidden),
+                    "config": _load_config(),
+                    "scan_status": scan_status or {},
+                }, ensure_ascii=False)
+                dead = []
+                for ws in list(_clients):
+                    try:
+                        await ws.send_text(msg)
+                    except Exception:
+                        dead.append(ws)
+                for ws in dead:
+                    _clients.discard(ws)
+                last_broadcast = now
             if _clients and now - last_heartbeat >= 15.0:
                 heartbeat = json.dumps({"type": "heartbeat", "ts": now})
                 dead = []
@@ -360,6 +404,8 @@ async def _broadcast_loop():
 
 @asynccontextmanager
 async def _lifespan(app):
+    global _broadcast_wakeup
+    _broadcast_wakeup = asyncio.Event()
     asyncio.create_task(_broadcast_loop())
     threading.Thread(target=_first_seen_loop, daemon=True).start()
     threading.Thread(target=_first_seen_save_loop, daemon=True).start()
@@ -406,11 +452,15 @@ async def ws_endpoint(ws: WebSocket):
     await ws.accept()
     _clients.add(ws)
     try:
-        raw = _load_json(LIVE_FILE, {})
+        if _scanner_state is not None:
+            raw = _scanner_state.get("arbs", {})
+            scan_status = _scanner_state.get("scan_status", {})
+        else:
+            raw = _load_json(LIVE_FILE, {})
+            scan_status = _load_json(STATUS_FILE, {})
         if not isinstance(raw, dict):
             raw = {}
         enriched = _build_enriched(raw)
-        scan_status = _load_json(STATUS_FILE, {})
         if not isinstance(scan_status, dict):
             scan_status = {}
         await ws.send_text(json.dumps({
@@ -433,6 +483,97 @@ async def ws_endpoint(ws: WebSocket):
         pass
     finally:
         _clients.discard(ws)
+
+
+def _reject_json_constant(value):
+    raise ValueError("non-finite JSON number")
+
+
+@app.websocket("/ws/scanner")
+async def scanner_ingest_ws(ws: WebSocket):
+    """Authenticated loopback-only ingest; browsers cannot publish scanner state."""
+    global _scanner_state, _scanner_session_id, _scanner_seq
+    expected = os.environ.get("POLYARB_SCANNER_WS_TOKEN", "")
+    authorization = ws.headers.get("authorization", "")
+    origin = ws.headers.get("origin")
+    client_host = ws.client.host if ws.client else ""
+    try:
+        is_loopback = ipaddress.ip_address(client_host).is_loopback
+    except ValueError:
+        is_loopback = False
+    authorized = bool(expected) and hmac.compare_digest(
+        authorization, "Bearer " + expected
+    )
+    if (not authorized or not is_loopback
+            or (origin is not None and origin not in ALLOWED_ORIGINS)):
+        await ws.close(code=1008)
+        return
+
+    await ws.accept()
+    try:
+        while True:
+            raw_message = await ws.receive_text()
+            if len(raw_message.encode("utf-8")) > SCANNER_WS_MAX_BYTES:
+                await ws.close(code=1009)
+                return
+            try:
+                payload = json.loads(raw_message, parse_constant=_reject_json_constant)
+            except (TypeError, ValueError):
+                await ws.close(code=1003)
+                return
+            if not isinstance(payload, dict):
+                await ws.close(code=1003)
+                return
+            session_id = payload.get("session_id")
+            seq = payload.get("seq")
+            sent_at = payload.get("sent_at")
+            arbs = payload.get("arbs")
+            scan_status = payload.get("scan_status")
+            if (payload.get("type") != "scanner.snapshot"
+                    or payload.get("schema_version") != 1
+                    or payload.get("scanner_id") != "polyarb_v4"
+                    or not isinstance(session_id, str) or not session_id
+                    or len(session_id) > 80
+                    or isinstance(seq, bool) or not isinstance(seq, int) or seq < 1
+                    or not isinstance(sent_at, (int, float))
+                    or not math.isfinite(float(sent_at))
+                    or abs(time.time() - float(sent_at)) > 60.0
+                    or not isinstance(arbs, dict) or len(arbs) > 5000
+                    or not isinstance(scan_status, dict)):
+                await ws.close(code=1008)
+                return
+            valid_arbs = True
+            for slug, arb in arbs.items():
+                if (not isinstance(slug, str) or not slug or len(slug) > 512
+                        or not isinstance(arb, dict)):
+                    valid_arbs = False
+                    break
+            if not valid_arbs:
+                await ws.close(code=1008)
+                return
+            if session_id != _scanner_session_id:
+                _scanner_session_id = session_id
+                _scanner_seq = -1
+            if seq <= _scanner_seq:
+                continue
+            _scanner_seq = seq
+            scan_status = dict(scan_status)
+            scan_status["scanner_to_backend_ms"] = round(
+                max(0.0, time.time() - float(sent_at)) * 1000, 1
+            )
+            _scanner_state = {
+                "session_id": session_id,
+                "seq": seq,
+                "received_at": time.time(),
+                "arbs": arbs,
+                "scan_status": scan_status,
+            }
+            if _broadcast_wakeup is not None:
+                _broadcast_wakeup.set()
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
 
 @app.get("/api/config")
 async def api_config():

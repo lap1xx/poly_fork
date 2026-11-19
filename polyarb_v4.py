@@ -24,6 +24,11 @@ except Exception:
     pass
 
 import requests
+from event_dispatch import (
+    DirtyUpdateQueue,
+    build_token_slug_index,
+    resolve_dirty_slugs,
+)
 from event_phase import classify_event_phase
 if sys.platform == "win32":
     os.system("")
@@ -67,6 +72,22 @@ TIMEOUT = 15.0
 BOOKS = {}
 LOCK = threading.Lock()
 STOP = threading.Event()
+_PM_UPDATE_CALLBACK = None
+
+
+def set_pm_update_callback(callback):
+    """Register a non-blocking callback for committed PM book updates."""
+    global _PM_UPDATE_CALLBACK
+    _PM_UPDATE_CALLBACK = callback
+
+
+def _notify_pm_update(token_id):
+    callback = _PM_UPDATE_CALLBACK
+    if callback is not None:
+        try:
+            callback(str(token_id))
+        except Exception:
+            pass
 
 RUB = " RUB"
 
@@ -544,6 +565,7 @@ class Feed(threading.Thread):
             aid = d.get("asset_id")
             if not aid:
                 return
+            aid = str(aid)
             bids = []
             asks = []
             for x in d.get("bids", []) or []:
@@ -573,15 +595,18 @@ class Feed(threading.Thread):
                     last_change = prev.get("last_change", now)
                 BOOKS[aid] = {"bids": bids, "asks": asks,
                               "ts": now, "last_change": last_change}
+            _notify_pm_update(aid)
             return
         if et == "price_change":
             pcs = d.get("price_changes") or d.get("changes") or []
             now = time.time()
+            updated_ids = set()
             with LOCK:
                 for ch in pcs:
                     aid = ch.get("asset_id")
                     if not aid:
                         continue
+                    aid = str(aid)
                     prev = BOOKS.get(aid)
                     if not prev:
                         continue
@@ -612,16 +637,24 @@ class Feed(threading.Thread):
                         last_change = prev.get("last_change", now)
                     BOOKS[aid] = {"bids": new_bids, "asks": new_asks,
                                   "ts": now, "last_change": last_change}
+                    updated_ids.add(aid)
+            for aid in updated_ids:
+                _notify_pm_update(aid)
             return
         if et == "last_trade_price":
             aid = d.get("asset_id")
             if not aid:
                 return
+            aid = str(aid)
             now = time.time()
+            updated = False
             with LOCK:
                 prev = BOOKS.get(aid)
                 if prev:
                     prev["ts"] = now
+                    updated = True
+            if updated:
+                _notify_pm_update(aid)
             return
 
 
@@ -769,6 +802,7 @@ def _refresh_pm_book_worker(token_id, attempted_at, reason):
     key = str(token_id)
     result_state = "fetch_failed"
     bid_levels = ask_levels = 0
+    applied = False
     try:
         fresh = _fresh_pm_book(key, timeout=4.0)
         if fresh is not None:
@@ -796,12 +830,15 @@ def _refresh_pm_book_worker(token_id, attempted_at, reason):
                         "bids": bids, "asks": asks, "ts": now,
                         "last_change": last_change,
                     }
+                    applied = True
                     if not bids and not asks:
                         result_state = "empty_book"
                     elif not asks:
                         result_state = "empty_asks"
                     else:
                         result_state = "asks_available"
+            if applied:
+                _notify_pm_update(key)
     except Exception:
         result_state = "fetch_failed"
     finally:
@@ -1403,12 +1440,15 @@ def main():
         return 1
 
     # ---------- BK bridge: 1win primary; BetBoom is a fallback ----------
+    update_queue = DirtyUpdateQueue()
+    set_pm_update_callback(update_queue.put_pm_token)
     router = None
     if ROUTER_ENABLED:
         print("[*] starting bookmaker router (1win primary; BetBoom fallback %s)..."
               % ("disabled" if args.no_bb else "enabled"))
         try:
             router = get_router(use_bb=not args.no_bb, use_onewin=True)
+            router.set_odds_update_callback(update_queue.put_onewin_match)
             router.start()
             ok_ow = router.wait_onewin(timeout=60, min_matches=1)
             ok_bb = False
@@ -1490,7 +1530,18 @@ def main():
     last_sig = {}
     printed_once = set()
     upd_count = {}
+    token_index = build_token_slug_index(market_map)
+    match_index = router.onewin_match_index() if router is not None else {}
+
+    def refresh_event_indexes():
+        token_index.clear()
+        token_index.update(build_token_slug_index(market_map))
+        match_index.clear()
+        if router is not None:
+            match_index.update(router.onewin_match_index())
+
     alert_gap = max(0.0, float(args.alert_gap))
+    newly_bound_slugs = set()
 
     def retry_bind():
         if router is not None:
@@ -1510,11 +1561,14 @@ def main():
                     b, _ = router.bind(slug, market_map[slug])
                     if b:
                         n += 1
+                        newly_bound_slugs.add(slug)
                 else:
                     if bind_slug(slug, market_map[slug]):
                         n += 1
+                        newly_bound_slugs.add(slug)
             except Exception:
                 pass
+        refresh_event_indexes()
         if n:
             print("[*] retry-bind: +%d (unbound было %d)" % (n, len(unbound)))
         _write_match_diagnostics(router, market_map)
@@ -1533,14 +1587,65 @@ def main():
     }
     _write_scan_status(last_scan_status)
 
+    publisher = None
+    publisher_token = os.environ.get("POLYARB_SCANNER_WS_TOKEN")
+    if publisher_token and HAS_WS:
+        try:
+            from scanner_publisher import ScannerPublisher
+            publisher = ScannerPublisher(
+                "ws://127.0.0.1:8080/ws/scanner",
+                publisher_token,
+                websocket_module=websocket,
+                verbose=True,
+            )
+        except Exception as exc:
+            print("[!] dashboard WebSocket publisher unavailable: %s" % type(exc).__name__)
+
+    live_snap = {}
+    best_by_slug = {}
+    initial_dirty = set(market_map)
+    last_fallback_refresh = 0.0
+    last_expiry_sweep = 0.0
+    last_publish = 0.0
+    last_phase_refresh = 0.0
+    last_router_health_refresh = 0.0
+    router_stats_cache = {}
+    router_feed_health_cache = {}
+    phase_counts_cache = {"live": 0, "prematch": 0, "unknown": 0}
+    last_pm_diag_write = 0.0
+
     try:
         while not STOP.is_set():
-            if args.watch and time.time() - last_pm_refresh >= args.watch_sec:
+            now = time.time()
+            source_events = update_queue.drain(timeout=min(0.1, max(0.01, poll)))
+            dirty_slugs = resolve_dirty_slugs(source_events, token_index, match_index)
+            source_event_at = min(
+                (event[2] for event in source_events if len(event) > 2),
+                default=None,
+            )
+            if initial_dirty:
+                dirty_slugs.update(initial_dirty)
+                initial_dirty.clear()
+            snapshot_changed = False
+
+            if args.watch and now - last_pm_refresh >= args.watch_sec:
+                previous_market_map = dict(market_map)
                 fresh, refresh_complete = fetch_live_pm_markets(with_status=True)
                 had_previous_catalog = bool(market_map)
                 market_map, added, removed = reconcile_pm_market_map(
                     market_map, fresh, refresh_complete
                 )
+                changed_slugs = {
+                    slug for slug, market in market_map.items()
+                    if slug not in previous_market_map or previous_market_map.get(slug) != market
+                }
+                removed_slugs = set(previous_market_map) - set(market_map)
+                if removed_slugs:
+                    for slug in removed_slugs:
+                        live_snap.pop(slug, None)
+                        best_by_slug.pop(slug, None)
+                    snapshot_changed = True
+                dirty_slugs.update(changed_slugs)
                 pm_catalog_complete = refresh_complete
                 pm_catalog_retained = not refresh_complete and had_previous_catalog
                 if added or removed:
@@ -1557,17 +1662,46 @@ def main():
                 if refreshed_tokens != tokens and feed.update_tokens(refreshed_tokens):
                     tokens = refreshed_tokens
                     print("[*] PM feed resubscribe: %d tokens" % len(tokens))
+                refresh_event_indexes()
+                if changed_slugs:
+                    retry_bind()
+                    dirty_slugs.update(newly_bound_slugs)
+                    newly_bound_slugs.clear()
                 last_pm_refresh = time.time()
 
-            if time.time() - last_retry >= 10:
+            if now - last_retry >= 10:
                 retry_bind()
+                dirty_slugs.update(newly_bound_slugs)
+                newly_bound_slugs.clear()
                 last_retry = time.time()
 
-            scan_iteration += 1
-            phase_counts = {"live": 0, "prematch": 0, "unknown": 0}
-            for _market in market_map.values():
-                _phase = classify_event_phase(_market)
-                phase_counts[_phase] = phase_counts.get(_phase, 0) + 1
+            # BetBoom remains a supported fallback; it has no event callback yet,
+            # so only BetBoom-bound markets receive this slower refresh.
+            if now - last_fallback_refresh >= 1.0:
+                if router is None:
+                    dirty_slugs.update(market_map)
+                else:
+                    dirty_slugs.update(
+                        slug for slug in market_map if router.get_src(slug) == "BetBoom"
+                    )
+                last_fallback_refresh = now
+
+            # Quotes can expire without a feed message; only active signals need a
+            # one-second freshness sweep, not a full-market scan.
+            if now - last_expiry_sweep >= 1.0:
+                dirty_slugs.update(live_snap)
+                last_expiry_sweep = now
+
+            if dirty_slugs:
+                scan_iteration += 1
+            if now - last_phase_refresh >= 5.0:
+                phase_counts_cache = {"live": 0, "prematch": 0, "unknown": 0}
+                for _market in market_map.values():
+                    _phase = classify_event_phase(_market)
+                    phase_counts_cache[_phase] = phase_counts_cache.get(_phase, 0) + 1
+                last_phase_refresh = now
+
+            phase_counts = dict(phase_counts_cache)
             scan_counts = {
                 "with_fresh_bookmaker": 0,
                 "no_fresh_bookmaker": 0,
@@ -1583,11 +1717,19 @@ def main():
                 "roi_passed": 0,
             }
             source_counts = {}
-            live_snap = {}
             best_candidate_roi = None
             best_candidate_slug = None
             pm_no_ask_details = []
-            for slug, m in market_map.items():
+            for slug in sorted(dirty_slugs):
+                m = market_map.get(slug)
+                previous_snapshot = live_snap.pop(slug, None)
+                if previous_snapshot is not None:
+                    snapshot_changed = True
+                best_by_slug.pop(slug, None)
+                if m is None:
+                    snapshot_changed = True
+                    continue
+                market_best_roi = None
                 if router is not None:
                     live_bc = router.live_bc(slug)
                     _bk_src = router.get_src(slug) or "BetBoom"
@@ -1622,6 +1764,8 @@ def main():
                     if best_candidate_roi is None or roi > best_candidate_roi:
                         best_candidate_roi = roi
                         best_candidate_slug = slug
+                    if market_best_roi is None or roi > market_best_roi:
+                        market_best_roi = roi
                     if roi < min_roi:
                         scan_counts["below_roi"] += 1
                         continue
@@ -1798,45 +1942,82 @@ def main():
                         except Exception:
                             pass
 
+                if market_best_roi is not None:
+                    best_by_slug[slug] = market_best_roi
+                snapshot_changed = True
+
             _now = time.time()
             pm_book_states = {}
             for _detail in pm_no_ask_details:
                 _state = _detail.get("book_state", "unknown")
                 pm_book_states[_state] = pm_book_states.get(_state, 0) + 1
-            _write_json_atomic("pm_book_diagnostics.json", {
-                "ts": _now,
-                "cycle": scan_iteration,
-                "summary": {
-                    "pm_no_ask_markets": len(pm_no_ask_details),
-                    "by_book_state": pm_book_states,
-                },
-                "markets": pm_no_ask_details,
-            })
+            if router is not None and _now - last_router_health_refresh >= 1.0:
+                router_stats_cache = router.stats(market_map.keys())
+                router_feed_health_cache = router.feed_health()
+                last_router_health_refresh = _now
+            matching_stats = None
+            if router is not None:
+                bound_markets = int(router_stats_cache.get("bindings", 0))
+                matching_stats = {
+                    "pm_markets": len(market_map),
+                    "matched_pm_markets": bound_markets,
+                    "unmatched_pm_markets": max(0, len(market_map) - bound_markets),
+                    "bound_1win": int(router_stats_cache.get("bound_1win", 0)),
+                    "bound_betboom": int(router_stats_cache.get("bound_betboom", 0)),
+                    "onewin_catalog_matches": int(router_stats_cache.get("onewin_matches", 0)),
+                    "betboom_catalog_matches": int(router_stats_cache.get("bb_matches", 0)),
+                }
+            if _now - last_pm_diag_write >= 2.0:
+                _write_json_atomic("pm_book_diagnostics.json", {
+                    "ts": _now,
+                    "cycle": scan_iteration,
+                    "summary": {
+                        "pm_no_ask_markets": len(pm_no_ask_details),
+                        "by_book_state": pm_book_states,
+                    },
+                    "markets": pm_no_ask_details,
+                })
+                last_pm_diag_write = _now
             if _now - globals().get('_last_snap_write', 0) >= 2.0:
                 _write_json_atomic("arbs_live.json", live_snap)
                 globals()['_last_snap_write'] = _now
+
+            if best_by_slug:
+                best_candidate_slug, best_candidate_roi = max(
+                    best_by_slug.items(), key=lambda item: item[1]
+                )
+            else:
+                best_candidate_slug = None
+                best_candidate_roi = None
 
             last_scan_status = {
                 "state": "running",
                 "ts": _now,
                 "cycle": scan_iteration,
+                "update_mode": "event",
+                "checks_scope": "last_dispatch_batch",
+                "processed_markets": len(dirty_slugs),
+                "source_updates": len(source_events),
+                "pending_updates": len(update_queue),
+                "event_received_at": source_event_at,
+                "event_to_snapshot_ms": round(max(0.0, _now - source_event_at) * 1000, 1)
+                if source_event_at is not None else None,
                 "pm_markets": len(market_map),
                 "phase_counts": phase_counts,
                 "checks": scan_counts,
                 "source_counts": source_counts,
+                "matching_stats": matching_stats,
                 "pm_book_summary": {
                     "pm_no_ask_markets": len(pm_no_ask_details),
                     "by_book_state": pm_book_states,
                 },
-                "bookmaker_feed_health": router.feed_health() if router is not None else {},
+                "bookmaker_feed_health": router_feed_health_cache,
                 "pm_catalog_complete": pm_catalog_complete,
                 "pm_catalog_retained": pm_catalog_retained,
                 "signals": len(live_snap),
                 "min_roi_pct": round(min_roi * 100, 3),
-                "best_candidate_roi_pct": (
-                    round(best_candidate_roi * 100, 3)
-                    if best_candidate_roi is not None else None
-                ),
+                "best_candidate_roi_pct": round(best_candidate_roi * 100, 3)
+                if best_candidate_roi is not None else None,
                 "best_candidate_slug": best_candidate_slug,
                 "bank_rub": round(bank, 2),
                 "usd_rub": round(rate, 4),
@@ -1844,8 +2025,11 @@ def main():
             if _now - last_status_write >= 1.0:
                 _write_scan_status(last_scan_status)
                 last_status_write = _now
-
-            time.sleep(poll)
+            if router is not None and dirty_slugs:
+                refresh_event_indexes()
+            if publisher is not None and (snapshot_changed or _now - last_publish >= 0.5):
+                publisher.publish(live_snap, last_scan_status)
+                last_publish = _now
     except KeyboardInterrupt:
         print()
         print("[*] stopped")
@@ -1856,6 +2040,13 @@ def main():
             last_scan_status["state"] = "stopped"
             last_scan_status["ts"] = time.time()
             _write_scan_status(last_scan_status)
+        set_pm_update_callback(None)
+        if publisher is not None:
+            try:
+                publisher.publish(live_snap, last_scan_status)
+                publisher.close(timeout=1.0)
+            except Exception:
+                pass
         try:
             if router is not None:
                 router.stop()

@@ -376,6 +376,11 @@ class OneWinStream:
         self._price_update_count = 0
         self._last_odds_message_at = None
         self._last_price_update_at = None
+        self._odds_update_callback = None
+
+    def set_odds_update_callback(self, callback):
+        """Register a non-blocking listener called after an odds message is applied."""
+        self._odds_update_callback = callback
 
     def _headers(self):
         return {
@@ -753,6 +758,12 @@ class OneWinStream:
                         merged_group[field] = group[field]
                 merged_group.update({"groupId": group_id, "odds": odds, "receivedAt": now})
                 bucket[group_id] = merged_group
+        callback = self._odds_update_callback
+        if callback is not None:
+            try:
+                callback(mid)
+            except Exception:
+                pass
 
     def _pm_sport_id(self, slug: str):
         s = (slug or "").lower()
