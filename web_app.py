@@ -529,7 +529,7 @@ async def api_trades(limit: int = 0):
 @app.get("/api/daily")
 async def api_daily(date: str = ""):
     if not date:
-        date = time.strftime("%Y-%m-%d")
+        date = time.strftime("%Y-%m-%d", time.gmtime())
     trades = []
     if TRADES_FILE.exists():
         for line in TRADES_FILE.read_text(encoding="utf-8").splitlines():
@@ -553,9 +553,9 @@ async def api_daily(date: str = ""):
 
 @app.get("/api/weekly")
 async def api_weekly():
-    from datetime import datetime, timedelta
+    from datetime import datetime, timedelta, timezone
     out = []
-    today = datetime.now().date()
+    today = datetime.now(timezone.utc).date()
     for i in range(6, -1, -1):
         d = (today - timedelta(days=i)).isoformat()
         trades = []

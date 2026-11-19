@@ -115,12 +115,34 @@ function toast(msg, err) {
   el._t = setTimeout(() => el.classList.add('hidden'), 2400);
 }
 
+/* Separate from the per-deal bank in config.json; kept only in this browser. */
+function updateBankLimit() {
+  const input = document.getElementById('risk-total-bank');
+  const output = document.getElementById('risk-limit');
+  if (!input || !output) return;
+  const bank = Number(input.value);
+  const valid = input.value.trim() !== '' && Number.isFinite(bank) && bank >= 0;
+  output.textContent = valid ? fmtMoney(bank * 0.4) : '—';
+  try {
+    if (valid) localStorage.setItem('poly_arb_total_bank', String(bank));
+    else localStorage.removeItem('poly_arb_total_bank');
+  } catch (e) {}
+}
+
+function setPanelStatus(connected) {
+  const label = document.getElementById('feed-status');
+  const dot = document.getElementById('feed-dot');
+  if (label) label.textContent = connected ? 'Панель подключена' : 'Нет связи с панелью';
+  if (dot) dot.classList.toggle('connected', connected);
+}
+
 /* ============= WS ============= */
 function connectWS() {
-  const ws = new WebSocket(`ws://${location.host}/ws`);
-  ws.onopen = () => {};
-  ws.onclose = () => setTimeout(connectWS, 1500);
-  ws.onerror = () => {};
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const ws = new WebSocket(`${protocol}//${location.host}/ws`);
+  ws.onopen = () => setPanelStatus(true);
+  ws.onclose = () => { setPanelStatus(false); setTimeout(connectWS, 1500); };
+  ws.onerror = () => setPanelStatus(false);
   ws.onmessage = (ev) => {
     try {
       const msg = JSON.parse(ev.data);
@@ -176,8 +198,8 @@ function updateHeader() {
     topEl.textContent = fmtPct(state.visible[0].roi);
     topEl.style.color = state.visible[0].roi >= 0 ? 'var(--green)' : 'var(--red)';
   } else {
-    topEl.textContent = '+0.00%';
-    topEl.style.color = 'var(--green)';
+    topEl.textContent = '—';
+    topEl.style.color = 'var(--txt2)';
   }
 }
 
@@ -195,7 +217,7 @@ function renderArbs() {
   box.innerHTML = state.visible.map(a => {
     const legs = a.bets || [];
     const pmLeg = legs.find(l => l.source === 'Polymarket') || {};
-    const bbLeg = legs.find(l => l.source === 'BetBoom') || {};
+    const bbLeg = legs.find(l => l.source && l.source !== 'Polymarket') || {};
     const tags = [];
     tags.push(`<span class="tag ${escapeHtml(sportClass(a.sport))}">${escapeHtml(a.sport || '')}</span>`);
     if (a.market_type) tags.push(`<span class="tag mtype">${escapeHtml(a.market_type)}</span>`);
@@ -225,7 +247,7 @@ function renderArbs() {
         <div class="arb-tags">${tags.join('')}</div>
         <div class="arb-meta">
           <div class="arb-bks">
-            <span class="bk-chip bb">${escapeHtml(bbLeg.source || 'BB')}</span>
+            <span class="bk-chip ${bbLeg.source === '1win' ? 'onewin' : 'bb'}">${escapeHtml(bbLeg.source || 'БК')}</span>
             <span class="bk-chip pm">Polymarket</span>
           </div>
           <span>${fmtAgo(a.age_sec)}</span>
@@ -238,6 +260,8 @@ function renderArbs() {
 /* ============= DETAIL ============= */
 function selectArb(slug) {
   state.activeSlug = slug;
+  state.detailEdited = false;
+  state.calcEdited = false;
   const ph = document.getElementById('detail-placeholder');
   const body = document.getElementById('detail-body');
   if (ph) { ph.classList.add('hidden'); ph.style.display = 'none'; }     // ← inline!
@@ -287,7 +311,7 @@ function refreshDetail() {
   document.getElementById('kpi-age').textContent = fmtAgo(a.age_sec);
 
   const pmLeg = (a.bets || []).find(l => l.source === 'Polymarket') || {};
-  const bbLeg = (a.bets || []).find(l => l.source === 'BetBoom') || {};
+  const bbLeg = (a.bets || []).find(l => l.source && l.source !== 'Polymarket') || {};
 
   const pmAsk = a.pm_best_ask || 0;
   document.getElementById('kpi-depth').textContent = pmAsk ? (pmAsk * 100).toFixed(1) + '¢' : '—';
@@ -307,32 +331,45 @@ function refreshDetail() {
   }
 
   document.getElementById('pm-side-lbl').textContent = pmLeg.outcome || '—';
+  renderHowMuch(a);
   loadPmBook(a.slug);
   loadPriceChart(a.slug);
-  renderHowMuch(a);
 }
 
 /* ============= PM BOOK ============= */
 async function loadPmBook(slug) {
+  const requestId = state.bookRequestId = (state.bookRequestId || 0) + 1;
   const tbody = document.getElementById('pm-book-body');
   const foot = document.getElementById('pm-book-foot');
   tbody.innerHTML = '<tr><td colspan="3" class="empty-cell">Загрузка…</td></tr>';
   foot.textContent = '—';
+  const enteredUsd = parseFloat(document.getElementById('hm-pm-stake')?.value || '0');
+  const requestedUsd = Number.isFinite(enteredUsd) && enteredUsd >= 1 && enteredUsd <= 100000
+    ? enteredUsd : 50;
   try {
-    const r = await fetch(`/api/pm_book/${encodeURIComponent(slug)}?size_usd=50`);
+    const r = await fetch(`/api/pm_book/${encodeURIComponent(slug)}?size_usd=${requestedUsd}`);
     const j = await r.json();
+    if (requestId !== state.bookRequestId || state.activeSlug !== slug) return;
     if (!j.ok || !j.books || !j.books.length) {
       tbody.innerHTML = '<tr><td colspan="3" class="empty-cell">Стакан недоступен</td></tr>';
       return;
     }
     const a = getActive();
+    if (!a || a.slug !== slug) return;
     const pmLeg = (a.bets || []).find(l => l.source === 'Polymarket') || {};
-    let book = j.books.find(b => (b.outcome || '').trim() === (pmLeg.outcome || '').trim()) || j.books[0];
+    const book = j.books.find(b => (b.outcome || '').trim() === (pmLeg.outcome || '').trim());
+    if (!book) {
+      tbody.innerHTML = '<tr><td colspan="3" class="empty-cell">Исход в стакане не найден</td></tr>';
+      return;
+    }
 
     pmBookCache[slug] = {
+      outcome: pmLeg.outcome,
       best_ask: book.best_ask,
       best_bid: book.best_bid,
       ask_depth_usd: book.ask_depth_usd,
+      avg_for_size: book.avg_for_size,
+      requested_usd: requestedUsd,
     };
 
     const pmUsd = parseFloat(document.getElementById('hm-pm-stake')?.value || '0');
@@ -362,11 +399,16 @@ async function loadPmBook(slug) {
       ? book.ask_depth_usd
       : asks.reduce((s, l) => s + l.price * l.size, 0);
     const totalLevels = (book.asks || []).length;
-    let footTxt = 'задействуем ' + Math.min(totalLevels, 7) + ' уровней · всего в книге $' + Math.round(totalUsd).toLocaleString('ru-RU');
-    if (totalUsd < 100) footTxt += ' · ⚠ тонкий стакан';
+    let footTxt = 'показано ' + Math.min(totalLevels, 7) + ' уровней · глубина ask $' + Math.round(totalUsd).toLocaleString('ru-RU');
+    if (book.avg_for_size && !book.avg_for_size.full) footTxt += ' · недостаточно для $' + requestedUsd.toFixed(2);
     foot.textContent = footTxt;
+    const avg = book.avg_for_size;
+    document.getElementById('hm-avg').textContent = avg && avg.avg_price
+      ? (avg.avg_price * 100).toFixed(1) + '¢ · $' + requestedUsd.toFixed(2) + (avg.full ? '' : ' · неполный объём') : '—';
   } catch (e) {
-    tbody.innerHTML = '<tr><td colspan="3" class="empty-cell">Ошибка сети</td></tr>';
+    if (requestId === state.bookRequestId && state.activeSlug === slug) {
+      tbody.innerHTML = '<tr><td colspan="3" class="empty-cell">Ошибка сети</td></tr>';
+    }
   }
 }
 
@@ -444,33 +486,45 @@ async function loadPriceChart(slug) {
 /* ============= HOW MUCH TO BET ============= */
 function renderHowMuch(a) {
   const pmLeg = (a.bets || []).find(l => l.source === 'Polymarket') || {};
-  const bbLeg = (a.bets || []).find(l => l.source === 'BetBoom') || {};
-  document.getElementById('hm-bb-name').textContent = bbLeg.source || 'BetBoom';
+  const bbLeg = (a.bets || []).find(l => l.source && l.source !== 'Polymarket') || {};
+  document.getElementById('hm-bb-name').textContent = bbLeg.source || 'Букмекер';
   document.getElementById('hm-rate').textContent = 'курс ' + (a.rate || state.config.rate || 85);
 
   const stakes = a.stakes || [0, 0];
   let pmSt = 0, bbSt = 0;
   (a.bets || []).forEach((l, i) => {
     if (l.source === 'Polymarket') pmSt = stakes[i] || 0;
-    if (l.source === 'BetBoom') bbSt = stakes[i] || 0;
+    if (l.source && l.source !== 'Polymarket') bbSt = stakes[i] || 0;
   });
   const rate = a.rate || state.config.rate || 85;
-  document.getElementById('hm-bb-stake').value = Math.round(bbSt);
-  document.getElementById('hm-pm-stake').value = (pmSt / rate).toFixed(2);
+  if (!state.detailEdited) {
+    document.getElementById('hm-bb-stake').value = Math.round(bbSt);
+    document.getElementById('hm-pm-stake').value = (pmSt / rate).toFixed(2);
+  }
   // лучшее ask из стакана, а не среднее по $50
-  const pmBestAsk = pmBookCache[state.activeSlug]?.best_ask;
+  const cachedBook = pmBookCache[state.activeSlug]?.outcome === pmLeg.outcome
+    ? pmBookCache[state.activeSlug] : null;
+  const pmBestAsk = cachedBook?.best_ask;
   if (pmBestAsk) {
     document.getElementById('hm-price').textContent = (pmBestAsk * 100).toFixed(1) + '¢';
   } else {
-    document.getElementById('hm-price').textContent = pmLeg.o ? (100 / pmLeg.o).toFixed(1) + '¢' : '—';
+    const snapshotAsk = Number(pmLeg.pm_best_ask || a.pm_best_ask);
+    document.getElementById('hm-price').textContent = snapshotAsk > 0 && snapshotAsk < 1
+      ? (snapshotAsk * 100).toFixed(1) + '¢' : '—';
   }
-  document.getElementById('hm-avg').textContent = '—';
+  const avg = cachedBook?.avg_for_size;
+  const enteredUsd = Number(document.getElementById('hm-pm-stake').value);
+  document.getElementById('hm-avg').textContent = avg && avg.avg_price && Math.abs(cachedBook.requested_usd - enteredUsd) < 0.005
+    ? (avg.avg_price * 100).toFixed(1) + '¢ · $' + cachedBook.requested_usd.toFixed(2) + (avg.full ? '' : ' · неполный объём') : '—';
   document.getElementById('hm-eff').textContent = pmLeg.o ? fmtOdds(pmLeg.o) : '—';
 
   recalcHowMuch();
 
   const buyBtn = document.getElementById('btn-buy-pm');
-  buyBtn.textContent = `КУПИТЬ НА POLYMARKET · $${parseFloat(document.getElementById('hm-pm-stake').value || 0).toFixed(2)} ↗`;
+  buyBtn.textContent = `ОТКРЫТЬ POLYMARKET · $${parseFloat(document.getElementById('hm-pm-stake').value || 0).toFixed(2)} ↗`;
+  const bkBtn = document.getElementById('btn-open-bb');
+  bkBtn.disabled = bbLeg.source !== 'BetBoom';
+  bkBtn.title = bkBtn.disabled ? 'Ссылка для этого источника ещё не подключена' : 'Открыть страницу события БК';
 }
 
 function recalcHowMuch() {
@@ -481,7 +535,7 @@ function recalcHowMuch() {
   const pmStakeRub = pmUsd * rate;
 
   const pmLeg = (a.bets || []).find(l => l.source === 'Polymarket') || {};
-  const bbLeg = (a.bets || []).find(l => l.source === 'BetBoom') || {};
+  const bbLeg = (a.bets || []).find(l => l.source && l.source !== 'Polymarket') || {};
   const pmO = pmLeg.o || 0, bbO = bbLeg.o || 0;
 
   const pay1 = pmStakeRub * pmO;
@@ -497,9 +551,9 @@ function recalcHowMuch() {
   profitEl.style.color = profit >= 0 ? 'var(--green)' : 'var(--red)';
 
   document.getElementById('btn-buy-pm').textContent =
-    `КУПИТЬ НА POLYMARKET · $${pmUsd.toFixed(2)} ↗`;
+    `ОТКРЫТЬ POLYMARKET · $${pmUsd.toFixed(2)} ↗`;
 
-  syncCalcFromDetail(pmLeg, bbLeg, pmUsd, bbStake, rate);
+  if (!state.calcEdited) syncCalcFromDetail(pmLeg, bbLeg, pmUsd, bbStake, rate);
 }
 
 /* ============= RIGHT CALC ============= */
@@ -507,7 +561,11 @@ function syncCalcFromDetail(pmLeg, bbLeg, pmUsd, bbStake, rate) {
   document.getElementById('calc-bk-name').textContent = bbLeg.source || '—';
   document.getElementById('calc-bk-odds').value = (bbLeg.o || 0).toFixed(2);
   document.getElementById('calc-bk-stake').value = Math.round(bbStake);
-  document.getElementById('calc-pm-price').value = pmLeg.o ? (100 / pmLeg.o).toFixed(1) : '0';
+  const a = getActive();
+  const cachedAsk = pmBookCache[state.activeSlug]?.outcome === pmLeg.outcome
+    ? pmBookCache[state.activeSlug].best_ask : null;
+  const rawAsk = Number(cachedAsk || pmLeg.pm_best_ask || (a && a.pm_best_ask));
+  document.getElementById('calc-pm-price').value = rawAsk > 0 && rawAsk < 1 ? (rawAsk * 100).toFixed(1) : '0';
   document.getElementById('calc-pm-stake').value = pmUsd.toFixed(2);
   document.getElementById('calc-rate').value = rate.toFixed(2);
   updateCalcHint();
@@ -519,7 +577,7 @@ function updateCalcHint() {
   const pmP = parseFloat(document.getElementById('calc-pm-price').value || '0') / 100;
   const pmSt = parseFloat(document.getElementById('calc-pm-stake').value || '0');
   const rate = parseFloat(document.getElementById('calc-rate').value || '85');
-  const FEE = state.config.pm_fee_pct || 0.04;
+  const FEE = state.config.pm_fee_pct ?? 0.04;
 
   const pmO = pmP > 0 ? (1 / pmP) / (1 + FEE) : 0;
   const pmRub = pmSt * rate;
@@ -531,7 +589,11 @@ function updateCalcHint() {
   const roi = bank > 0 ? profit / bank : 0;
 
   const hint = document.getElementById('calc-hint');
-  if (bank <= 0) { hint.textContent = 'Введи кэф и ставку'; hint.style.color = 'var(--dim)'; return; }
+  if (!(bkO > 1 && bkSt > 0 && pmP > 0 && pmP < 1 && pmSt > 0 && rate > 0)) {
+    hint.textContent = 'Укажи обе суммы, кэф БК, цену PM и курс';
+    hint.style.color = 'var(--dim)';
+    return;
+  }
   hint.innerHTML = `Банк: <b>${fmtMoney(bank)}</b> · Профит: <b style="color:${profit >= 0 ? 'var(--green)' : 'var(--red)'}">${profit >= 0 ? '+' : ''}${fmtMoney(profit)}</b> · ROI: <b style="color:${roi >= 0 ? 'var(--green)' : 'var(--red)'}">${fmtPct(roi)}</b>`;
   hint.style.color = 'var(--txt)';
 }
@@ -565,7 +627,7 @@ async function openConfig() {
     const j = await r.json();
     document.getElementById('cfg-bank').value = j.bank || 2500;
     document.getElementById('cfg-rate').value = j.rate || 85;
-    document.getElementById('cfg-fee').value = ((j.pm_fee_pct || 0.04) * 100).toFixed(1);
+    document.getElementById('cfg-fee').value = ((j.pm_fee_pct ?? 0.04) * 100).toFixed(1);
     document.getElementById('cfg-safe').value = (j.safe_fork_threshold || 0.45);
   } catch (e) {}
   document.getElementById('modal-config').classList.remove('hidden');
@@ -612,11 +674,11 @@ function renderEditor() {
   const a = state.editing; if (!a) return;
   const legs = a.bets || [];
   const pm = legs.find(l => l.source === 'Polymarket') || {};
-  const bb = legs.find(l => l.source === 'BetBoom') || {};
+  const bb = legs.find(l => l.source && l.source !== 'Polymarket') || {};
   let pmSt = 0, bbSt = 0;
   legs.forEach((l, i) => {
-    if (l.source === 'Polymarket') pmSt = a.stakes[i];
-    if (l.source === 'BetBoom') bbSt = a.stakes[i];
+    if (l.source === 'Polymarket') pmSt = (a.stakes || [])[i] || 0;
+    if (l.source && l.source !== 'Polymarket') bbSt = (a.stakes || [])[i] || 0;
   });
   const rate = a.rate || state.config.rate || 85;
   document.getElementById('ed-match').textContent = a.title
@@ -626,7 +688,7 @@ function renderEditor() {
   const pmUsd = rate > 0 ? pmSt / rate : pmSt;
 
   document.getElementById('ed-leg-0').innerHTML = `
-    <div class="leg-head"><span class="lbl">Плечо 1</span><span class="leg-bk">${escapeHtml(bb.source || 'BetBoom')}</span></div>
+    <div class="leg-head"><span class="lbl">Плечо 1</span><span class="leg-bk">${escapeHtml(bb.source || 'Букмекер')}</span></div>
     <div class="leg-field"><span class="lbl">Исход</span><input type="text" id="ed-bb-outcome" value="${escapeHtml(bb.outcome || '')}" readonly></div>
     <div class="leg-field"><span class="lbl">Коэффициент</span><input type="number" step="0.01" id="ed-bb-odds" value="${bb.o || 0}"></div>
     <div class="leg-field"><span class="lbl">Ставка, ₽</span><input type="number" step="1" id="ed-bb-stake" value="${bbSt.toFixed(0)}"></div>
@@ -634,7 +696,7 @@ function renderEditor() {
   document.getElementById('ed-leg-1').innerHTML = `
     <div class="leg-head"><span class="lbl">Плечо 2</span><span class="leg-bk">Polymarket</span></div>
     <div class="leg-field"><span class="lbl">Исход</span><input type="text" id="ed-pm-outcome" value="${escapeHtml(pm.outcome || '')}" readonly></div>
-    <div class="leg-field"><span class="lbl">Цена, ¢</span><input type="number" step="0.1" id="ed-pm-price" value="${pm.o ? (100 / pm.o).toFixed(1) : '0'}"></div>
+    <div class="leg-field"><span class="lbl">Цена, ¢</span><input type="number" step="0.1" id="ed-pm-price" value="${Number(pm.pm_best_ask || a.pm_best_ask) > 0 ? (Number(pm.pm_best_ask || a.pm_best_ask) * 100).toFixed(1) : '0'}"></div>
     <div class="leg-field"><span class="lbl">Ордер, $</span><input type="number" step="0.01" id="ed-pm-amount" value="${pmUsd.toFixed(2)}"></div>
     <div class="leg-field"><span class="lbl">Курс ₽/$</span><input type="number" step="0.01" id="ed-rate" value="${rate.toFixed(2)}"></div>
   `;
@@ -652,7 +714,7 @@ function recalcEditor() {
   const pmPrice = parseFloat(document.getElementById('ed-pm-price').value || '0') / 100;
   const pmUsd = parseFloat(document.getElementById('ed-pm-amount').value || '0');
   const rate = parseFloat(document.getElementById('ed-rate').value || '85');
-  const FEE = state.config.pm_fee_pct || 0.04;
+  const FEE = state.config.pm_fee_pct ?? 0.04;
   const pmO = pmPrice > 0 ? (1 / pmPrice) / (1 + FEE) : 0;
   const pmRub = pmUsd * rate;
   const bank = bbSt + pmRub;
@@ -681,7 +743,7 @@ async function saveTrade() {
     bank: a._calc.bank, profit: a._calc.profit, roi: a._calc.roi,
     payout: a._calc.payout, rate: a._calc.rate,
     legs: [
-      { book: 'BetBoom', outcome: ((a.bets.find(b => b.source === 'BetBoom') || {}).outcome) || '',
+      { book: ((a.bets.find(b => b.source && b.source !== 'Polymarket') || {}).source) || 'Букмекер', outcome: ((a.bets.find(b => b.source && b.source !== 'Polymarket') || {}).outcome) || '',
         odds: a._calc.bb_odds, stake_rub: a._calc.bb_stake_rub },
       { book: 'Polymarket', outcome: ((a.bets.find(b => b.source === 'Polymarket') || {}).outcome) || '',
         price_usd: a._calc.pm_price, amount_usd: a._calc.pm_amount_usd,
@@ -720,11 +782,11 @@ async function checkPM() {
     const j = await r.json();
     if (!j.ok) { body.innerHTML = '<div class="pm-check-err">' + escapeHtml(j.err || 'unknown') + '</div>'; return; }
     const pmOutcome = document.getElementById('ed-pm-outcome').value;
-    let book = j.books.find(b => (b.outcome || '').trim() === pmOutcome.trim()) || j.books[0];
+    let book = j.books.find(b => (b.outcome || '').trim() === pmOutcome.trim());
     if (!book || !book.best_ask) { body.innerHTML = '<div class="pm-check-err">PM \u0441\u0442\u0430\u043A\u0430\u043D \u043F\u0443\u0441\u0442</div>'; return; }
     const ba = book.best_ask;
     const pmPrice = parseFloat(document.getElementById('ed-pm-price').value || '0') / 100;
-    const FEE = state.config.pm_fee_pct || 0.04;
+    const FEE = state.config.pm_fee_pct ?? 0.04;
     const curOdds = pmPrice > 0 ? (1 / pmPrice) / (1 + FEE) : 0;
     const liveOdds = (1 / ba) / (1 + FEE);
     const diffPct = curOdds > 0 ? ((liveOdds - curOdds) / curOdds * 100) : 0;
@@ -750,6 +812,11 @@ function refreshPMNow() { checkPM(); }
 
 function openBBCoords() {
   const a = getActive(); if (!a) return;
+  const bkLeg = (a.bets || []).find(leg => leg.source && leg.source !== 'Polymarket');
+  if (!bkLeg || bkLeg.source !== 'BetBoom') {
+    toast('Ссылка для этого источника ещё не подключена', true);
+    return;
+  }
   const mid = a.bb_match_id;
   const tour = a.bb_tournament_id;
   const sportMap = { 'CS2': 'cs2', 'DOTA2': 'dota-2', 'LOL': 'lol', 'VALORANT': 'valorant', 'TENNIS': 'tennis' };
@@ -757,19 +824,21 @@ function openBBCoords() {
   const url = (tour && mid)
     ? 'https://betboom.ru/esport/' + sp + '/' + tour + '/' + mid
     : 'https://betboom.ru/esport/' + sp + '/live';
-  window.open(url, '_blank');
+  if (!(tour && mid)) toast('Точная ссылка неизвестна — открывается общая страница');
+  window.open(url, '_blank', 'noopener,noreferrer');
 }
 async function openPMUrl() {
   const a = getActive(); if (!a) return;
   try {
     const r = await fetch('/api/pm_url/' + encodeURIComponent(a.slug));
     const j = await r.json();
-    if (j.url) window.open(j.url, '_blank');
+    if (j.url) window.open(j.url, '_blank', 'noopener,noreferrer');
     else toast('PM URL \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D', true);
   } catch (e) { toast('\u041E\u0448\u0438\u0431\u043A\u0430: ' + e.message, true); }
 }
 function markFilled() {
-  toast('\u041E\u0442\u043C\u0435\u0447\u0435\u043D\u043E \u043A\u0430\u043A \u0438\u0441\u043F\u043E\u043B\u043D\u0435\u043D\u043E');
+  const a = getActive();
+  if (a) openEdit(a.slug);
 }
 
 async function showTrades() {
@@ -889,10 +958,10 @@ function openDaily() {
 function closeDaily() { document.getElementById('modal-daily').classList.add('hidden'); }
 
 async function shutdownBot() {
-  if (!confirm('\u0412\u044B\u043A\u043B\u044E\u0447\u0438\u0442\u044C \u0431\u043E\u0442\u0430?')) return;
+  if (!confirm('Закрыть веб-панель? Сканер продолжит работу отдельно.')) return;
   try {
     await fetch('/api/shutdown', { method: 'POST' });
-    toast('\u0411\u043E\u0442 \u0432\u044B\u043A\u043B\u044E\u0447\u0430\u0435\u0442\u0441\u044F...');
+    toast('Панель закрывается...');
   } catch (e) { toast('\u0421\u0435\u0442\u044C: ' + e.message, true); }
 }
 
@@ -919,6 +988,8 @@ function init() {
 
   const cfgBtn = document.getElementById('btn-config');
   if (cfgBtn) cfgBtn.addEventListener('click', openConfig);
+  const dailyBtn = document.getElementById('btn-daily');
+  if (dailyBtn) dailyBtn.addEventListener('click', openDaily);
   const shutdownBtn = document.getElementById('btn-shutdown');
   if (shutdownBtn) shutdownBtn.addEventListener('click', shutdownBot);
 
@@ -926,9 +997,16 @@ function init() {
   if (detClose) detClose.addEventListener('click', closeDetail);
 
   const hmBB = document.getElementById('hm-bb-stake');
-  if (hmBB) hmBB.addEventListener('input', recalcHowMuch);
+  if (hmBB) hmBB.addEventListener('input', () => { state.detailEdited = true; recalcHowMuch(); });
   const hmPM = document.getElementById('hm-pm-stake');
-  if (hmPM) hmPM.addEventListener('input', recalcHowMuch);
+  if (hmPM) hmPM.addEventListener('input', () => {
+    state.detailEdited = true;
+    state.bookRequestId = (state.bookRequestId || 0) + 1;
+    document.getElementById('hm-avg').textContent = '—';
+    recalcHowMuch();
+    clearTimeout(state.bookRefreshTimer);
+    state.bookRefreshTimer = setTimeout(() => { if (state.activeSlug) loadPmBook(state.activeSlug); }, 600);
+  });
 
   const openBB = document.getElementById('btn-open-bb');
   if (openBB) openBB.addEventListener('click', openBBCoords);
@@ -939,10 +1017,11 @@ function init() {
 
   ['calc-bk-odds','calc-bk-stake','calc-pm-price','calc-pm-stake','calc-rate'].forEach(id => {
     const el = document.getElementById(id);
-    if (el) el.addEventListener('input', updateCalcHint);
+    if (el) el.addEventListener('input', () => { state.calcEdited = true; updateCalcHint(); });
   });
   const resetBtn = document.getElementById('btn-calc-reset');
   if (resetBtn) resetBtn.addEventListener('click', () => {
+    state.calcEdited = true;
     document.getElementById('calc-bk-odds').value = 0;
     document.getElementById('calc-bk-stake').value = 0;
     document.getElementById('calc-pm-price').value = 0;
@@ -951,7 +1030,14 @@ function init() {
     updateCalcHint();
   });
   const myArbsBtn = document.getElementById('btn-my-arbs');
-  if (myArbsBtn) myArbsBtn.addEventListener('click', openDaily);
+  if (myArbsBtn) myArbsBtn.addEventListener('click', showTrades);
+
+  const totalBank = document.getElementById('risk-total-bank');
+  if (totalBank) {
+    try { totalBank.value = localStorage.getItem('poly_arb_total_bank') || ''; } catch (e) {}
+    totalBank.addEventListener('input', updateBankLimit);
+    updateBankLimit();
+  }
 
   document.addEventListener('keydown', e => {
     if (e.key === 'Escape') {

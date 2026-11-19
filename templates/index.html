@@ -13,23 +13,25 @@
   <header class="hdr">
     <div class="hdr-left">
       <div class="logo">
-        <span class="logo-fork">🍴</span>
-        <span class="logo-text">POLY<span class="logo-accent">-ARB</span></span>
+        <span class="logo-fork" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M5 5v5a3 3 0 0 0 3 3h1v6M19 5v5a3 3 0 0 1-3 3h-1v6M8 5v5M16 5v5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="logo-text">POLY<span class="logo-accent">-ARB</span><small>TRADING TERMINAL</small></span>
       </div>
-      <div class="hdr-tabs">
-        <button class="tab active" data-phase="live">ЛАЙВ</button>
-        <button class="tab" data-phase="prematch">ПРЕМАТЧ</button>
+      <div class="hdr-tabs" aria-label="Режим событий">
+        <button class="tab active" data-phase="live"><span class="tab-live-dot" aria-hidden="true"></span> LIVE</button>
+        <button class="tab" data-phase="prematch">PREMATCH</button>
       </div>
     </div>
     <div class="hdr-right">
       <div class="stat-summary" id="hdr-summary">
         <span class="stat-count"><b id="st-total">0</b> вилок</span>
         <span class="stat-sep">·</span>
-        <span class="stat-roi">ТОП <b id="st-top-roi">+0.00%</b></span>
+        <span class="stat-roi">ТОП ROI <b id="st-top-roi">—</b></span>
       </div>
-      <button class="icon-btn" id="st-sound" title="Звук">🔊</button>
-      <button class="icon-btn" id="btn-config" title="Настройки">⚙️</button>
-      <button class="icon-btn danger" id="btn-shutdown" title="Выключить бота">⏻</button>
+      <div class="feed-indicator" role="status"><span class="feed-dot" id="feed-dot" aria-hidden="true"></span><span id="feed-status">Ожидание соединения</span></div>
+      <button class="header-action" id="btn-daily" type="button">Итоги дня</button>
+      <button class="icon-btn" id="st-sound" title="Звук" aria-label="Звук">🔊</button>
+      <button class="icon-btn" id="btn-config" title="Настройки" aria-label="Настройки">⚙</button>
+      <button class="icon-btn danger" id="btn-shutdown" title="Закрыть веб-панель" aria-label="Закрыть веб-панель">⏻</button>
     </div>
   </header>
 
@@ -38,6 +40,11 @@
 
     <!-- ============ COL 1: ARBS LIST ============ -->
     <aside class="col-list">
+      <div class="section-heading list-heading">
+        <div><div class="eyebrow">МОНИТОРИНГ РЫНКА</div><h1>Радар вилок</h1></div>
+        <span class="section-mark" aria-hidden="true">⌁</span>
+      </div>
+      <div class="filter-caption"><span>ФИЛЬТРЫ</span><span>ВИД СПОРТА</span></div>
       <div class="list-filters">
         <label class="chk"><input type="checkbox" id="f-cs2" checked> CS2</label>
         <label class="chk"><input type="checkbox" id="f-dota2" checked> DOTA2</label>
@@ -45,23 +52,35 @@
         <label class="chk"><input type="checkbox" id="f-tennis" checked> TENNIS</label>
         <label class="chk minroi">ROI ≥ <input type="number" id="f-minroi" value="0" min="0" max="100" step="0.5">%</label>
       </div>
+      <div class="list-caption"><span>НАЙДЕННЫЕ ВИЛКИ</span><span>ПО ROI ↓</span></div>
       <div class="arbs-list" id="arbs-list">
-        <div class="empty">Нет вилок по текущим фильтрам...</div>
+        <div class="empty">Нет вилок по текущим фильтрам.<br>Попробуйте изменить параметры поиска.</div>
       </div>
+      <div class="source-note"><span class="source-title">ИСТОЧНИКИ</span><span>BetBoom · legacy</span><span>1win · в разработке</span></div>
     </aside>
 
     <!-- ============ COL 2: ACTIVE ARB DETAIL ============ -->
     <section class="col-detail" id="col-detail">
       <div class="detail-placeholder" id="detail-placeholder">
-        <div class="ph-icon">🍴</div>
-        <div class="ph-text">Выбери вилку слева</div>
-        <div class="ph-sub">Клик по карточке — откроется стакан PM, график и калькулятор</div>
+        <div class="placeholder-content">
+          <div class="placeholder-orbit" aria-hidden="true"><div class="placeholder-orbit-inner"><svg viewBox="0 0 40 40" fill="none"><path d="M9 10v8a5 5 0 0 0 5 5h2v8M31 10v8a5 5 0 0 1-5 5h-2v8M14 10v8M26 10v8" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div></div>
+          <div class="eyebrow">РАБОЧЕЕ ПРОСТРАНСТВО</div>
+          <div class="ph-text">Выберите вилку</div>
+          <div class="ph-sub">Когда в радаре появятся подходящие события, выберите карточку слева, чтобы открыть детали.</div>
+          <div class="placeholder-steps">
+            <div><span class="step-number">01</span><span><b>Найдите событие</b><small>Настройте фильтры в радаре</small></span></div>
+            <div><span class="step-number">02</span><span><b>Изучите данные</b><small>Стакан, история цены и расчёт</small></span></div>
+            <div><span class="step-number">03</span><span><b>Проверьте вручную</b><small>Условия и исполнение на площадках</small></span></div>
+          </div>
+          <div class="placeholder-note">Нет подходящих вилок? Измените фильтры или дождитесь обновления данных.</div>
+        </div>
       </div>
 
       <div class="detail-body hidden" id="detail-body">
         <!-- header -->
         <div class="det-head">
           <div class="det-head-left">
+            <div class="eyebrow">ВЫБРАННОЕ СОБЫТИЕ</div>
             <div class="det-title" id="det-title">—</div>
             <div class="det-tags" id="det-tags"></div>
           </div>
@@ -79,7 +98,7 @@
             <div class="kpi-val" id="kpi-age">—</div>
           </div>
           <div class="kpi">
-            <div class="kpi-lbl">ЛУЧШИИЙ ASK</div>
+            <div class="kpi-lbl">ЛУЧШИЙ ASK</div>
             <div class="kpi-val" id="kpi-depth">—</div>
           </div>
           <div class="kpi">
@@ -94,9 +113,10 @@
           <div class="signal-note-text" id="signal-note-text">Низкая наблюдаемая цена — только фильтр, не гарантия исполнения или расчёта рынка.</div>
         </div>
 
-        <!-- 2-col inside detail: PM book + chart -->
-        <div class="det-mid">
-          <div class="panel">
+        <!-- Market data and calculation sit side by side on wide screens. -->
+        <div class="detail-workspace">
+        <div class="det-mid panel market-panel">
+          <div class="market-section">
             <div class="panel-head">
               <span>СТАКАН POLYMARKET</span>
               <span class="panel-sub" id="pm-side-lbl">—</span>
@@ -112,7 +132,7 @@
             <div class="pm-book-foot" id="pm-book-foot">—</div>
           </div>
 
-          <div class="panel">
+          <div class="market-section chart-section">
             <div class="panel-head">
               <span>ИСТОРИЯ ЦЕНЫ</span>
               <span class="panel-sub" id="chart-delta">—</span>
@@ -145,57 +165,70 @@
           <div class="hm-info">
             <div><span>Цена доли в стакане</span><b id="hm-price">—</b></div>
             <div><span>Средняя по стакану</span><b id="hm-avg">—</b></div>
-            <div><span>С комиссией и курсом</span><b id="hm-eff">—</b></div>
+            <div><span>Эфф. коэффициент PM</span><b id="hm-eff">—</b></div>
             <div class="hm-hl"><span>Всего в игре</span><b id="hm-total">—</b></div>
-            <div class="hm-hl"><span>Возврат при любом исходе</span><b id="hm-payout">—</b></div>
+            <div class="hm-hl"><span>Расчётный мин. возврат</span><b id="hm-payout">—</b></div>
             <div class="hm-hl"><span>Профит</span><b id="hm-profit" class="green">—</b></div>
           </div>
 
           <div class="hm-actions">
-            <button class="btn dark" id="btn-open-bb">ОТКРЫТЬ BETBOOM С СУММОЙ</button>
-            <button class="btn green" id="btn-buy-pm">КУПИТЬ НА POLYMARKET · $0.00 ↗</button>
-            <button class="btn dark" id="btn-filled">Залился в вилку ✓</button>
+            <button class="btn dark" id="btn-open-bb">ОТКРЫТЬ СОБЫТИЕ БК ↗</button>
+            <button class="btn green" id="btn-buy-pm">ОТКРЫТЬ POLYMARKET ↗</button>
+            <button class="btn dark" id="btn-filled">ЗАПИСАТЬ СДЕЛКУ</button>
           </div>
+          <div class="action-hint">Оценка по снимку; после изменения суммы требуется перепроверить обе стороны и глубину стакана. Сделка записывается вручную.</div>
+        </div>
         </div>
       </div>
     </section>
 
     <!-- ============ COL 3: CALCULATOR ============ -->
     <aside class="col-calc">
-      <div class="calc-head">КАЛЬКУЛЯТОР ВИЛКИ</div>
+      <div class="calc-heading"><div><div class="eyebrow">ИНСТРУМЕНТЫ</div><div class="calc-head">Калькулятор вилки</div></div><span class="calc-symbol" aria-hidden="true">⌗</span></div>
+      <p class="calc-intro">Рассчитайте параметры по своим значениям или выберите вилку в радаре.</p>
 
       <div class="calc-block">
-        <div class="calc-block-title">БУКМЕКЕР <span id="calc-bk-name">—</span></div>
+        <div class="calc-block-title"><span class="book-marker bb-marker"></span> БУКМЕКЕР <span id="calc-bk-name">—</span></div>
         <div class="calc-row">
-          <label>Кэф</label>
+          <label for="calc-bk-odds">Кэф</label>
           <input type="number" step="0.01" id="calc-bk-odds" value="0">
         </div>
         <div class="calc-row">
-          <label>Ставка, ₽</label>
+          <label for="calc-bk-stake">Ставка, ₽</label>
           <input type="number" step="1" id="calc-bk-stake" value="0">
         </div>
       </div>
 
       <div class="calc-block">
-        <div class="calc-block-title">POLYMARKET</div>
+        <div class="calc-block-title"><span class="book-marker pm-marker"></span> POLYMARKET</div>
         <div class="calc-row">
-          <label>Цена, ¢</label>
+          <label for="calc-pm-price">Цена, ¢</label>
           <input type="number" step="0.1" id="calc-pm-price" value="0">
         </div>
         <div class="calc-row">
-          <label>Купил на, $</label>
+          <label for="calc-pm-stake">Купил на, $</label>
           <input type="number" step="0.01" id="calc-pm-stake" value="0">
         </div>
       </div>
 
       <div class="calc-rate">
-        <span>курс</span>
+        <label for="calc-rate">курс</label>
         <input type="number" step="0.01" id="calc-rate" value="85">
         <span>₽ · из настроек</span>
         <button class="btn-mini" id="btn-calc-reset">Сброс</button>
       </div>
 
       <div class="calc-hint" id="calc-hint">Введи кэф и ставку на БК, цену и сумму на Полике</div>
+      <div class="calc-disclaimer">Упрощённая оценка по введённой цене, без проверки ликвидности.</div>
+
+      <div class="risk-block">
+        <div class="risk-title">ПЛАНИРОВАНИЕ БАНКА</div>
+        <label for="risk-total-bank">Общий банк, ₽</label>
+        <input type="number" id="risk-total-bank" min="0" placeholder="Не задан">
+        <div class="risk-result"><span>Ориентир на сделку</span><output id="risk-limit" for="risk-total-bank">—</output></div>
+        <div class="risk-hint">40% от общего банка · ориентир из вашего плана</div>
+        <div class="risk-hint risk-separate">Общий банк задаётся отдельно от банка на сделку в настройках.</div>
+      </div>
 
       <button class="btn green big" id="btn-my-arbs">МОИ ВИЛКИ</button>
     </aside>
@@ -220,13 +253,13 @@
       </div>
 
       <div class="summary">
-        <div class="sum-item"><div class="lbl">Общий банк</div><div class="val" id="ed-bank">—</div></div>
+        <div class="sum-item"><div class="lbl">Банк сделки</div><div class="val" id="ed-bank">—</div></div>
         <div class="sum-item"><div class="lbl">Профит при плече 1</div><div class="val" id="ed-p1">—</div></div>
         <div class="sum-item"><div class="lbl">Профит при плече 2</div><div class="val" id="ed-p2">—</div></div>
-        <div class="sum-item highlight"><div class="lbl">Гарантированный ROI</div><div class="val green" id="ed-roi">—</div></div>
+        <div class="sum-item highlight"><div class="lbl">Расчётный ROI</div><div class="val green" id="ed-roi">—</div></div>
       </div>
 
-      <div class="modal-hint">После сохранения графики и результат сделки пересчитываются автоматически.</div>
+      <div class="modal-hint">Укажите фактические параметры вручную. Значения в журнале остаются расчётными и не подтверждают исполнение.</div>
 
       <div class="modal-actions">
         <button class="btn dark" onclick="closeEdit()">ОТМЕНА</button>
@@ -234,13 +267,13 @@
         <button class="btn green" onclick="saveTrade()">СОХРАНИТЬ ИЗМЕНЕНИЯ</button>
       </div>
 
-      <div class="pm-check-panel hidden" id="pm-check-panel">
+      <div class="pm-check-panel">
         <div class="pm-check-head">
           ПРОВЕРКА PM-СТАКАНА
           <button class="btn-mini" onclick="checkPM()">Проверить PM</button>
-          <button class="btn-mini" onclick="refreshPMNow()">Форс-фетч</button>
         </div>
-        <div id="pm-check-body"></div>
+        <div class="pm-check-explainer">Проверяется только стакан Polymarket, не оба плеча сделки.</div>
+        <div class="pm-check-result hidden" id="pm-check-panel"><div id="pm-check-body"></div></div>
       </div>
     </div>
   </div>
@@ -252,6 +285,7 @@
         <div class="modal-title">ЖУРНАЛ СДЕЛОК</div>
         <button class="close" onclick="closeTrades()">✕</button>
       </div>
+      <div class="modal-disclaimer">Ручные записи · расчётные значения. Журнал не подтверждает фактическое исполнение и прибыль.</div>
       <div class="trades-list" id="trades-list"></div>
       <div class="modal-actions">
         <button class="btn dark" onclick="exportCSV()">ЭКСПОРТ CSV</button>
@@ -262,22 +296,23 @@
   <!-- ============ MODAL: DAILY DASHBOARD ============ -->
   <div class="modal-back hidden" id="modal-daily">
     <div class="modal wide">
-      <div class="modal-eyebrow">ИТОГИ ДНЯ</div>
+      <div class="modal-eyebrow">ИТОГИ ДНЯ · UTC</div>
       <div class="modal-head">
-        <div class="modal-title">Результаты без догадок</div>
+        <div class="modal-title">Статистика по записям</div>
         <button class="close" onclick="closeDaily()">✕</button>
       </div>
+      <div class="modal-disclaimer">Ручные записи · расчётные значения. Дни считаются по UTC. Это не подтверждённая прибыль и не количество найденных сигналов.</div>
 
       <div class="dash-kpis">
-        <div class="dk"><div class="lbl">СДЕЛОК</div><div class="val" id="daily-count">0</div></div>
+        <div class="dk"><div class="lbl">ЗАПИСЕЙ</div><div class="val" id="daily-count">0</div></div>
         <div class="dk"><div class="lbl">ОБОРОТ</div><div class="val" id="daily-bank">0 ₽</div></div>
-        <div class="dk"><div class="lbl">РЕЗУЛЬТАТ</div><div class="val green" id="daily-profit">+0 ₽</div></div>
-        <div class="dk"><div class="lbl">СРЕДНИЙ ROI</div><div class="val green" id="daily-roi">+0.000%</div></div>
+        <div class="dk"><div class="lbl">РАСЧЁТНЫЙ РЕЗУЛЬТАТ</div><div class="val green" id="daily-profit">+0 ₽</div></div>
+        <div class="dk"><div class="lbl">ROI ПО ЗАПИСЯМ</div><div class="val green" id="daily-roi">+0.000%</div></div>
       </div>
 
       <div class="dash-body">
         <div class="dash-col">
-          <div class="dash-col-title">ПРИБЫЛЬ ПО ДНЯМ · 7 ДНЕЙ</div>
+          <div class="dash-col-title">ROI ПО ДНЯМ · 7 ДНЕЙ</div>
           <div class="weekly-chart" id="weekly-chart"></div>
         </div>
         <div class="dash-col">
@@ -295,13 +330,13 @@
             </div>
             <div class="daily-meta">
               <div><span class="lbl">ОБОРОТ</span><b id="daily-bank2">0 ₽</b></div>
-              <div><span class="lbl">ROI ДНЯ</span><b id="daily-roi2">0%</b></div>
-              <div><span class="lbl">СДЕЛОК</span><b id="daily-count2">0</b></div>
+              <div><span class="lbl">ROI ПО ЗАПИСЯМ</span><b id="daily-roi2">0%</b></div>
+              <div><span class="lbl">ЗАПИСЕЙ</span><b id="daily-count2">0</b></div>
             </div>
           </div>
         </div>
         <div class="dash-col">
-          <div class="dash-col-title">ПОСЛЕДНИЕ СДЕЛКИ</div>
+          <div class="dash-col-title">ПОСЛЕДНИЕ ЗАПИСИ</div>
           <div class="recent-trades" id="recent-trades"></div>
         </div>
       </div>
@@ -328,10 +363,10 @@
         <button class="close" onclick="closeConfig()">✕</button>
       </div>
       <div class="config-grid">
-        <div class="cfg-row"><label>Банк по умолчанию, ₽</label><input type="number" id="cfg-bank" value="2500"></div>
+        <div class="cfg-row"><label for="cfg-bank">Банк на сделку по умолчанию, ₽</label><input type="number" id="cfg-bank" value="2500"></div>
         <div class="cfg-row"><label>Курс ₽/$ (fallback)</label><input type="number" step="0.01" id="cfg-rate" value="85"></div>
         <div class="cfg-row"><label>Комиссия Polymarket, %</label><input type="number" step="0.1" id="cfg-fee" value="4"></div>
-        <div class="cfg-row"><label>Safe-fork threshold, ¢</label><input type="number" step="0.01" id="cfg-safe" value="0.45"></div>
+        <div class="cfg-row"><label for="cfg-safe">Порог цены PM, доля 0–1</label><input type="number" step="0.01" id="cfg-safe" value="0.45"></div>
       </div>
       <div class="modal-actions">
         <button class="btn dark" onclick="closeConfig()">ОТМЕНА</button>
