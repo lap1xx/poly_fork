@@ -178,6 +178,57 @@ class OneWinFeedTests(unittest.TestCase):
         duplicate["id"] = 12346
         self.stream._store_matches([duplicate])
         self.assertIsNone(self.stream.bind(self.slug, ["Team Alpha", "Team Bravo"]))
+        diagnostic = self.stream.snapshot_match_diagnostics()[self.slug]
+        self.assertEqual(diagnostic["reason"], "ambiguous_event")
+        self.assertEqual(len(diagnostic["top_candidates"]), 2)
+
+    def test_name_normalization_handles_punctuation_and_cyrillic_transliteration(self):
+        self.assertEqual(self.ow._name_score("Виртус.pro", "Virtus Pro"), 1.0)
+        self.assertEqual(self.ow._name_score("NAVI Esports", "Navi"), 1.0)
+
+    def test_team_name_subset_is_not_accepted_as_a_match(self):
+        self.assertEqual(
+            self.ow._name_score("Team Spirit", "Team Spirit Academy"), 0.0
+        )
+
+    def test_curated_alias_group_matches_known_name_variant(self):
+        previous = self.ow._TEAM_ALIAS_INDEX
+        try:
+            self.ow._TEAM_ALIAS_INDEX = self.ow._build_alias_index(
+                [["Natus Vincere", "NaVi"]]
+            )
+            self.assertEqual(self.ow._name_score("Natus Vincere", "NaVi"), 1.0)
+        finally:
+            self.ow._TEAM_ALIAS_INDEX = previous
+
+    def test_alias_shared_by_two_groups_is_disabled(self):
+        index = self.ow._build_alias_index([
+            ["Alpha Pro", "Alpha"],
+            ["Alpha Academy", "Alpha"],
+        ])
+        self.assertIsNone(index["alpha"])
+
+    def test_time_context_resolves_duplicate_event_only_when_clear(self):
+        first = dict(self.match, startAt="2026-11-19T10:00:00Z")
+        duplicate = dict(self.match, id=12346, startAt="2026-11-20T10:00:00Z")
+        self.stream._store_matches([first, duplicate])
+        binding = self.stream.bind(
+            self.slug,
+            ["Team Alpha", "Team Bravo"],
+            {"start": "2026-11-19T10:30:00Z"},
+        )
+        self.assertIsNotNone(binding)
+        self.assertEqual(binding["match_id"], 12345)
+        self.assertEqual(binding["start_delta_hours"], 0.5)
+        diagnostic = self.stream.snapshot_match_diagnostics()[self.slug]
+        self.assertEqual(diagnostic["reason"], "matched_time_context")
+
+    def test_below_threshold_diagnostic_contains_top_candidate(self):
+        self.assertIsNone(self.stream.bind(self.slug, ["Completely Different", "Unknown Club"]))
+        diagnostic = self.stream.snapshot_match_diagnostics()[self.slug]
+        self.assertEqual(diagnostic["reason"], "below_threshold")
+        self.assertEqual(diagnostic["top_candidates"][0]["match_id"], 12345)
+        self.assertLess(diagnostic["top_candidates"][0]["score"], diagnostic["threshold"])
 
     def test_catalog_refresh_prunes_removed_matches_per_successful_sport(self):
         other_sport = dict(self.match, id=22345, sportId=47)

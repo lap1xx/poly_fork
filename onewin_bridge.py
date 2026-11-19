@@ -20,7 +20,9 @@ import re
 import threading
 import time
 import unicodedata
+from difflib import SequenceMatcher
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 
 try:
@@ -52,6 +54,10 @@ INITIAL_SUBSCRIPTION_LIMIT = 30
 SUBSCRIPTION_BATCH_SIZE = 30
 MATCH_REFRESH_SECONDS = 180
 MATCH_AMBIGUITY_MARGIN = 0.08
+TEAM_ALIASES_FILE = os.getenv(
+    "ONEWIN_TEAM_ALIASES_FILE",
+    os.path.join(os.path.dirname(__file__), "team_aliases.json"),
+)
 try:
     ODDS_MAX_AGE_SECONDS = float(os.getenv("ONEWIN_MAX_ODDS_AGE_SECONDS", "30"))
     if not math.isfinite(ODDS_MAX_AGE_SECONDS) or not 1.0 <= ODDS_MAX_AGE_SECONDS <= 600.0:
@@ -177,9 +183,82 @@ def _group_market_kind(name: str):
     return "winner", None
 
 
+_CYRILLIC_TRANSLATION = str.maketrans({
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e",
+    "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l",
+    "м": "m", "н": "n", "о": "o", "п": "p", "р": "r", "с": "s",
+    "т": "t", "у": "u", "ф": "f", "х": "kh", "ц": "ts", "ч": "ch",
+    "ш": "sh", "щ": "shch", "ъ": "", "ы": "y", "ь": "", "э": "e",
+    "ю": "yu", "я": "ya",
+})
+_GENERIC_TEAM_SUFFIXES = {"esport", "esports", "gaming"}
+
+
 def _plain_name(value: str) -> str:
-    s = unicodedata.normalize("NFKD", (value or "").strip().lower())
-    return "".join(c for c in s if not unicodedata.combining(c))
+    """Fold punctuation, accents and common Cyrillic/Latin spelling variants."""
+    s = unicodedata.normalize("NFKD", str(value or "").strip().casefold())
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    s = s.translate(_CYRILLIC_TRANSLATION).replace("&", " and ")
+    tokens = re.findall(r"[a-z0-9]+", s)
+    while tokens and tokens[-1] in _GENERIC_TEAM_SUFFIXES:
+        tokens.pop()
+    return " ".join(tokens)
+
+
+def _build_alias_index(groups):
+    index = {}
+    for group_no, group in enumerate(groups or []):
+        if not isinstance(group, (list, tuple)):
+            continue
+        normalized = {_plain_name(value) for value in group if _plain_name(value)}
+        if len(normalized) < 2:
+            continue
+        key = "alias:%d" % group_no
+        for name in normalized:
+            if name in index and index[name] != key:
+                index[name] = None
+            elif name not in index:
+                index[name] = key
+    return index
+
+
+def _load_alias_index(path=TEAM_ALIASES_FILE):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        return _build_alias_index(payload.get("groups", [])) if isinstance(payload, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+_TEAM_ALIAS_INDEX = _load_alias_index()
+
+
+def _parse_start_time(value):
+    if value is None or value == "":
+        return None
+    try:
+        if isinstance(value, (int, float)):
+            stamp = float(value)
+            if stamp > 10_000_000_000:
+                stamp /= 1000.0
+            return datetime.fromtimestamp(stamp, tz=timezone.utc)
+        text = str(value).strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except (OverflowError, OSError, TypeError, ValueError):
+        return None
+
+
+def _start_delta_hours(pm_start, bk_start):
+    pm_dt, bk_dt = _parse_start_time(pm_start), _parse_start_time(bk_start)
+    if pm_dt is None or bk_dt is None:
+        return None
+    return abs((pm_dt - bk_dt).total_seconds()) / 3600.0
 
 
 def _name_score(a: str, b: str) -> float:
@@ -188,13 +267,28 @@ def _name_score(a: str, b: str) -> float:
         return 0.0
     if a == b:
         return 1.0
-    if a in b or b in a:
-        return 0.88
-    def trigrams(s):
-        s = "  " + s + "  "
-        return {s[i:i + 3] for i in range(len(s) - 2)}
-    aa, bb = trigrams(a), trigrams(b)
-    return len(aa & bb) / max(len(aa), len(bb)) if aa and bb else 0.0
+    alias_a, alias_b = _TEAM_ALIAS_INDEX.get(a), _TEAM_ALIAS_INDEX.get(b)
+    if alias_a and alias_a == alias_b:
+        return 1.0
+    tokens_a, tokens_b = set(a.split()), set(b.split())
+    if tokens_a == tokens_b:
+        return 0.98
+    # A bare substring/team-name subset is too ambiguous (e.g. main vs academy).
+    if tokens_a.issubset(tokens_b) or tokens_b.issubset(tokens_a):
+        return 0.0
+    compact_a, compact_b = a.replace(" ", ""), b.replace(" ", "")
+    if min(len(compact_a), len(compact_b)) < 4:
+        return 0.0
+
+    def trigrams(value):
+        padded = "  " + value + "  "
+        return {padded[i:i + 3] for i in range(len(padded) - 2)}
+
+    tri_a, tri_b = trigrams(a), trigrams(b)
+    tri_score = len(tri_a & tri_b) / len(tri_a | tri_b) if tri_a or tri_b else 0.0
+    token_score = len(tokens_a & tokens_b) / len(tokens_a | tokens_b)
+    sequence_score = SequenceMatcher(None, a, b).ratio()
+    return 0.50 * sequence_score + 0.30 * tri_score + 0.20 * token_score
 
 
 def _team_from_outcome(odd: dict, match: dict):
@@ -231,6 +325,7 @@ class OneWinStream:
         # match_id -> group_id -> {name, isBase, odds: {odd_id: odd}}
         self.stakes: dict[str, dict] = {}
         self.bindings: dict[str, dict] = {}
+        self.match_diagnostics: dict[str, dict] = {}
         self._stop = threading.Event()
         self._ready = threading.Event()
         self._connected = threading.Event()
@@ -605,13 +700,57 @@ class OneWinStream:
         s = (slug or "").lower()
         return next((sid for pref, sid in PM_TO_ONEWIN_SPORT.items() if s.startswith(pref)), None)
 
-    def bind(self, slug: str, pm_teams):
+    def _record_match_diagnostic(self, slug, payload):
+        with self.lock:
+            self.match_diagnostics[str(slug)] = payload
+
+    def snapshot_match_diagnostics(self):
+        with self.lock:
+            return {slug: dict(value) for slug, value in self.match_diagnostics.items()}
+
+    def bind(self, slug: str, pm_teams, pm_context=None):
         kind, arg, _ = pm_market_kind(slug)
-        if kind not in ("winner", "map_winner") or not isinstance(pm_teams, (list, tuple)) or len(pm_teams) != 2:
+        teams_ok = isinstance(pm_teams, (list, tuple)) and len(pm_teams) == 2
+        base = {
+            "slug": str(slug),
+            "pm_teams": list(pm_teams) if teams_ok else [],
+            "market_kind": kind,
+        }
+
+        def record(reason, rows=None, threshold=None, selected=None, **extra):
+            top = []
+            for score, direct, reverse, delta_hours, candidate in (rows or [])[:3]:
+                top.append({
+                    "match_id": candidate.get("id"),
+                    "home": candidate.get("home"),
+                    "away": candidate.get("away"),
+                    "score": round(score, 4),
+                    "direct_score": round(direct, 4),
+                    "reverse_score": round(reverse, 4),
+                    "start_delta_hours": round(delta_hours, 2) if delta_hours is not None else None,
+                })
+            payload = dict(base)
+            payload.update({"reason": reason, "threshold": threshold, "top_candidates": top})
+            if selected is not None:
+                payload["selected_match_id"] = selected.get("id")
+            payload.update(extra)
+            self._record_match_diagnostic(slug, payload)
+
+        if kind not in ("winner", "map_winner"):
+            record("unsupported_market_type")
+            return None
+        if not teams_ok:
+            record("invalid_team_outcomes")
             return None
         sport_id = self._pm_sport_id(slug)
         if sport_id is None:
+            record("unsupported_sport")
             return None
+        base["sport_id"] = sport_id
+        threshold = 0.65 if sport_id == 33 else 0.75
+        pm_context = pm_context if isinstance(pm_context, dict) else {}
+        pm_start = (pm_context.get("start") or pm_context.get("eventStartTime")
+                    or pm_context.get("startAt"))
         with self.lock:
             candidates = list(self.matches.values())
         scored = []
@@ -624,29 +763,58 @@ class OneWinStream:
             home, away = match.get("home"), match.get("away")
             if not home or not away:
                 continue
-            direct = min(_name_score(pm_teams[0], home), _name_score(pm_teams[1], away))
-            reverse = min(_name_score(pm_teams[0], away), _name_score(pm_teams[1], home))
+            direct_parts = (_name_score(pm_teams[0], home), _name_score(pm_teams[1], away))
+            reverse_parts = (_name_score(pm_teams[0], away), _name_score(pm_teams[1], home))
+            direct = min(direct_parts)
+            reverse = min(reverse_parts)
             score = max(direct, reverse)
-            scored.append((score, match))
-        threshold = 0.65 if sport_id == 33 else 0.75
+            delta_hours = _start_delta_hours(pm_start, match.get("startAt"))
+            scored.append((score, direct, reverse, delta_hours, match))
         scored.sort(key=lambda item: item[0], reverse=True)
-        best_score, best = scored[0] if scored else (0.0, None)
+        if not scored:
+            record("no_sport_candidates", threshold=threshold)
+            return None
+        best_score, _, _, _, best = scored[0]
         if not best or best_score < threshold:
+            record("below_threshold", rows=scored, threshold=threshold)
             return None
-        if (len(scored) > 1 and scored[1][0] >= threshold
-                and best_score - scored[1][0] < MATCH_AMBIGUITY_MARGIN):
-            return None
+        near_best = [row for row in scored
+                     if row[0] >= threshold and best_score - row[0] < MATCH_AMBIGUITY_MARGIN]
+        used_time_context = False
+        if len(near_best) > 1:
+            with_time = [row for row in near_best if row[3] is not None]
+            if len(with_time) == len(near_best):
+                by_time = sorted(with_time, key=lambda row: row[3])
+                if by_time[0][3] <= 24.0 and by_time[1][3] - by_time[0][3] >= 6.0:
+                    best_score, _, _, _, best = by_time[0]
+                    used_time_context = True
+                else:
+                    record("ambiguous_event", rows=scored, threshold=threshold)
+                    return None
+            else:
+                record("ambiguous_event", rows=scored, threshold=threshold)
+                return None
         direct_avg = (_name_score(pm_teams[0], best["home"]) + _name_score(pm_teams[1], best["away"])) / 2
         reverse_avg = (_name_score(pm_teams[0], best["away"]) + _name_score(pm_teams[1], best["home"])) / 2
+        event_key = "%s:%s" % (
+            sport_id,
+            "|".join(sorted((_plain_name(pm_teams[0]), _plain_name(pm_teams[1])))),
+        )
         binding = {
             "match_id": best["id"], "sport_id": sport_id, "kind": kind,
             "arg": arg, "score": best_score, "swap": reverse_avg > direct_avg,
             "home": best["home"], "away": best["away"],
             "pm_home": pm_teams[0], "pm_away": pm_teams[1], "bound_at": time.time(),
-            "event_url": best.get("event_url"),
+            "event_url": best.get("event_url"), "event_key": event_key,
+            "start_delta_hours": _start_delta_hours(pm_start, best.get("startAt")),
         }
         with self.lock:
             self.bindings[slug] = binding
+        record(
+            "matched_time_context" if used_time_context else "matched",
+            rows=scored, threshold=threshold, selected=best,
+            event_key=event_key,
+        )
         self._subscribe_match(best["id"])
         return dict(binding)
 
@@ -750,9 +918,9 @@ def wait_ready(timeout: float = 120, min_matches: int = 1, poll: float = 0.5) ->
     return False
 
 
-def bind_slug(slug: str, pm_teams):
+def bind_slug(slug: str, pm_teams, pm_context=None):
     try:
-        return get_global_stream().bind(slug, pm_teams)
+        return get_global_stream().bind(slug, pm_teams, pm_context)
     except Exception:
         return None
 
@@ -762,6 +930,10 @@ def get_binding(slug: str):
     with stream.lock:
         binding = stream.bindings.get(slug)
         return dict(binding) if binding else None
+
+
+def get_match_diagnostics():
+    return get_global_stream().snapshot_match_diagnostics()
 
 
 def get_live_bc(slug: str):

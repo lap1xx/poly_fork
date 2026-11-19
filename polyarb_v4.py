@@ -1100,6 +1100,40 @@ def _write_scan_status(payload):
     _write_json_atomic(STATUS_FILE, payload)
 
 
+def _write_match_diagnostics(router, market_map):
+    """Publish explainable 1win matching results without changing arb decisions."""
+    if router is None or not getattr(router, "use_onewin", False):
+        return
+    try:
+        from onewin_bridge import get_match_diagnostics
+        diagnostics = get_match_diagnostics()
+    except Exception:
+        return
+    active = set(market_map or {})
+    diagnostics = {slug: row for slug, row in diagnostics.items() if slug in active}
+    reason_counts = {}
+    match_ids = set()
+    matched_markets = 0
+    for row in diagnostics.values():
+        reason = row.get("reason", "unknown")
+        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        if reason in {"matched", "matched_time_context"}:
+            matched_markets += 1
+            match_id = row.get("selected_match_id")
+            if match_id is not None:
+                match_ids.add(str(match_id))
+    _write_json_atomic("match_diagnostics.json", {
+        "ts": time.time(),
+        "summary": {
+            "markets_with_diagnostics": len(diagnostics),
+            "matched_pm_markets": matched_markets,
+            "unique_1win_events": len(match_ids),
+            "reason_counts": reason_counts,
+        },
+        "markets": diagnostics,
+    })
+
+
 def build_arb_candidates(m, live_bc, slip, bank=0.0, rate=0.0,
                          bk_source="BetBoom", diagnostics=None):
     def note(reason):
@@ -1289,6 +1323,7 @@ def main():
             print("    [!] bind %s: %s" % (slug, e))
     print("[*] bound 1win=%d BetBoom fallback=%d / %d"
           % (bound_ow, bound_bb, len(market_map)))
+    _write_match_diagnostics(router, market_map)
 
     # ---------- CBR rate ----------
     cbr_rate = get_rate()
@@ -1334,6 +1369,7 @@ def main():
             stream = get_global_stream()
             unbound = [s for s in market_map if s not in stream.bindings]
         if not unbound:
+            _write_match_diagnostics(router, market_map)
             return 0
         n = 0
         for slug in unbound:
@@ -1349,6 +1385,7 @@ def main():
                 pass
         if n:
             print("[*] retry-bind: +%d (unbound было %d)" % (n, len(unbound)))
+        _write_match_diagnostics(router, market_map)
         return n
 
     last_retry = time.time()

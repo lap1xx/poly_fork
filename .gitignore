@@ -18,6 +18,7 @@ vendor.txt
 arbs_live.json
 scanner_status.json
 scanner_status.json.tmp
+match_diagnostics.json
 config.json# temp
 __pycache__/
 *.pyc

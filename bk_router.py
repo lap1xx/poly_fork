@@ -172,7 +172,7 @@ class BKRouter:
         if len(pm_teams) != 2:
             return False
         try:
-            binding = _ow.bind_slug(slug, pm_teams)
+            binding = _ow.bind_slug(slug, pm_teams, market)
         except Exception:
             binding = None
         if not binding:
@@ -197,7 +197,7 @@ class BKRouter:
         # bound as a live fallback for temporary/missing 1win quotes as well.
         if self._can_use_onewin():
             try:
-                b = _ow.bind_slug(slug, pm_o)
+                b = _ow.bind_slug(slug, pm_o, pm_market)
             except Exception:
                 b = None
             if b:
