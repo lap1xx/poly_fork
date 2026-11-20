@@ -1,4 +1,3 @@
 @echo off
-cd /d "%~dp0.."
-python bot_live.py
-pause
+call "%~dp0..\bot_live.bat" %*
+exit /b %ERRORLEVEL%
