@@ -13,6 +13,7 @@ import json
 import math
 import os
 import pathlib
+import re
 import threading
 import time
 import urllib.parse
@@ -61,6 +62,23 @@ _scanner_seq = -1
 _broadcast_wakeup = None
 SCANNER_WS_MAX_BYTES = 8 * 1024 * 1024
 SCANNER_STATE_STALE_SECONDS = 3.0
+
+def _configured_onewin_event_origin():
+    """Return a normalized HTTPS origin used by the read-only 1win event links."""
+    raw = os.getenv("ONEWIN_ORIGIN", "https://f1w-7707.com").strip()
+    try:
+        parts = urllib.parse.urlsplit(raw)
+        host = (parts.hostname or "").lower().rstrip(".")
+        port = parts.port
+    except ValueError:
+        return ""
+    if (parts.scheme.lower() != "https" or not host
+            or parts.username or parts.password or port not in (None, 443)
+            or parts.path not in ("", "/") or parts.query or parts.fragment
+            or not re.fullmatch(r"[a-z0-9.-]+", host)
+            or ".." in host or host.startswith(".") or host.endswith(".")):
+        return ""
+    return f"https://{host}"
 
 def _load_json(path: pathlib.Path, default):
     if not path.exists():
@@ -446,7 +464,12 @@ if STATIC.exists():
 async def index():
     html_file = TEMPLATES / "index.html"
     if html_file.exists():
-        return HTMLResponse(html_file.read_text(encoding="utf-8"))
+        html = html_file.read_text(encoding="utf-8")
+        html = html.replace(
+            "/*__ONEWIN_EVENT_ORIGIN__*/",
+            json.dumps(_configured_onewin_event_origin(), ensure_ascii=True),
+        )
+        return HTMLResponse(html)
     return HTMLResponse("<h1>Poly-ARB Web v4</h1>")
 
 @app.websocket("/ws")

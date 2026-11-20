@@ -540,11 +540,14 @@ class PinnedSignalSnapshotTests(unittest.TestCase):
             "slug": "example-match",
             "q": "Alpha vs Beta",
             "roi": 0.061,
+            "bk_event_url": "https://f1w-7707.com/betting/match/esport/example-match",
+            "pm_event_url": "https://polymarket.com/event/example-match",
             "stakes": [42.0, 58.0],
             "bets": [
                 {"source": "1win", "outcome": "Alpha", "o": 2.2},
                 {"source": "Polymarket", "outcome": "Beta", "o": 1.9,
-                 "token": "token-x", "pm_best_ask": 0.51, "pm_avg_ask": 0.52},
+                 "token": "token-x", "pm_best_ask": 0.51, "pm_avg_ask": 0.52,
+                 "pm_target_shares": 42.75},
             ],
             "ts": 1000.0,
         }
@@ -552,8 +555,13 @@ class PinnedSignalSnapshotTests(unittest.TestCase):
         self.assertTrue(polyarb_v4._pin_signal_snapshot(pinned, snapshot, now=1000.0))
         key = polyarb_v4._pinned_signal_key(snapshot)
         frozen = pinned[key]
+        self.assertEqual(frozen["snapshot_id"], "%s|%.6f" % (key, 1000.0))
         self.assertEqual(frozen["currency"], "USDT")
         self.assertTrue(frozen["inactive_snapshot"])
+        self.assertEqual(frozen["bk_event_url"], snapshot["bk_event_url"])
+        self.assertEqual(frozen["pm_event_url"], snapshot["pm_event_url"])
+        self.assertEqual(frozen["bets"][1]["token"], "token-x")
+        self.assertEqual(frozen["bets"][1]["pm_target_shares"], 42.75)
         self.assertAlmostEqual(frozen["expires_at"], 1300.0)
 
         changed = json.loads(json.dumps(snapshot))
@@ -582,6 +590,22 @@ class PinnedSignalSnapshotTests(unittest.TestCase):
         self.assertFalse(polyarb_v4._pin_signal_snapshot(pinned, snapshot, now=1000.0))
         self.assertEqual(pinned, {})
 
+    def test_distinct_pm_tokens_do_not_dedupe_within_the_snapshot_ttl(self):
+        base = {
+            "slug": "same-event", "roi": 0.06, "stakes": [10.0, 10.0],
+            "bets": [
+                {"source": "1win", "outcome": "Alpha"},
+                {"source": "Polymarket", "outcome": "Beta", "token": "token-a"},
+            ],
+        }
+        another = json.loads(json.dumps(base))
+        another["bets"][1]["token"] = "token-b"
+        pinned = {}
+
+        self.assertTrue(polyarb_v4._pin_signal_snapshot(pinned, base, now=1000.0))
+        self.assertTrue(polyarb_v4._pin_signal_snapshot(pinned, another, now=1001.0))
+        self.assertEqual(len(pinned), 2)
+
     def test_more_than_fifty_snapshots_keep_the_full_five_minute_ttl(self):
         pinned = {}
         for index in range(75):
@@ -595,6 +619,17 @@ class PinnedSignalSnapshotTests(unittest.TestCase):
             self.assertTrue(polyarb_v4._pin_signal_snapshot(pinned, snapshot, now=1000.0))
         self.assertEqual(len(polyarb_v4._prune_pinned_signal_snapshots(pinned, 1299.9)), 75)
         self.assertEqual(polyarb_v4._prune_pinned_signal_snapshots(pinned, 1300.0), [])
+
+
+class OneWinEventOriginTests(unittest.TestCase):
+    def test_configured_https_origin_is_normalized(self):
+        with patch.dict(os.environ, {"ONEWIN_ORIGIN": "https://F1W-7707.com/"}):
+            self.assertEqual(web_app._configured_onewin_event_origin(), "https://f1w-7707.com")
+
+    def test_non_https_or_credentialed_origin_is_rejected(self):
+        for value in ("http://f1w-7707.com", "https://user@f1w-7707.com", "https://evil<svg>"):
+            with self.subTest(value=value), patch.dict(os.environ, {"ONEWIN_ORIGIN": value}):
+                self.assertEqual(web_app._configured_onewin_event_origin(), "")
 
 
 class UsdtNormalizationTests(unittest.TestCase):

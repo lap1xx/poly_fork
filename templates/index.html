@@ -68,14 +68,10 @@
         <div class="scan-reasons" id="scan-reasons">Здесь будут причины отсева сигналов.</div>
         <div class="scan-drop hidden" id="scan-signal-drop" aria-live="polite"></div>
       </section>
-      <div class="list-caption"><span>НАЙДЕННЫЕ ВИЛКИ</span><span>ПО ROI ↓</span></div>
+      <div class="list-caption"><span>НАЙДЕННЫЕ ВИЛКИ · СНИМКИ ВНИЗУ</span><span>ПО ROI ↓</span></div>
       <div class="arbs-list" id="arbs-list">
         <div class="empty">Нет вилок по текущим фильтрам.<br>Попробуйте изменить параметры поиска.</div>
       </div>
-      <section class="pinned-section" aria-live="polite">
-        <div class="pinned-heading"><span>ЗАКРЕПЛЁННЫЕ СНИМКИ · НЕАКТИВНЫЕ</span><small>ROI ≥ 5% · до 5 минут</small></div>
-        <div class="pinned-list" id="pinned-snapshots"><div class="pinned-empty">Снимков с ROI ≥ 5% пока нет.</div></div>
-      </section>
       <div class="source-note"><span class="source-title">ИСТОЧНИКИ</span><span>1win · основной</span><span>BetBoom · резерв</span></div>
     </aside>
 
@@ -114,18 +110,20 @@
             <div class="kpi-val" id="kpi-roi">—</div>
           </div>
           <div class="kpi">
-            <div class="kpi-lbl">ЖИВЁТ</div>
+            <div class="kpi-lbl" id="kpi-age-label">ЖИВЁТ</div>
             <div class="kpi-val" id="kpi-age">—</div>
           </div>
           <div class="kpi">
-            <div class="kpi-lbl">ЛУЧШИЙ ASK</div>
+            <div class="kpi-lbl" id="kpi-depth-label">ЛУЧШИЙ ASK</div>
             <div class="kpi-val" id="kpi-depth">—</div>
           </div>
           <div class="kpi">
-            <div class="kpi-lbl">КЭФ СЕЙЧАС</div>
+            <div class="kpi-lbl" id="kpi-odds-label">КЭФ СЕЙЧАС</div>
             <div class="kpi-val" id="kpi-odds">—</div>
           </div>
         </div>
+
+        <div class="snapshot-warning hidden" id="snapshot-warning" role="status" aria-live="polite"></div>
 
         <!-- Price filter note; this is not a settlement guarantee -->
         <div class="signal-note hidden" id="safe-banner">
@@ -138,7 +136,7 @@
         <div class="det-mid panel market-panel">
           <div class="market-section">
             <div class="panel-head">
-              <span>СТАКАН POLYMARKET</span>
+              <span id="pm-book-title">СТАКАН POLYMARKET</span>
               <span class="panel-sub" id="pm-side-lbl">—</span>
             </div>
             <table class="pm-book" id="pm-book">
@@ -154,7 +152,7 @@
 
           <div class="market-section chart-section">
             <div class="panel-head">
-              <span>ИСТОРИЯ ЦЕНЫ</span>
+              <span id="chart-title">ИСТОРИЯ ЦЕНЫ</span>
               <span class="panel-sub" id="chart-delta">—</span>
             </div>
             <canvas class="price-chart" id="price-chart" width="480" height="220"></canvas>
@@ -165,26 +163,27 @@
         <!-- How much to bet -->
         <div class="panel how-much">
           <div class="panel-head">
-            <span>СКОЛЬКО СТАВИТЬ</span>
+            <span id="hm-title">СКОЛЬКО СТАВИТЬ</span>
               <span class="panel-sub" id="hm-rate">суммы в USDT</span>
           </div>
 
           <div class="hm-legs">
             <div class="hm-leg bb">
-              <span class="hm-bk" id="hm-bb-name">1win</span>
+              <span class="hm-leg-copy"><span class="hm-bk" id="hm-bb-name">1win</span><small class="hm-outcome" id="hm-bb-outcome">—</small></span>
               <input type="number" step="0.01" id="hm-bb-stake" value="0">
               <span class="hm-cur">USDT</span>
             </div>
             <div class="hm-leg pm">
-              <span class="hm-bk">Polymarket</span>
+              <span class="hm-leg-copy"><span class="hm-bk">Polymarket</span><small class="hm-outcome" id="hm-pm-outcome">—</small></span>
               <input type="number" step="0.01" id="hm-pm-stake" value="0">
               <span class="hm-cur">USDT</span>
             </div>
           </div>
 
           <div class="hm-info">
-            <div><span>Цена доли в стакане</span><b id="hm-price">—</b></div>
-            <div><span>Средняя по стакану</span><b id="hm-avg">—</b></div>
+            <div><span id="hm-price-label">Цена доли в стакане</span><b id="hm-price">—</b></div>
+            <div><span id="hm-avg-label">Средняя по стакану</span><b id="hm-avg">—</b></div>
+            <div><span id="hm-shares-label">Доли Polymarket</span><b id="hm-shares">—</b></div>
             <div><span>Эфф. коэффициент PM</span><b id="hm-eff">—</b></div>
             <div class="hm-hl"><span>Всего в игре</span><b id="hm-total">—</b></div>
             <div class="hm-hl"><span>Расчётный мин. возврат</span><b id="hm-payout">—</b></div>
@@ -197,7 +196,7 @@
             <button class="btn green" id="btn-buy-pm">ОТКРЫТЬ POLYMARKET ↗</button>
             <button class="btn dark" id="btn-filled">ЗАПИСАТЬ СДЕЛКУ</button>
           </div>
-          <div class="action-hint">Оценка по снимку; после изменения суммы требуется перепроверить обе стороны и глубину стакана. Сделка записывается вручную.</div>
+          <div class="action-hint" id="action-hint">Оценка по снимку; после изменения суммы требуется перепроверить обе стороны и глубину стакана. Сделка записывается вручную.</div>
         </div>
         </div>
       </div>
@@ -398,6 +397,7 @@
   <div class="toast hidden" id="toast"></div>
 
 </div>
+<script>window.POLYARB_ONEWIN_ORIGIN = /*__ONEWIN_EVENT_ORIGIN__*/;</script>
 <script src="/static/bankroll_plan.js"></script>
 <script src="/static/app.js"></script>
 </body>

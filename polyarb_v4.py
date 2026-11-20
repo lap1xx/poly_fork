@@ -1634,6 +1634,7 @@ def _pin_signal_snapshot(snapshots, snapshot, now=None):
     if not key or key in snapshots:
         return False
     frozen = json.loads(json.dumps(snapshot, ensure_ascii=False))
+    frozen["snapshot_id"] = "%s|%.6f" % (key, now)
     frozen["currency"] = "USDT"
     frozen["locked_at"] = now
     frozen["expires_at"] = now + PINNED_SIGNAL_TTL_SEC
@@ -2155,6 +2156,7 @@ def main():
                                 {
                                     "source": b.get("source"),
                                     "outcome": b.get("outcome"),
+                                    "token": b.get("token"),
                                     "o": float(b.get("o") or 0),
                                     "c": float(b.get("c") or 0),
                                     "s": float(b.get("s") or 0),
@@ -2180,6 +2182,7 @@ def main():
                             "bk_source": _bk_src,
                             "bk_odds_age_sec": _bk_age,
                             "bk_event_url": (_bb_b or {}).get("event_url"),
+                            "pm_event_url": f"https://polymarket.com/event/{slug}",
                             "bk_match_id": (_bb_b or {}).get("match_id"),
                             "bk_binding": _bb_b,
                             "bb_match_id": ((_bb_b or {}).get("match_id")

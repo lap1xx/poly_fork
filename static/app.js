@@ -11,6 +11,7 @@ const state = {
   arbs: [],          // все enriched arbs
   visible: [],       // после фильтров
   activeSlug: null,
+  activeSnapshotId: null,
   editing: null,
   hideSet: new Set(),
   seenSlugs: new Set(),
@@ -276,7 +277,7 @@ function connectWS() {
     if (state._primed && hasNew) playArbChime();
     state._primed = true;
     applyFilters();
-    if (state.activeSlug) refreshDetailThrottled();
+    if (state.activeSlug || state.activeSnapshotId) refreshDetailThrottled();
     if (state.scanStatus) {
       state.scanStatus.ui_render_ms = Math.round((performance.now() - uiRenderStarted) * 10) / 10;
     }
@@ -310,7 +311,6 @@ function applyFilters() {
   });
   state.visible.sort((a, b) => (b.roi || 0) - (a.roi || 0));
   renderArbs();
-  renderPinnedSnapshots();
   updateHeader();
 }
 
@@ -597,7 +597,7 @@ function updateArbCard(card, a) {
   const bbLeg = legs.find(l => l && l.source && l.source !== 'Polymarket') || {};
   const phase = ['live', 'prematch', 'unknown'].includes(a.phase) ? a.phase : 'unknown';
   const phaseLabels = { live: 'LIVE', prematch: 'ПРЕМАТЧ', unknown: 'СТАТУС ?' };
-  const title = a.title ? `${a.title} · ${a.q || ''}` : (a.q || slug);
+  const title = a.title && a.q && a.title !== a.q ? `${a.title} · ${a.q}` : (a.title || a.q || slug);
   const classes = ['arb'];
   if (slug === state.activeSlug) classes.push('active');
   if (state.freshSlugs.has(slug)) classes.push('fresh');
@@ -649,44 +649,92 @@ function updateArbCard(card, a) {
   setCardMarkup(card, '.arb-stakes', legRows, '_renderedStakes');
 }
 
-function renderPinnedSnapshots() {
-  const box = document.getElementById('pinned-snapshots');
-  if (!box) return;
-  const rows = Array.isArray(state.pinnedSignalSnapshots)
-    ? state.pinnedSignalSnapshots.filter(row => row && typeof row === 'object') : [];
-  if (!rows.length) {
-    box.innerHTML = '<div class="pinned-empty">Снимков с ROI ≥ 5% пока нет.</div>';
-    return;
-  }
+function pinnedSnapshotId(row) {
+  const bets = Array.isArray(row.bets) ? row.bets : [];
+  const pmLeg = bets.find(leg => leg && leg.source === 'Polymarket') || {};
+  const bookmakerLeg = bets.find(leg => leg && leg.source && leg.source !== 'Polymarket') || {};
+  return String(row.snapshot_id || [
+    row.slug || 'snapshot', pmLeg.token || '', pmLeg.outcome || '',
+    bookmakerLeg.source || '', bookmakerLeg.outcome || '',
+    row.locked_at || row.ts || '', row.expires_at || '',
+  ].join('|'));
+}
+
+function currentPinnedSnapshots() {
   const now = Date.now() / 1000;
-  box.innerHTML = rows.map(row => {
-    const bets = Array.isArray(row.bets) ? row.bets : [];
-    const stakes = Array.isArray(row.stakes) ? row.stakes : [];
-    const pm = bets.find(leg => leg?.source === 'Polymarket') || {};
-    const bkIndex = bets.findIndex(leg => leg && leg.source !== 'Polymarket');
-    const bk = bkIndex >= 0 ? bets[bkIndex] : {};
-    const pmIndex = bets.findIndex(leg => leg?.source === 'Polymarket');
-    const pmStake = Number(stakes[pmIndex] || 0);
-    const bkStake = Number(stakes[bkIndex] || 0);
-    const pmPrice = Number(pm.pm_avg_ask || pm.pm_best_ask || 0);
-    const expires = Math.max(0, Math.ceil(Number(row.expires_at || 0) - now));
-    const locked = Number(row.locked_at || row.ts || 0);
-    const lockedText = locked > 0 ? new Date(locked * 1000).toLocaleTimeString('ru-RU') : '—';
-    const pmLine = `${escapeHtml(pm.outcome || 'Polymarket')} · ${pmStake.toFixed(2)} USDT` +
-      (pmPrice > 0 ? ` · ${(pmStake / pmPrice).toFixed(2)} долей @ ${(pmPrice * 100).toFixed(1)}¢` : '');
-    const bkLine = `${escapeHtml(bk.source || '1win')} · ${escapeHtml(bk.outcome || 'исход')} · ${bkStake.toFixed(2)} USDT @ ${fmtOdds(bk.o)}×`;
-    const title = escapeHtml(row.title || row.q || row.slug || 'Событие');
-    return `<article class="pinned-card"><div class="pinned-top"><b>${title}</b><strong>${Number(row.snapshot_roi_pct ?? Number(row.roi || 0) * 100).toFixed(2)}%</strong></div>` +
-      `<div class="pinned-warning">СНИМОК · НЕАКТИВНО · цены заморожены ${lockedText}</div>` +
-      `<div class="pinned-leg">${bkLine}</div><div class="pinned-leg">${pmLine}</div>` +
-      `<div class="pinned-countdown">Удаление через ${Math.floor(expires / 60)}:${String(expires % 60).padStart(2, '0')}</div></article>`;
-  }).join('');
+  const rows = Array.isArray(state.pinnedSignalSnapshots)
+    ? state.pinnedSignalSnapshots.filter(row => row && typeof row === 'object' && Number(row.expires_at) > now)
+    : [];
+  state.pinnedSignalSnapshots = rows;
+  return rows.slice().sort((a, b) => Number(b.locked_at || b.ts || 0) - Number(a.locked_at || a.ts || 0));
+}
+
+function updatePinnedSnapshotCard(card, row) {
+  const id = pinnedSnapshotId(row);
+  const selected = id === state.activeSnapshotId;
+  const bets = Array.isArray(row.bets) ? row.bets : [];
+  const stakes = Array.isArray(row.stakes) ? row.stakes : [];
+  const pmLeg = bets.find(leg => leg && leg.source === 'Polymarket') || {};
+  const bookmakerLeg = bets.find(leg => leg && leg.source && leg.source !== 'Polymarket') || {};
+  const pmPrice = Number(pmLeg.pm_avg_ask || pmLeg.pm_best_ask || row.pm_best_ask || 0);
+  const roiPct = Number(row.snapshot_roi_pct ?? Number(row.roi || 0) * 100);
+  const expiresIn = Math.max(0, Math.ceil(Number(row.expires_at) - Date.now() / 1000));
+  const lockedAt = Number(row.locked_at || row.ts || 0);
+  const lockedText = lockedAt > 0 ? new Date(lockedAt * 1000).toLocaleTimeString('ru-RU') : '—';
+  const title = row.title && row.q && row.title !== row.q
+    ? `${row.title} · ${row.q}` : (row.title || row.q || row.slug || 'Событие');
+  const phase = ['live', 'prematch', 'unknown'].includes(row.phase) ? row.phase : 'unknown';
+  const phaseLabels = { live: 'LIVE', prematch: 'ПРЕМАТЧ', unknown: 'СТАТУС ?' };
+
+  card.className = `arb pinned-snapshot-card${selected ? ' active' : ''}`;
+  card.dataset.pinnedSnapshotId = id;
+  delete card.dataset.arbSlug;
+  card.setAttribute('role', 'button');
+  card.tabIndex = 0;
+  card.setAttribute('aria-pressed', String(selected));
+  card.setAttribute('aria-label', `${title}; замороженный неактивный снимок; ROI ${roiPct.toFixed(2)}%; до снятия ${expiresIn} секунд; нажмите Enter, чтобы открыть сохранённые детали`);
+  setCardText(card, '.arb-title', title);
+  setCardText(card, '.arb-roi', `${roiPct.toFixed(2)}%`);
+  setCardText(card, '.arb-age', `СНИМОК ${lockedText} · ${Math.floor(expiresIn / 60)}:${String(expiresIn % 60).padStart(2, '0')} ДО СНЯТИЯ`);
+
+  const tags = [`<span class="tag ${escapeHtml(sportClass(row.sport))}">${escapeHtml(row.sport || '')}</span>`];
+  if (row.market_type) tags.push(`<span class="tag mtype">${escapeHtml(row.market_type)}</span>`);
+  tags.push(`<span class="tag phase-${phase}">${phaseLabels[phase]}</span>`);
+  tags.push('<span class="tag snapshot-lock">СНИМОК · НЕАКТИВНО</span>');
+  setCardMarkup(card, '.arb-tags', tags.join(''), '_renderedTags');
+
+  const bkClass = bookmakerLeg.source === '1win' ? 'onewin' : 'bb';
+  const chips = `<span class="bk-chip ${bkClass}">${escapeHtml(bookmakerLeg.source || 'БК')}</span>` +
+    '<span class="bk-chip pm">Polymarket</span>';
+  setCardMarkup(card, '.arb-bks', chips, '_renderedBooks');
+
+  const legRows = bets.map((leg, index) => {
+    if (!leg || !leg.source) return '';
+    const amount = Number(stakes[index] || 0);
+    const outcome = escapeHtml(leg.outcome || 'исход');
+    if (leg.source === 'Polymarket') {
+      const price = Number(leg.pm_avg_ask || leg.pm_best_ask || row.pm_best_ask || 0);
+      const capturedShares = Number(leg.pm_target_shares || 0);
+      const shareCount = capturedShares > 0 ? capturedShares : (price > 0 ? amount / price : 0);
+      const shares = shareCount > 0 ? ` · ${shareCount.toFixed(2)} долей` : '';
+      const priceText = price > 0 ? ` @ ${(price * 100).toFixed(1)}¢` : '';
+      return `<span>${outcome} · ${amount.toFixed(2)} USDT${shares}${priceText}</span>`;
+    }
+    return `<span>${escapeHtml(leg.source)} · ${outcome} · ${amount.toFixed(2)} USDT @ ${fmtOdds(leg.o)}×</span>`;
+  }).filter(Boolean).join('');
+  setCardMarkup(card, '.arb-stakes', legRows, '_renderedStakes');
 }
 
 function renderArbs() {
   const box = document.getElementById('arbs-list');
+  if (!box) return;
   const items = state.visible.filter(a => a && a.slug);
-  if (!items.length) {
+  const pinnedItems = currentPinnedSnapshots();
+  if (state.activeSnapshotId && !pinnedItems.some(row => pinnedSnapshotId(row) === state.activeSnapshotId)) {
+    closeDetail();
+    return;
+  }
+  if (!items.length && !pinnedItems.length) {
     const phaseNames = { all: 'всех фаз', live: 'LIVE', prematch: 'прематча', unknown: 'неподтверждённого статуса' };
     const message = state.arbs.length
       ? 'Проверьте фильтры спорта и минимального ROI.'
@@ -702,23 +750,35 @@ function renderArbs() {
 
   if (!box.dataset.eventsBound) {
     box.addEventListener('click', event => {
-      const card = event.target.closest('[data-arb-slug]');
-      if (card && box.contains(card)) selectArb(card.dataset.arbSlug);
+      const card = event.target.closest('[data-arb-slug], [data-pinned-snapshot-id]');
+      if (!card || !box.contains(card)) return;
+      if (card.dataset.pinnedSnapshotId) selectPinnedSnapshot(card.dataset.pinnedSnapshotId);
+      else selectArb(card.dataset.arbSlug);
     });
     box.addEventListener('keydown', event => {
       if (event.key !== 'Enter' && event.key !== ' ') return;
-      const card = event.target.closest('[data-arb-slug]');
+      const card = event.target.closest('[data-arb-slug], [data-pinned-snapshot-id]');
       if (!card || !box.contains(card)) return;
       event.preventDefault();
-      selectArb(card.dataset.arbSlug);
+      if (card.dataset.pinnedSnapshotId) selectPinnedSnapshot(card.dataset.pinnedSnapshotId);
+      else selectArb(card.dataset.arbSlug);
     });
     box.dataset.eventsBound = 'true';
   }
 
   delete box.dataset.emptyMarkup;
   box.querySelector(':scope > .empty')?.remove();
+  if (!items.length && state.arbs.length) {
+    const phaseNames = { all: 'всех фаз', live: 'LIVE', prematch: 'прематча', unknown: 'неподтверждённого статуса' };
+    const empty = document.createElement('div');
+    empty.className = 'empty active-empty';
+    empty.innerHTML = `<b>Нет активных вилок по фильтрам</b><br>Раздел: ${escapeHtml(phaseNames[state.phase] || phaseNames.all)}.<small>Ниже сохранены неактивные снимки ROI ≥ 5%.</small>`;
+    box.insertBefore(empty, box.firstChild);
+  }
   const existing = new Map(Array.from(box.querySelectorAll(':scope > .arb[data-arb-slug]'))
     .map(card => [card.dataset.arbSlug, card]));
+  const existingPinned = new Map(Array.from(box.querySelectorAll(':scope > .arb[data-pinned-snapshot-id]'))
+    .map(card => [card.dataset.pinnedSnapshotId, card]));
   let position = 0;
   for (const a of items) {
     const slug = String(a.slug);
@@ -730,12 +790,24 @@ function renderArbs() {
     if (current !== card) box.insertBefore(card, current || null);
     position += 1;
   }
+  for (const row of pinnedItems) {
+    const id = pinnedSnapshotId(row);
+    let card = existingPinned.get(id);
+    if (card) existingPinned.delete(id);
+    else card = createArbCard();
+    updatePinnedSnapshotCard(card, row);
+    const current = box.children[position];
+    if (current !== card) box.insertBefore(card, current || null);
+    position += 1;
+  }
   for (const card of existing.values()) card.remove();
+  for (const card of existingPinned.values()) card.remove();
 }
 
 /* ============= DETAIL ============= */
 function selectArb(slug) {
   state.activeSlug = slug;
+  state.activeSnapshotId = null;
   state.detailEdited = false;
   state.calcEdited = false;
   state.suggestedCapped = false;
@@ -747,8 +819,25 @@ function selectArb(slug) {
   refreshDetail();
 }
 
+function selectPinnedSnapshot(snapshotId) {
+  const row = currentPinnedSnapshots().find(item => pinnedSnapshotId(item) === String(snapshotId));
+  if (!row) return;
+  state.activeSlug = null;
+  state.activeSnapshotId = String(snapshotId);
+  state.detailEdited = false;
+  state.calcEdited = false;
+  state.suggestedCapped = false;
+  const ph = document.getElementById('detail-placeholder');
+  const body = document.getElementById('detail-body');
+  if (ph) { ph.classList.add('hidden'); ph.style.display = 'none'; }
+  if (body) { body.classList.remove('hidden'); body.style.display = 'block'; }
+  renderArbs();
+  refreshDetail();
+}
+
 function closeDetail() {
   state.activeSlug = null;
+  state.activeSnapshotId = null;
   const ph = document.getElementById('detail-placeholder');
   const body = document.getElementById('detail-body');
   if (ph) { ph.classList.remove('hidden'); ph.style.display = 'flex'; }
@@ -757,6 +846,10 @@ function closeDetail() {
 }
 
 function getActive() {
+  if (state.activeSnapshotId) {
+    const row = currentPinnedSnapshots().find(item => pinnedSnapshotId(item) === state.activeSnapshotId);
+    return row ? { ...row, inactive_snapshot: true } : null;
+  }
   return state.arbs.find(a => a.slug === state.activeSlug);
 }
 
@@ -771,10 +864,11 @@ function refreshDetailThrottled() {
 function refreshDetail() {
   const a = getActive();
   if (!a) { closeDetail(); return; }
+  const frozen = Boolean(a.inactive_snapshot);
 
-  document.getElementById('det-title').textContent = a.title
-    ? (a.title + ' · ' + (a.q || ''))
-    : (a.q || a.slug);
+  const eventTitle = a.title && a.q && a.title !== a.q
+    ? `${a.title} · ${a.q}` : (a.title || a.q || a.slug);
+  document.getElementById('det-title').textContent = eventTitle + (frozen ? ' · ЗАКРЕПЛЁННЫЙ СНИМОК' : '');
   const tags = [`<span class="tag mtype">${escapeHtml(a.market_type || 'МАТЧ')}</span>`,
                 `<span class="tag ${escapeHtml(sportClass(a.sport))}">${escapeHtml(a.sport || '')}</span>`];
   const detailPhase = ['live','prematch','unknown'].includes(a.phase) ? a.phase : 'unknown';
@@ -783,17 +877,33 @@ function refreshDetail() {
   if (a.is_streamer) tags.push(`<span class="tag streamer">СТРИМЕР</span>`);
   if (a.source_state === 'stale') tags.push(`<span class="tag pm-age">ДАННЫЕ УСТАРЕЛИ</span>`);
   else if (a.source_state === 'unknown') tags.push(`<span class="tag pm-age">СВЕЖЕСТЬ НЕИЗВЕСТНА</span>`);
+  if (frozen) tags.push('<span class="tag snapshot-lock">СНИМОК · НЕАКТИВНО</span>');
   document.getElementById('det-tags').innerHTML = tags.join('');
+
+  const lockedAt = Number(a.locked_at || a.ts || 0);
+  const remaining = Math.max(0, Math.ceil(Number(a.expires_at || 0) - Date.now() / 1000));
+  const snapshotWarning = document.getElementById('snapshot-warning');
+  if (snapshotWarning) {
+    snapshotWarning.classList.toggle('hidden', !frozen);
+    if (frozen) {
+      const lockedText = lockedAt > 0 ? new Date(lockedAt * 1000).toLocaleTimeString('ru-RU') : '—';
+      snapshotWarning.textContent = `ЗАМОРОЖЕННЫЙ СНИМОК · НЕАКТИВЕН · зафиксирован ${lockedText} · будет удалён через ${Math.floor(remaining / 60)}:${String(remaining % 60).padStart(2, '0')}. Сохранённые котировки не являются текущими — перепроверьте цены на площадках.`;
+    }
+  }
 
   const roiEl = document.getElementById('kpi-roi');
   roiEl.textContent = fmtPct(a.roi);
   roiEl.style.color = a.roi >= 0 ? 'var(--green)' : 'var(--red)';
-  document.getElementById('kpi-age').textContent = fmtAgo(a.age_sec);
+  document.getElementById('kpi-age').textContent = frozen
+    ? `${Math.floor(remaining / 60)}:${String(remaining % 60).padStart(2, '0')}` : fmtAgo(a.age_sec);
+  document.getElementById('kpi-age-label').textContent = frozen ? 'СНИМУТ ЧЕРЕЗ' : 'ЖИВЁТ';
 
   const pmLeg = (a.bets || []).find(l => l.source === 'Polymarket') || {};
   const bbLeg = (a.bets || []).find(l => l.source && l.source !== 'Polymarket') || {};
 
-  const pmAsk = a.pm_best_ask || 0;
+  const pmAsk = Number(pmLeg.pm_best_ask || a.pm_best_ask || 0);
+  document.getElementById('kpi-depth-label').textContent = frozen ? 'ASK В СНИМКЕ' : 'ЛУЧШИЙ ASK';
+  document.getElementById('kpi-odds-label').textContent = frozen ? 'КОЭФ. В СНИМКЕ' : 'КЭФ СЕЙЧАС';
   document.getElementById('kpi-depth').textContent = pmAsk ? (pmAsk * 100).toFixed(1) + '¢' : '—';
 
   const bbO = bbLeg.o || 0;
@@ -812,8 +922,27 @@ function refreshDetail() {
 
   document.getElementById('pm-side-lbl').textContent = pmLeg.outcome || '—';
   renderHowMuch(a);
-  loadPmBook(a.slug);
-  loadPriceChart(a.slug);
+  if (frozen) {
+    state.bookRequestId = (state.bookRequestId || 0) + 1;
+    state.chartRequestId = (state.chartRequestId || 0) + 1;
+    document.getElementById('pm-book-title').textContent = 'ЗАПОМНЕННАЯ КОТИРОВКА';
+    document.getElementById('pm-book-body').innerHTML = '<tr><td colspan="3" class="empty-cell">Актуальный стакан не загружается для снимка</td></tr>';
+    document.getElementById('pm-book-foot').textContent = 'Значения сохранены на момент фиксации';
+    const canvas = document.getElementById('price-chart');
+    const context = canvas.getContext('2d');
+    context.clearRect(0, 0, canvas.width, canvas.height);
+    context.fillStyle = '#4a5a52';
+    context.font = '12px monospace';
+    context.fillText('История цен не обновляется для снимка', 12, 24);
+    document.getElementById('chart-title').textContent = 'ИСТОРИЯ НЕ ЗАГРУЖАЕТСЯ';
+    document.getElementById('chart-foot').textContent = 'Снимок не содержит живую историю котировок';
+    document.getElementById('chart-delta').textContent = 'неактивно';
+  } else {
+    document.getElementById('pm-book-title').textContent = 'СТАКАН POLYMARKET';
+    document.getElementById('chart-title').textContent = 'ИСТОРИЯ ЦЕНЫ';
+    loadPmBook(a.slug);
+    loadPriceChart(a.slug);
+  }
 }
 
 /* ============= PM BOOK ============= */
@@ -894,6 +1023,7 @@ async function loadPmBook(slug) {
 
 /* ============= PRICE CHART ============= */
 async function loadPriceChart(slug) {
+  const requestId = state.chartRequestId = (state.chartRequestId || 0) + 1;
   const canvas = document.getElementById('price-chart');
   const ctx = canvas.getContext('2d');
   const w = canvas.width = canvas.clientWidth * (window.devicePixelRatio || 1);
@@ -904,6 +1034,7 @@ async function loadPriceChart(slug) {
   try {
     const r = await fetch(`/api/price_history/${encodeURIComponent(slug)}?max_points=120`);
     const j = await r.json();
+    if (requestId !== state.chartRequestId || state.activeSlug !== slug) return;
     const pts = (j.points || []).map(p => p.ask).filter(v => v > 0);
     const foot = document.getElementById('chart-foot');
     const delta = document.getElementById('chart-delta');
@@ -959,7 +1090,9 @@ async function loadPriceChart(slug) {
 
     foot.textContent = `${(min * 100).toFixed(1)}¢ — ${(max * 100).toFixed(1)}¢ · ${pts.length} точек`;
   } catch (e) {
-    document.getElementById('chart-foot').textContent = 'ошибка';
+    if (requestId === state.chartRequestId && state.activeSlug === slug) {
+      document.getElementById('chart-foot').textContent = 'ошибка';
+    }
   }
 }
 
@@ -967,8 +1100,12 @@ async function loadPriceChart(slug) {
 function renderHowMuch(a) {
   const pmLeg = (a.bets || []).find(l => l.source === 'Polymarket') || {};
   const bbLeg = (a.bets || []).find(l => l.source && l.source !== 'Polymarket') || {};
+  const frozen = Boolean(a.inactive_snapshot);
   document.getElementById('hm-bb-name').textContent = bbLeg.source || 'Букмекер';
-  document.getElementById('hm-rate').textContent = 'суммы в USDT';
+  document.getElementById('hm-bb-outcome').textContent = `${bbLeg.outcome || '—'} · кэф ${fmtOdds(bbLeg.o)}×`;
+  document.getElementById('hm-pm-outcome').textContent = `${pmLeg.outcome || '—'} · кэф ${fmtOdds(pmLeg.o)}×`;
+  document.getElementById('hm-title').textContent = frozen ? 'СОХРАНЁННЫЕ СТАВКИ' : 'СКОЛЬКО СТАВИТЬ';
+  document.getElementById('hm-rate').textContent = frozen ? 'СУММЫ ЗАМОРОЖЕНЫ · USDT' : 'суммы в USDT';
 
   const stakes = a.stakes || [0, 0];
   let pmSt = 0, bbSt = 0;
@@ -976,7 +1113,14 @@ function renderHowMuch(a) {
     if (l.source === 'Polymarket') pmSt = stakes[i] || 0;
     if (l.source && l.source !== 'Polymarket') bbSt = stakes[i] || 0;
   });
-  if (!state.detailEdited) {
+  const bbInput = document.getElementById('hm-bb-stake');
+  const pmInput = document.getElementById('hm-pm-stake');
+  bbInput.readOnly = frozen;
+  pmInput.readOnly = frozen;
+  if (frozen) {
+    bbInput.value = Number(bbSt).toFixed(2);
+    pmInput.value = Number(pmSt).toFixed(2);
+  } else if (!state.detailEdited) {
     const cap = getPlanCap();
     const fitStakes = window.PolyBankrollPlanner?.fitSuggestedStakes;
     const plan = typeof fitStakes === 'function'
@@ -987,7 +1131,7 @@ function renderHowMuch(a) {
     document.getElementById('hm-pm-stake').value = Number(plan.polymarketUsdt).toFixed(2);
   }
   // лучшее ask из стакана, а не среднее по $50
-  const cachedBook = pmBookCache[state.activeSlug]?.outcome === pmLeg.outcome
+  const cachedBook = !frozen && pmBookCache[state.activeSlug]?.outcome === pmLeg.outcome
     ? pmBookCache[state.activeSlug] : null;
   const pmBestAsk = cachedBook?.best_ask;
   if (pmBestAsk) {
@@ -999,14 +1143,39 @@ function renderHowMuch(a) {
   }
   const avg = cachedBook?.avg_for_size;
   const enteredUsd = Number(document.getElementById('hm-pm-stake').value);
-  document.getElementById('hm-avg').textContent = avg && avg.avg_price && Math.abs(cachedBook.requested_usd - enteredUsd) < 0.005
+  if (frozen) {
+    const capturedAvg = Number(pmLeg.pm_avg_ask || 0);
+    document.getElementById('hm-price-label').textContent = 'Ask при фиксации';
+    document.getElementById('hm-avg-label').textContent = 'Средняя при фиксации';
+    document.getElementById('hm-avg').textContent = capturedAvg > 0
+      ? (capturedAvg * 100).toFixed(1) + '¢ · сохранённое значение' : '—';
+  } else {
+    document.getElementById('hm-price-label').textContent = 'Цена доли в стакане';
+    document.getElementById('hm-avg-label').textContent = 'Средняя по стакану';
+    document.getElementById('hm-avg').textContent = avg && avg.avg_price && Math.abs(cachedBook.requested_usd - enteredUsd) < 0.005
       ? (avg.avg_price * 100).toFixed(1) + '¢ · ' + cachedBook.requested_usd.toFixed(2) + ' USDT' + (avg.full ? '' : ' · неполный объём') : '—';
+  }
+  const sharesPrice = Number(pmLeg.pm_avg_ask || pmLeg.pm_best_ask || a.pm_best_ask || 0);
+  const capturedShares = Number(pmLeg.pm_target_shares || 0);
+  const shares = frozen && capturedShares > 0
+    ? capturedShares : (sharesPrice > 0 ? pmSt / sharesPrice : 0);
+  document.getElementById('hm-shares-label').textContent = frozen ? 'Доли в снимке' : 'Оценка долей PM';
+  document.getElementById('hm-shares').textContent = shares > 0
+    ? `${shares.toLocaleString('ru-RU', { maximumFractionDigits: 4 })} долей` : '—';
   document.getElementById('hm-eff').textContent = pmLeg.o ? fmtOdds(pmLeg.o) : '—';
 
   recalcHowMuch();
 
+  const actionHint = document.getElementById('action-hint');
+  if (actionHint) actionHint.textContent = frozen
+    ? 'Это сохранённый неактивный снимок, не текущие котировки. Ссылки открывают площадки вручную; перед любыми действиями сверьте исходы и цены. Автоматических ставок нет.'
+    : 'Оценка по снимку; после изменения суммы требуется перепроверить обе стороны и глубину стакана. Сделка записывается вручную.';
+
   const buyBtn = document.getElementById('btn-buy-pm');
   buyBtn.textContent = `ОТКРЫТЬ POLYMARKET · ${parseFloat(document.getElementById('hm-pm-stake').value || 0).toFixed(2)} USDT ↗`;
+  const filledBtn = document.getElementById('btn-filled');
+  filledBtn.disabled = frozen;
+  filledBtn.title = frozen ? 'Неактивный снимок не является фактической сделкой' : 'Записать исполненную вручную сделку';
   const bkBtn = document.getElementById('btn-open-bb');
   const oneWinUrlReady = bbLeg.source === '1win' && Boolean(a.bk_event_url);
   const betBoomUrlReady = bbLeg.source === 'BetBoom' && Boolean(a.bb_match_id && a.bb_tournament_id);
@@ -1019,6 +1188,7 @@ function renderHowMuch(a) {
 
 function recalcHowMuch() {
   const a = getActive(); if (!a) return;
+  const frozen = Boolean(a.inactive_snapshot);
   const bbStake = parseFloat(document.getElementById('hm-bb-stake').value || '0');
   const pmStakeUsdt = parseFloat(document.getElementById('hm-pm-stake').value || '0');
 
@@ -1037,7 +1207,11 @@ function recalcHowMuch() {
   const profitEl = document.getElementById('hm-profit');
   profitEl.textContent = (profit >= 0 ? '+' : '') + fmtMoney(profit);
   profitEl.style.color = profit >= 0 ? 'var(--green)' : 'var(--red)';
-  updatePlanRiskNote(bank);
+  if (frozen) {
+    document.getElementById('hm-risk-note').textContent = 'Суммы ставок и котировки заморожены из снимка; изменение общего банка на сохранённые значения не влияет.';
+  } else {
+    updatePlanRiskNote(bank);
+  }
 
   document.getElementById('btn-buy-pm').textContent =
     `ОТКРЫТЬ POLYMARKET · ${pmStakeUsdt.toFixed(2)} USDT ↗`;
@@ -1310,7 +1484,11 @@ function openBookmakerEvent() {
   if (bkLeg?.source === '1win' && a.bk_event_url) {
     try {
       const eventUrl = new URL(a.bk_event_url, window.location.origin);
-      if (eventUrl.protocol !== 'https:') throw new Error('Небезопасный протокол ссылки');
+      const allowedOrigin = window.POLYARB_ONEWIN_ORIGIN;
+      if (eventUrl.protocol !== 'https:' || eventUrl.username || eventUrl.password
+          || !allowedOrigin || eventUrl.origin !== allowedOrigin) {
+        throw new Error('Недоверенный адрес события 1win');
+      }
       window.open(eventUrl.href, '_blank', 'noopener,noreferrer');
     } catch (e) {
       toast('Не удалось открыть страницу события 1win', true);
@@ -1333,6 +1511,18 @@ function openBookmakerEvent() {
 }
 async function openPMUrl() {
   const a = getActive(); if (!a) return;
+  if (a.pm_event_url) {
+    try {
+      const eventUrl = new URL(a.pm_event_url, window.location.origin);
+      if (eventUrl.protocol !== 'https:' || eventUrl.hostname !== 'polymarket.com') {
+        throw new Error('Небезопасная ссылка на Polymarket');
+      }
+      window.open(eventUrl.href, '_blank', 'noopener,noreferrer');
+    } catch (e) {
+      toast('Не удалось открыть страницу события Polymarket', true);
+    }
+    return;
+  }
   try {
     const r = await fetch('/api/pm_url/' + encodeURIComponent(a.slug));
     const j = await r.json();
@@ -1342,7 +1532,12 @@ async function openPMUrl() {
 }
 function markFilled() {
   const a = getActive();
-  if (a) openEdit(a.slug);
+  if (!a) return;
+  if (a.inactive_snapshot) {
+    toast('Неактивный снимок нельзя записать как исполненную сделку', true);
+    return;
+  }
+  openEdit(a.slug);
 }
 
 async function showTrades() {
@@ -1556,8 +1751,8 @@ function init() {
   document.addEventListener('visibilitychange', checkWsFreshness);
   setInterval(loadDaily, 30000);
   setInterval(() => {
-    if (state.visible.length) renderArbs();
-    renderPinnedSnapshots();
+    renderArbs();
+    if (state.activeSnapshotId) refreshDetail();
   }, 1000);
 
   loadDaily();
