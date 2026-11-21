@@ -76,6 +76,11 @@ PINNED_SIGNAL_MIN_ROI = 0.05
 TIMEOUT = 15.0
 PM_CATALOG_TIMEOUT = (3.0, 5.0)
 PM_CATALOG_WORKERS = 7
+PM_CATALOG_PAGE_LIMIT = 500
+PM_CATALOG_MAX_PAGES = 50
+PM_CATALOG_MAX_RETRIES = 3
+PM_CATALOG_RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
+PM_CATALOG_RETRY_BACKOFF_SEC = 0.25
 _PM_CATALOG_DIAGNOSTICS_LOCK = threading.Lock()
 _PM_CATALOG_DIAGNOSTICS = {}
 BOOKS = {}
@@ -1258,25 +1263,132 @@ def fetch_live_pm_slugs():
     return list(out)
 
 
-def _fetch_pm_catalog_tag(tag, query_limit):
-    results = []
-    for live_mode in ("true", None):
-        params = {"tag_slug": tag, "limit": query_limit,
-                  "active": "true", "closed": "false"}
-        if live_mode:
-            params["live"] = live_mode
+def _fetch_pm_catalog_query(tag, mode, page_limit=PM_CATALOG_PAGE_LIMIT):
+    """Fetch one tag/mode stream to cursor exhaustion, or report it as partial."""
+    events = []
+    cursor = None
+    seen_cursors = set()
+    pages = 0
+    raw_event_rows = 0
+    invalid_event_rows = 0
+    effective_page_limit = int(page_limit)
+    last_http_status = None
+    error = None
+    cursor_exhausted = False
+    page_cap_hit = False
+    limit_downgraded = False
+
+    while pages < PM_CATALOG_MAX_PAGES:
+        params = {
+            "tag_slug": tag,
+            "limit": effective_page_limit,
+            "active": "true",
+            "closed": "false",
+        }
+        if mode == "live":
+            params["live"] = "true"
+        if cursor is not None:
+            params["after_cursor"] = cursor
+
+        response = None
+        fallback_limit = False
+        for attempt in range(PM_CATALOG_MAX_RETRIES):
+            try:
+                response = requests.get(
+                    GAMMA + "/events/keyset",
+                    params=params,
+                    timeout=PM_CATALOG_TIMEOUT,
+                )
+                last_http_status = getattr(response, "status_code", None)
+                response.raise_for_status()
+                break
+            except Exception as exc:
+                exc_response = getattr(exc, "response", None)
+                status = getattr(exc_response, "status_code", None)
+                if status is None and response is not None:
+                    status = getattr(response, "status_code", None)
+                last_http_status = status or last_http_status
+                if status == 400 and effective_page_limit > 100 and not limit_downgraded:
+                    effective_page_limit = 100
+                    limit_downgraded = True
+                    fallback_limit = True
+                    response = None
+                    break
+                retryable_status = status in PM_CATALOG_RETRYABLE_STATUSES
+                retryable_exception = isinstance(
+                    exc, (requests.ConnectionError, requests.Timeout, OSError)
+                )
+                if (attempt + 1 < PM_CATALOG_MAX_RETRIES
+                        and (retryable_status or retryable_exception)):
+                    time.sleep(PM_CATALOG_RETRY_BACKOFF_SEC * (2 ** attempt))
+                    continue
+                error = "HTTP_%s" % status if status else type(exc).__name__
+                response = None
+                break
+
+        if fallback_limit:
+            # Retry the same cursor with a smaller page size; do not count a page.
+            continue
+        if response is None:
+            break
+
         try:
-            response = requests.get(
-                GAMMA + "/events", params=params, timeout=PM_CATALOG_TIMEOUT
-            )
-            response.raise_for_status()
-            events = response.json()
-            if not isinstance(events, list):
-                results.append((live_mode, None, "InvalidResponseShape"))
-            else:
-                results.append((live_mode, events, None))
-        except Exception as exc:
-            results.append((live_mode, None, type(exc).__name__))
+            payload = response.json()
+        except Exception:
+            error = "InvalidJSON"
+            break
+        if not isinstance(payload, dict):
+            error = "InvalidResponseShape"
+            break
+        page_events = payload.get("events")
+        if not isinstance(page_events, list):
+            error = "InvalidEventsShape"
+            break
+        if "next_cursor" not in payload:
+            error = "MissingNextCursor"
+            break
+
+        pages += 1
+        raw_event_rows += len(page_events)
+        valid_events = [event for event in page_events if isinstance(event, dict)]
+        invalid_event_rows += len(page_events) - len(valid_events)
+        events.extend(valid_events)
+
+        next_cursor = payload.get("next_cursor")
+        cursor_text = str(next_cursor).strip() if next_cursor is not None else ""
+        if next_cursor is None or cursor_text in {"", "LTE="}:
+            cursor_exhausted = True
+            break
+        if cursor_text == cursor or cursor_text in seen_cursors:
+            error = "RepeatedCursor"
+            break
+        seen_cursors.add(cursor_text)
+        cursor = cursor_text
+
+    if pages >= PM_CATALOG_MAX_PAGES and not cursor_exhausted and not error:
+        page_cap_hit = True
+        error = "PageCapReached"
+
+    return {
+        "tag": tag,
+        "mode": mode,
+        "pages": pages,
+        "raw_event_rows": raw_event_rows,
+        "invalid_event_rows": invalid_event_rows,
+        "events": events,
+        "cursor_exhausted": cursor_exhausted,
+        "page_cap_hit": page_cap_hit,
+        "effective_page_limit": effective_page_limit,
+        "last_http_status": last_http_status,
+        "error": error,
+    }
+
+
+def _fetch_pm_catalog_tag(tag, query_limit=PM_CATALOG_PAGE_LIMIT):
+    results = [
+        _fetch_pm_catalog_query(tag, mode, query_limit)
+        for mode in ("live", "general")
+    ]
     return tag, results
 
 
@@ -1285,6 +1397,7 @@ def get_pm_catalog_diagnostics():
         snapshot = dict(_PM_CATALOG_DIAGNOSTICS)
     snapshot["error_counts"] = dict(snapshot.get("error_counts") or {})
     snapshot["failed_tags"] = list(snapshot.get("failed_tags") or [])
+    snapshot["queries"] = [dict(query) for query in snapshot.get("queries") or []]
     return snapshot
 
 
@@ -1293,25 +1406,30 @@ def fetch_live_pm_markets(with_status=False):
             "valorant", "tennis", "atp"]
     prefixes = ("cs2-", "dota2-", "lol-", "valorant-",
                 "atp-", "wta-", "itf-")
-    query_limit = 200
     started = time.monotonic()
     out = {}
     query_count = len(tags) * 2
     successful_queries = 0
+    cursor_exhausted_queries = 0
+    total_pages = 0
+    page_cap_queries = 0
+    invalid_event_rows = 0
     catalog_complete = True
     results_by_tag = {}
     error_counts = {}
     failed_tags = set()
+    query_details = []
 
-    # A Gamma outage must not serialize seven sports into 14 * 15s of startup
-    # waiting. Each tag has one worker; its live and general queries are kept
-    # together, bounding concurrency while preserving both catalog views.
+    # Keep the existing per-tag worker bound; each worker walks the live and
+    # general keysets serially so cursor order is preserved within a stream.
     with ThreadPoolExecutor(
         max_workers=min(PM_CATALOG_WORKERS, len(tags)),
         thread_name_prefix="pm-catalog",
     ) as executor:
-        futures = {executor.submit(_fetch_pm_catalog_tag, tag, query_limit): tag
-                   for tag in tags}
+        futures = {
+            executor.submit(_fetch_pm_catalog_tag, tag, PM_CATALOG_PAGE_LIMIT): tag
+            for tag in tags
+        }
         for future in as_completed(futures):
             tag = futures[future]
             try:
@@ -1319,23 +1437,52 @@ def fetch_live_pm_markets(with_status=False):
                 results_by_tag[result_tag] = results
             except Exception as exc:
                 error_type = type(exc).__name__
-                results_by_tag[tag] = [("true", None, error_type),
-                                       (None, None, error_type)]
+                results_by_tag[tag] = [
+                    {
+                        "tag": tag, "mode": mode, "pages": 0,
+                        "raw_event_rows": 0, "invalid_event_rows": 0,
+                        "events": [], "cursor_exhausted": False,
+                        "page_cap_hit": False,
+                        "effective_page_limit": PM_CATALOG_PAGE_LIMIT,
+                        "last_http_status": None, "error": error_type,
+                    }
+                    for mode in ("live", "general")
+                ]
 
     for tag in tags:
-        for live_mode, events, error_type in results_by_tag.get(
-            tag, [("true", None, "WorkerError"), (None, None, "WorkerError")]
-        ):
-            if error_type:
+        for result in results_by_tag.get(tag, []):
+            pages = int(result.get("pages") or 0)
+            total_pages += pages
+            invalid_event_rows += int(result.get("invalid_event_rows") or 0)
+            cursor_exhausted = bool(result.get("cursor_exhausted"))
+            query_error = result.get("error")
+            if cursor_exhausted:
+                cursor_exhausted_queries += 1
+            if result.get("page_cap_hit"):
+                page_cap_queries += 1
+            if not cursor_exhausted or query_error:
                 catalog_complete = False
                 failed_tags.add(tag)
+                error_type = query_error or "CursorNotExhausted"
                 error_counts[error_type] = error_counts.get(error_type, 0) + 1
-                continue
-            successful_queries += 1
-            if len(events) >= query_limit:
-                # No pagination is implemented; a full page may be truncated.
+            else:
+                successful_queries += 1
+            if result.get("invalid_event_rows"):
                 catalog_complete = False
-            for event in events:
+
+            query_details.append({
+                "tag": tag,
+                "mode": result.get("mode"),
+                "pages": pages,
+                "raw_event_rows": int(result.get("raw_event_rows") or 0),
+                "cursor_exhausted": cursor_exhausted,
+                "page_cap_hit": bool(result.get("page_cap_hit")),
+                "effective_page_limit": result.get("effective_page_limit"),
+                "last_http_status": result.get("last_http_status"),
+                "error": query_error,
+            })
+
+            for event in result.get("events") or []:
                 if not isinstance(event, dict):
                     catalog_complete = False
                     continue
@@ -1386,8 +1533,15 @@ def fetch_live_pm_markets(with_status=False):
         "query_count": query_count,
         "successful_queries": successful_queries,
         "failed_queries": query_count - successful_queries,
+        "cursor_exhausted_queries": cursor_exhausted_queries,
+        "total_pages": total_pages,
+        "page_limit": PM_CATALOG_PAGE_LIMIT,
+        "max_pages_per_query": PM_CATALOG_MAX_PAGES,
+        "page_cap_queries": page_cap_queries,
+        "invalid_event_rows": invalid_event_rows,
         "error_counts": error_counts,
         "failed_tags": sorted(failed_tags),
+        "queries": query_details,
         "markets": len(out),
         "complete": complete,
         "elapsed_ms": round((time.monotonic() - started) * 1000, 1),
@@ -1395,16 +1549,16 @@ def fetch_live_pm_markets(with_status=False):
     with _PM_CATALOG_DIAGNOSTICS_LOCK:
         _PM_CATALOG_DIAGNOSTICS.clear()
         _PM_CATALOG_DIAGNOSTICS.update(diagnostics)
-    if diagnostics["failed_queries"]:
+    if diagnostics["failed_queries"] or not catalog_complete:
         errors = ", ".join(
             "%s=%s" % (name, count)
             for name, count in sorted(error_counts.items())
         ) or "invalid catalog data"
         print(
-            "[!] Polymarket Gamma catalog: %d/%d requests succeeded; "
-            "%d failed (%s), %d markets in %.0f ms" % (
+            "[!] Polymarket Gamma catalog: %d/%d query streams fully paginated; "
+            "%d incomplete (%s), %d pages, %d markets in %.0f ms" % (
                 successful_queries, query_count, diagnostics["failed_queries"],
-                errors, len(out), diagnostics["elapsed_ms"],
+                errors, total_pages, len(out), diagnostics["elapsed_ms"],
             ),
             flush=True,
         )
@@ -2560,6 +2714,10 @@ def main():
                 "event_received_at": source_event_at,
                 "event_to_snapshot_ms": round(max(0.0, _now - source_event_at) * 1000, 1)
                 if source_event_at is not None else None,
+                "enabled_bk_sources": (
+                    (["1win"] if router is not None and router.use_onewin else [])
+                    + (["BetBoom"] if (router.use_bb if router is not None else BB_ENABLED) else [])
+                ),
                 "pm_markets": len(market_map),
                 "phase_counts": phase_counts,
                 "checks": scan_counts,

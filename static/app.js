@@ -30,16 +30,8 @@ const state = {
 const pmBookCache = {};  // slug -> {best_ask, best_bid, ask_depth_usd}
 
 const BK_LIST = [
-  { id: '1win',    name: '1win',       speed: 0, color: 'onewin' },
-  { id: 'liga',    name: 'Лига Ставок',speed: 0 },
-  { id: 'betboom', name: 'BetBoom',    speed: 0, color: 'bb' },
-  { id: 'duel',    name: 'Duel',       speed: 1 },
-  { id: 'fonbet',  name: 'Fonbet',     speed: 1 },
-  { id: 'olimpbet',name: 'Olimpbet',   speed: 1 },
-  { id: 'pari',    name: 'PARI',       speed: 1 },
-  { id: 'roobet',  name: 'Roobet',     speed: 1 },
-  { id: 'stake',   name: 'Stake',      speed: 2 },
-  { id: 'winline', name: 'Winline',    speed: 0 },
+  { id: '1win',    name: '1win',    speed: 0, color: 'onewin' },
+  { id: 'betboom', name: 'BetBoom', speed: 0, color: 'bb' },
 ];
 if (!state.bkFilter) state.bkFilter = Object.fromEntries(BK_LIST.map(b => [b.id, true]));
 
@@ -293,6 +285,14 @@ function checkWsFreshness() {
   try { ws.close(4000, 'heartbeat timeout'); } catch (e) {}
 }
 
+function activeBookmakerList() {
+  const enabledIds = window.PolyArbSourceFilter.activeSourceIds(
+    state.scanStatus?.enabled_bk_sources,
+    BK_LIST.map(bookmaker => bookmaker.id),
+  );
+  return BK_LIST.filter(bookmaker => enabledIds.includes(bookmaker.id));
+}
+
 /* ============= FILTERS ============= */
 function applyFilters() {
   const sports = new Set();
@@ -307,6 +307,9 @@ function applyFilters() {
     if (state.phase !== 'all' && phase !== state.phase) return false;
     if (!sports.has(a.sport)) return false;
     if ((a.roi || 0) < minRoi) return false;
+    if (!window.PolyArbSourceFilter.includesSelectedProvider(
+      a, state.bkFilter, state.scanStatus?.enabled_bk_sources,
+    )) return false;
     return true;
   });
   state.visible.sort((a, b) => (b.roi || 0) - (a.roi || 0));
@@ -413,14 +416,19 @@ function renderScanStatus() {
   const catalogQueries = Number(catalogFetch.query_count || 0);
   const catalogFailures = Number(catalogFetch.failed_queries || 0);
   const catalogMarkets = Number(catalogFetch.markets || 0);
-  if (catalogQueries > 0 && (catalogFailures > 0 || catalogMarkets === 0)) {
+  if (catalogQueries > 0) {
     const errorTypes = Object.entries(catalogFetch.error_counts || {})
       .map(([name, count]) => `${name} ${Number(count)}`).slice(0, 2);
     const failedTags = (catalogFetch.failed_tags || []).slice(0, 3);
+    const invalidRows = Number(catalogFetch.invalid_event_rows || 0);
     reasons.unshift(
-      `Gamma PM: ответы ${Number(catalogFetch.successful_queries || 0)}/${catalogQueries} · ` +
-      `рынков ${catalogMarkets} · ${Number(catalogFetch.elapsed_ms || 0).toFixed(0)} мс` +
-      (catalogFailures ? ` · ошибок ${catalogFailures}${errorTypes.length ? ` (${errorTypes.join(', ')})` : ''}` : ' · активных рынков нет') +
+      `Gamma keyset: страниц ${Number(catalogFetch.total_pages || 0)} · ` +
+      `курсоры ${Number(catalogFetch.cursor_exhausted_queries || 0)}/${catalogQueries} · ` +
+      `лимит ${Number(catalogFetch.page_limit || 0)} · рынков ${catalogMarkets} · ` +
+      `${Number(catalogFetch.elapsed_ms || 0).toFixed(0)} мс` +
+      (catalogFailures ? ` · неполных запросов ${catalogFailures}${errorTypes.length ? ` (${errorTypes.join(', ')})` : ''}` : '') +
+      (invalidRows ? ` · пропущено event rows ${invalidRows}` : '') +
+      (!catalogFailures && !invalidRows && catalogMarkets === 0 ? ' · активных рынков нет' : '') +
       (failedTags.length ? ` · теги ${failedTags.join('/')}` : '')
     );
   }
@@ -1267,22 +1275,25 @@ function updateCalcHint() {
 
 /* ============= BK FILTER MODAL ============= */
 function openBkModal() {
+  const activeBookmakers = activeBookmakerList();
   const grid = document.getElementById('bk-grid');
-  grid.innerHTML = BK_LIST.map(b => {
-    const on = state.bkFilter[b.id];
+  grid.innerHTML = activeBookmakers.map(b => {
+    const on = state.bkFilter[b.id] !== false;
     return `<div class="bk-item ${on ? 'on' : ''}" onclick="toggleBk('${b.id}')">
       <div class="mark">✓</div>
       <div class="name">${escapeHtml(b.name)}</div>
       <div class="speed">${b.speed}с</div>
     </div>`;
-  }).join('');
-  const cnt = BK_LIST.filter(b => state.bkFilter[b.id]).length;
-  document.getElementById('bk-sub').textContent = `Отмечено ${cnt} из ${BK_LIST.length}`;
+  }).join('') || '<div class="bk-empty">Нет включённых поддерживаемых источников</div>';
+  const cnt = activeBookmakers.filter(b => state.bkFilter[b.id] !== false).length;
+  document.getElementById('bk-sub').textContent = `Отмечено ${cnt} из ${activeBookmakers.length}`;
   document.getElementById('modal-bk').classList.remove('hidden');
 }
 function toggleBk(id) {
-  state.bkFilter[id] = !state.bkFilter[id];
+  if (!activeBookmakerList().some(bookmaker => bookmaker.id === id)) return;
+  state.bkFilter[id] = state.bkFilter[id] === false;
   localStorage.setItem('poly_arb_bks', JSON.stringify(state.bkFilter));
+  applyFilters();
   openBkModal();
 }
 function closeBkModal() { document.getElementById('modal-bk').classList.add('hidden'); }

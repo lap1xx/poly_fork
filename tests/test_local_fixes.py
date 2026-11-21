@@ -91,11 +91,32 @@ class EventPhaseTests(unittest.TestCase):
 
 class PMCatalogRefreshTests(unittest.TestCase):
     class FakeResponse:
+        def __init__(self, payload=None, status_code=200):
+            self.payload = payload if payload is not None else {
+                "events": [], "next_cursor": "LTE="
+            }
+            self.status_code = status_code
+
         def raise_for_status(self):
+            if self.status_code >= 400:
+                raise polyarb_v4.requests.HTTPError(
+                    "HTTP %s" % self.status_code, response=self
+                )
             return None
 
         def json(self):
-            return []
+            return self.payload
+
+    @staticmethod
+    def _catalog_query(tag, mode, *, events=None, error=None, exhausted=True,
+                       pages=1, page_cap_hit=False):
+        return {
+            "tag": tag, "mode": mode, "pages": pages,
+            "raw_event_rows": len(events or []), "invalid_event_rows": 0,
+            "events": list(events or []), "cursor_exhausted": exhausted,
+            "page_cap_hit": page_cap_hit, "effective_page_limit": 500,
+            "last_http_status": None, "error": error,
+        }
 
     def test_market_map_prunes_only_after_complete_refresh(self):
         current = {"old": {"v": 1}, "keep": {"v": 1}}
@@ -143,12 +164,25 @@ class PMCatalogRefreshTests(unittest.TestCase):
         self.assertEqual(get.call_count, 14)
         self.assertGreater(max_active, 1)
         self.assertEqual(bad_timeouts, [])
+        self.assertTrue(all(call.args[0].endswith("/events/keyset") for call in get.call_args_list))
         self.assertEqual(diagnostic["successful_queries"], 14)
         self.assertEqual(diagnostic["failed_queries"], 0)
+        self.assertEqual(diagnostic["total_pages"], 14)
+        self.assertEqual(diagnostic["cursor_exhausted_queries"], 14)
 
     def test_fetch_marks_any_failed_query_as_partial(self):
-        responses = [self.FakeResponse() for _ in range(13)] + [OSError("temporary")]
-        with patch.object(polyarb_v4.requests, "get", side_effect=responses):
+        def fake_tag(tag, _query_limit):
+            results = []
+            for mode in ("live", "general"):
+                if tag == "cs2" and mode == "general":
+                    results.append(self._catalog_query(
+                        tag, mode, error="OSError", exhausted=False, pages=0
+                    ))
+                else:
+                    results.append(self._catalog_query(tag, mode))
+            return tag, results
+
+        with patch.object(polyarb_v4, "_fetch_pm_catalog_tag", side_effect=fake_tag):
             markets, complete = polyarb_v4.fetch_live_pm_markets(with_status=True)
         self.assertEqual(markets, {})
         self.assertFalse(complete)
@@ -156,21 +190,117 @@ class PMCatalogRefreshTests(unittest.TestCase):
         self.assertEqual(diagnostic["failed_queries"], 1)
         self.assertEqual(diagnostic["error_counts"], {"OSError": 1})
 
-    def test_limit_sized_response_cannot_authorize_pruning(self):
-        class CappedResponse(self.FakeResponse):
-            def json(self):
-                return [{"markets": []} for _ in range(200)]
-
-        responses = [self.FakeResponse() for _ in range(13)] + [CappedResponse()]
-        with patch.object(polyarb_v4.requests, "get", side_effect=responses):
+    def test_full_page_with_terminal_cursor_is_complete(self):
+        response = self.FakeResponse({
+            "events": [{"markets": []} for _ in range(500)],
+            "next_cursor": "LTE=",
+        })
+        with patch.object(polyarb_v4.requests, "get", return_value=response):
             markets, complete = polyarb_v4.fetch_live_pm_markets(with_status=True)
         self.assertEqual(markets, {})
-        self.assertFalse(complete)
+        self.assertTrue(complete)
+
+    def test_keyset_pages_are_merged_and_duplicate_market_slugs_are_deduplicated(self):
+        def market_event(slug):
+            return {"markets": [{
+                "slug": slug,
+                "question": slug,
+                "outcomes": json.dumps(["Yes", "No"]),
+                "clobTokenIds": json.dumps([slug + "-y", slug + "-n"]),
+            }]}
+
+        def fake_get(_url, *, params, **_kwargs):
+            if params.get("tag_slug") == "cs2" and "live" not in params:
+                if params.get("after_cursor") == "page-2":
+                    return self.FakeResponse({
+                        "events": [market_event("cs2-beta"), market_event("cs2-alpha")],
+                        "next_cursor": "LTE=",
+                    })
+                return self.FakeResponse({
+                    "events": [market_event("cs2-alpha")],
+                    "next_cursor": "page-2",
+                })
+            return self.FakeResponse()
+
+        with patch.object(polyarb_v4.requests, "get", side_effect=fake_get) as get:
+            markets, complete = polyarb_v4.fetch_live_pm_markets(with_status=True)
+        self.assertTrue(complete)
+        self.assertEqual(set(markets), {"cs2-alpha", "cs2-beta"})
+        self.assertEqual(get.call_count, 15)
+        diagnostic = polyarb_v4.get_pm_catalog_diagnostics()
+        self.assertEqual(diagnostic["query_count"], 14)
+        self.assertEqual(diagnostic["total_pages"], 15)
+        self.assertEqual(diagnostic["successful_queries"], 14)
+
+    def test_single_query_sends_after_cursor_and_stops_on_terminal_cursor(self):
+        pages = [
+            self.FakeResponse({"events": [{"id": "e1"}], "next_cursor": "cursor-1"}),
+            self.FakeResponse({"events": [{"id": "e2"}], "next_cursor": "LTE="}),
+        ]
+        with patch.object(polyarb_v4.requests, "get", side_effect=pages) as get:
+            result = polyarb_v4._fetch_pm_catalog_query("cs2", "general")
+        self.assertTrue(result["cursor_exhausted"])
+        self.assertIsNone(result["error"])
+        self.assertEqual(result["pages"], 2)
+        self.assertEqual([event["id"] for event in result["events"]], ["e1", "e2"])
+        self.assertEqual(get.call_args_list[0].kwargs["params"]["limit"], 500)
+        self.assertEqual(get.call_args_list[1].kwargs["params"]["after_cursor"], "cursor-1")
+        self.assertNotIn("offset", get.call_args_list[1].kwargs["params"])
+
+    def test_repeated_cursor_fails_closed(self):
+        pages = [
+            self.FakeResponse({"events": [{"id": "e1"}], "next_cursor": "cursor-1"}),
+            self.FakeResponse({"events": [{"id": "e2"}], "next_cursor": "cursor-1"}),
+        ]
+        with patch.object(polyarb_v4.requests, "get", side_effect=pages):
+            result = polyarb_v4._fetch_pm_catalog_query("cs2", "general")
+        self.assertFalse(result["cursor_exhausted"])
+        self.assertEqual(result["error"], "RepeatedCursor")
+        self.assertEqual(result["pages"], 2)
+
+    def test_page_cap_fails_closed_without_claiming_cursor_exhaustion(self):
+        pages = [
+            self.FakeResponse({"events": [], "next_cursor": "cursor-%d" % i})
+            for i in range(1, 3)
+        ]
+        with patch.object(polyarb_v4, "PM_CATALOG_MAX_PAGES", 2):
+            with patch.object(polyarb_v4.requests, "get", side_effect=pages):
+                result = polyarb_v4._fetch_pm_catalog_query("cs2", "general")
+        self.assertFalse(result["cursor_exhausted"])
+        self.assertTrue(result["page_cap_hit"])
+        self.assertEqual(result["error"], "PageCapReached")
+        self.assertEqual(result["pages"], 2)
+
+    def test_page_error_keeps_rows_but_reports_incomplete_stream(self):
+        responses = [
+            self.FakeResponse({"events": [{"id": "e1"}], "next_cursor": "cursor-1"}),
+            OSError("temporary"), OSError("temporary"), OSError("temporary"),
+        ]
+        with patch.object(polyarb_v4.time, "sleep"):
+            with patch.object(polyarb_v4.requests, "get", side_effect=responses):
+                result = polyarb_v4._fetch_pm_catalog_query("cs2", "general")
+        self.assertFalse(result["cursor_exhausted"])
+        self.assertEqual(result["error"], "OSError")
+        self.assertEqual(result["pages"], 1)
+        self.assertEqual(result["events"], [{"id": "e1"}])
+
+    def test_http_429_is_retried_with_bounded_timeout(self):
+        responses = [self.FakeResponse(status_code=429), self.FakeResponse()]
+        with patch.object(polyarb_v4.time, "sleep"):
+            with patch.object(polyarb_v4.requests, "get", side_effect=responses) as get:
+                result = polyarb_v4._fetch_pm_catalog_query("cs2", "general")
+        self.assertTrue(result["cursor_exhausted"])
+        self.assertIsNone(result["error"])
+        self.assertEqual(get.call_count, 2)
+        self.assertTrue(all(
+            call.kwargs["timeout"] == polyarb_v4.PM_CATALOG_TIMEOUT
+            for call in get.call_args_list
+        ))
 
     def test_non_list_outcomes_or_tokens_mark_catalog_partial(self):
         class WrongShapeResponse(self.FakeResponse):
             def json(self):
-                return [{"markets": [
+                return {"events": [{"markets": [
                     {
                         "slug": "cs2-scalar-shape",
                         "outcomes": json.dumps("ab"),
@@ -181,7 +311,7 @@ class PMCatalogRefreshTests(unittest.TestCase):
                         "outcomes": json.dumps({"0": "A", "1": "B"}),
                         "clobTokenIds": json.dumps({"0": "x", "1": "y"}),
                     },
-                ]}]
+                ]}], "next_cursor": "LTE="}
 
         responses = [WrongShapeResponse() for _ in range(14)]
         with patch.object(polyarb_v4.requests, "get", side_effect=responses):

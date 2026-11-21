@@ -43,5 +43,11 @@ jobs:
       - name: Check dashboard JavaScript syntax
         run: node --check static/app.js
 
+      - name: Check dashboard source filter syntax
+        run: node --check static/source_filter.js
+
       - name: Test bankroll planner
         run: node tests/test_bankroll_plan.cjs
+
+      - name: Test bookmaker source filter
+        run: node tests/test_source_filter.cjs

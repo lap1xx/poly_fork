@@ -373,6 +373,7 @@ input{font-family:var(--mono)}
 /* BK MODAL */
 .bk-sub{color:var(--txt2);font-size:12px;margin-bottom:12px}
 .bk-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.bk-empty{grid-column:1/-1;color:var(--txt2);font-size:12px;padding:10px 0}
 .bk-item{display:flex;align-items:center;gap:10px;background:var(--card2);border:1px solid var(--line);border-radius:9px;padding:10px 12px;cursor:pointer;transition:border .15s;user-select:none}
 .bk-item:hover{border-color:var(--line2)}
 .bk-item.on{border-color:var(--green-brd);background:rgba(0,255,136,.04)}
