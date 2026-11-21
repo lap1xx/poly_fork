@@ -24,6 +24,7 @@ except Exception:
     pass
 
 import requests
+from arb_invariants import is_pm_bookmaker_pair as _is_pm_bookmaker_pair
 from event_dispatch import (
     DirtyUpdateQueue,
     build_token_slug_index,
@@ -65,6 +66,7 @@ HT = "https" + COLON + SLASH + SLASH
 WSS = "wss" + COLON + SLASH + SLASH
 GAMMA = HT + "gamma-api" + DOT + "polymarket" + DOT + "com"
 WS_URL = WSS + "ws-subscriptions-clob" + DOT + "polymarket" + DOT + "com" + "/ws/market"
+WS_PING_INTERVAL_SEC = 8.0
 PM_FEE_PCT = 0.04
 CBR_URL = HT + "www" + DOT + "cbr" + DOT + "ru" + "/scripts/XML_daily.asp"
 BANKROLL_PLAN_LIMIT = 0.40
@@ -95,6 +97,75 @@ def _notify_pm_update(token_id):
             callback(str(token_id))
         except Exception:
             pass
+
+
+def _parse_clob_event_timestamp(value):
+    """Normalize CLOB event timestamps to Unix seconds; return None if unknown."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        timestamp = parsed.timestamp()
+    else:
+        try:
+            timestamp = float(value)
+        except (TypeError, ValueError):
+            if not isinstance(value, str):
+                return None
+            try:
+                parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                timestamp = parsed.timestamp()
+            except (TypeError, ValueError, OverflowError):
+                return None
+    if not math.isfinite(timestamp) or timestamp <= 0:
+        return None
+    if timestamp >= 100_000_000_000:
+        timestamp /= 1000.0
+    return timestamp
+
+
+def _book_source_timestamp(book):
+    if not isinstance(book, dict):
+        return None
+    try:
+        timestamp = float(book.get("source_ts"))
+    except (TypeError, ValueError):
+        return None
+    return timestamp if math.isfinite(timestamp) and timestamp > 0 else None
+
+
+def _parse_reported_top_price(value):
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return True, None
+    try:
+        price = float(value)
+    except (TypeError, ValueError):
+        return False, None
+    if not math.isfinite(price):
+        return False, None
+    if price == 0:
+        return True, None
+    if 0 < price < 1:
+        return True, price
+    return False, None
+
+
+def _reported_tops_match(bids, asks, reported):
+    for field, levels in (("best_bid", bids), ("best_ask", asks)):
+        if field not in reported:
+            continue
+        local = levels[0][0] if levels else None
+        remote = reported[field]
+        if remote is None:
+            if local is not None:
+                return False
+        elif local is None or not math.isclose(local, remote, rel_tol=0.0, abs_tol=1e-9):
+            return False
+    return True
 
 USDT = " USDT"
 
@@ -538,7 +609,7 @@ class Feed(threading.Thread):
                     continue
                 p = {"type": "market", "assets_ids": ids, "initial_dump": True}
                 ws.send(json.dumps(p))
-                last = time.time()
+                last_ping = time.monotonic()
                 while not STOP.is_set():
                     with self._ids_lock:
                         if generation != self._generation:
@@ -552,12 +623,13 @@ class Feed(threading.Thread):
                         break
                     if m and m != "PONG":
                         self._h(m)
-                    if time.time() - last > 50:
+                    now_mono = time.monotonic()
+                    if now_mono - last_ping >= WS_PING_INTERVAL_SEC:
                         try:
                             ws.send("PING")
                         except Exception:
                             break
-                        last = time.time()
+                        last_ping = now_mono
             except Exception:
                 pass
             finally:
@@ -580,6 +652,8 @@ class Feed(threading.Thread):
             self._a(it)
 
     def _a(self, d):
+        if not isinstance(d, dict):
+            return
         et = d.get("event_type")
         if et == "book":
             aid = d.get("asset_id")
@@ -605,61 +679,133 @@ class Feed(threading.Thread):
             bids.sort(key=lambda z: -z[0])
             asks.sort(key=lambda z: z[0])
             now = time.time()
+            event_ts = _parse_clob_event_timestamp(d.get("timestamp"))
             with LOCK:
                 prev = BOOKS.get(aid)
-                prev_ask = prev["asks"][0][0] if prev and prev.get("asks") else None
+                prev_source_ts = _book_source_timestamp(prev)
+                if (event_ts is not None and prev_source_ts is not None
+                        and event_ts < prev_source_ts):
+                    return
+                prev_asks = (prev or {}).get("asks") or []
+                prev_ask = prev_asks[0][0] if prev_asks else None
                 cur_ask = asks[0][0] if asks else None
                 if prev is None or prev_ask != cur_ask:
                     last_change = now
                 else:
                     last_change = prev.get("last_change", now)
-                BOOKS[aid] = {"bids": bids, "asks": asks,
-                              "ts": now, "last_change": last_change}
+                BOOKS[aid] = {
+                    "bids": bids, "asks": asks, "ts": now,
+                    "last_change": last_change,
+                    "source_ts": event_ts if event_ts is not None else prev_source_ts,
+                }
             _notify_pm_update(aid)
             return
         if et == "price_change":
             pcs = d.get("price_changes") or d.get("changes") or []
+            if isinstance(pcs, dict):
+                pcs = [pcs]
+            if not isinstance(pcs, (list, tuple)):
+                return
+            event_ts = _parse_clob_event_timestamp(d.get("timestamp"))
             now = time.time()
+            changes_by_id = {}
+            invalid_ids = set()
+            reported_tops = {}
+            for ch in pcs:
+                if not isinstance(ch, dict):
+                    continue
+                aid = ch.get("asset_id")
+                if not aid:
+                    continue
+                aid = str(aid)
+                try:
+                    side = str(ch.get("side") or "").upper()
+                    price = float(ch.get("price", 0))
+                    size = float(ch.get("size", 0))
+                except (TypeError, ValueError):
+                    invalid_ids.add(aid)
+                    continue
+                if (not math.isfinite(price) or not math.isfinite(size)
+                        or not 0 < price < 1 or size < 0
+                        or side not in {"BUY", "SELL"}):
+                    invalid_ids.add(aid)
+                    continue
+                changes_by_id.setdefault(aid, []).append((side, price, size))
+                tops = {}
+                for field in ("best_bid", "best_ask"):
+                    if field in ch:
+                        valid, top_price = _parse_reported_top_price(ch.get(field))
+                        if not valid:
+                            invalid_ids.add(aid)
+                        else:
+                            tops[field] = top_price
+                # The last change's top-of-book values describe the final batch state.
+                reported_tops[aid] = tops
+
             updated_ids = set()
+            invalidated_ids = set()
+            refresh_reasons = {}
             with LOCK:
-                for ch in pcs:
-                    aid = ch.get("asset_id")
-                    if not aid:
+                all_ids = set(changes_by_id) | invalid_ids
+                for aid in sorted(all_ids):
+                    if aid in invalid_ids:
+                        BOOKS.pop(aid, None)
+                        invalidated_ids.add(aid)
+                        refresh_reasons[aid] = "invalid_delta"
                         continue
-                    aid = str(aid)
                     prev = BOOKS.get(aid)
                     if not prev:
+                        refresh_reasons[aid] = "missing_snapshot"
+                        continue
+                    prev_source_ts = _book_source_timestamp(prev)
+                    if (event_ts is not None and prev_source_ts is not None
+                            and event_ts < prev_source_ts):
                         continue
                     try:
-                        side = (ch.get("side") or "").upper()
-                        price = float(ch.get("price", 0))
-                        size = float(ch.get("size", 0))
-                    except Exception:
+                        bids = {float(p): float(s) for p, s in prev.get("bids", [])}
+                        asks = {float(p): float(s) for p, s in prev.get("asks", [])}
+                    except (TypeError, ValueError):
+                        BOOKS.pop(aid, None)
+                        invalidated_ids.add(aid)
+                        refresh_reasons[aid] = "invalid_snapshot"
                         continue
-                    if (not math.isfinite(price) or not math.isfinite(size)
-                            or not (0 < price < 1)
-                            or side not in {"BUY", "SELL"}):
+                    if any(not math.isfinite(p) or not math.isfinite(s)
+                           or not 0 < p < 1 or s <= 0 for p, s in list(bids.items()) + list(asks.items())):
+                        BOOKS.pop(aid, None)
+                        invalidated_ids.add(aid)
+                        refresh_reasons[aid] = "invalid_snapshot"
                         continue
-                    bids = {p: s for p, s in prev.get("bids", [])}
-                    asks = {p: s for p, s in prev.get("asks", [])}
-                    book_side = bids if side == "BUY" else asks
-                    if size <= 0:
-                        book_side.pop(price, None)
-                    else:
-                        book_side[price] = size
+                    for side, price, size in changes_by_id[aid]:
+                        book_side = bids if side == "BUY" else asks
+                        if size == 0:
+                            book_side.pop(price, None)
+                        else:
+                            book_side[price] = size
                     new_bids = sorted(bids.items(), key=lambda z: -z[0])
                     new_asks = sorted(asks.items(), key=lambda z: z[0])
-                    prev_ask = prev["asks"][0][0] if prev.get("asks") else None
+                    if not _reported_tops_match(
+                            new_bids, new_asks, reported_tops.get(aid, {})):
+                        BOOKS.pop(aid, None)
+                        invalidated_ids.add(aid)
+                        refresh_reasons[aid] = "top_of_book_mismatch"
+                        continue
+                    prev_asks = prev.get("asks") or []
+                    prev_ask = prev_asks[0][0] if prev_asks else None
                     cur_ask = new_asks[0][0] if new_asks else None
                     if prev_ask != cur_ask:
                         last_change = now
                     else:
                         last_change = prev.get("last_change", now)
-                    BOOKS[aid] = {"bids": new_bids, "asks": new_asks,
-                                  "ts": now, "last_change": last_change}
+                    BOOKS[aid] = {
+                        "bids": new_bids, "asks": new_asks, "ts": now,
+                        "last_change": last_change,
+                        "source_ts": event_ts if event_ts is not None else prev_source_ts,
+                    }
                     updated_ids.add(aid)
-            for aid in updated_ids:
+            for aid in updated_ids | invalidated_ids:
                 _notify_pm_update(aid)
+            for aid, reason in refresh_reasons.items():
+                _schedule_pm_book_refresh(aid, reason)
             return
         if et == "last_trade_price":
             # A completed trade is not evidence that cached resting bids/asks
@@ -764,7 +910,7 @@ def _fresh_pm_book(token_id, timeout=6.0):
             pass
     bids.sort(key=lambda z: -z[0])
     asks.sort(key=lambda z: z[0])
-    return bids, asks
+    return bids, asks, _parse_clob_event_timestamp(book.get("timestamp"))
 
 
 def pm_book_diagnostic(token_id, now=None):
@@ -776,6 +922,8 @@ def pm_book_diagnostic(token_id, now=None):
         if not book:
             state = "missing_book"
             age = None
+            source_ts = None
+            source_age = None
             bids, asks = [], []
         else:
             bids = list(book.get("bids") or [])
@@ -785,6 +933,8 @@ def pm_book_diagnostic(token_id, now=None):
             except (TypeError, ValueError):
                 ts = 0.0
             age = max(0.0, now - ts) if ts > 0 else None
+            source_ts = _book_source_timestamp(book)
+            source_age = max(0.0, now - source_ts) if source_ts is not None else None
             if ts <= 0:
                 state = "missing_timestamp"
             elif age > BOOK_TTL:
@@ -800,6 +950,8 @@ def pm_book_diagnostic(token_id, now=None):
     return {
         "book_state": state,
         "book_age_sec": round(age, 1) if age is not None else None,
+        "source_event_ts": source_ts,
+        "source_event_age_sec": round(source_age, 1) if source_age is not None else None,
         "bid_levels": len(bids),
         "ask_levels": len(asks),
         "best_bid": bids[0][0] if bids else None,
@@ -818,7 +970,15 @@ def _refresh_pm_book_worker(token_id, attempted_at, reason):
     try:
         fresh = _fresh_pm_book(key, timeout=4.0)
         if fresh is not None:
-            bids, asks = fresh
+            if not isinstance(fresh, (tuple, list)) or len(fresh) not in (2, 3):
+                fresh = None
+            elif len(fresh) == 2:
+                bids, asks = fresh
+                rest_source_ts = None
+            else:
+                bids, asks, rest_source_ts = fresh
+                rest_source_ts = _parse_clob_event_timestamp(rest_source_ts)
+        if fresh is not None:
             bid_levels, ask_levels = len(bids), len(asks)
             now = time.time()
             with LOCK:
@@ -827,7 +987,15 @@ def _refresh_pm_book_worker(token_id, attempted_at, reason):
                     previous_ts = float((previous or {}).get("ts") or 0.0)
                 except (TypeError, ValueError):
                     previous_ts = 0.0
-                if previous_ts > attempted_at:
+                previous_source_ts = _book_source_timestamp(previous)
+                comparable_source_times = (
+                    rest_source_ts is not None and previous_source_ts is not None
+                )
+                if comparable_source_times and rest_source_ts < previous_source_ts:
+                    result_state = "rest_snapshot_older"
+                elif (previous_ts >= attempted_at
+                      and (not comparable_source_times
+                           or previous_source_ts >= rest_source_ts)):
                     result_state = "websocket_newer"
                 else:
                     previous_ask = ((previous or {}).get("asks") or [None])[0]
@@ -841,6 +1009,8 @@ def _refresh_pm_book_worker(token_id, attempted_at, reason):
                     BOOKS[key] = {
                         "bids": bids, "asks": asks, "ts": now,
                         "last_change": last_change,
+                        "source_ts": (rest_source_ts if rest_source_ts is not None
+                                      else previous_source_ts),
                     }
                     applied = True
                     if not bids and not asks:
@@ -1392,6 +1562,11 @@ def build_arb_candidates(m, live_bc, slip, bank=0.0, rate=0.0,
         if diagnostics is not None:
             diagnostics[reason] = diagnostics.get(reason, 0) + 1
 
+    source_label = str(bk_source or "").strip()
+    if not source_label or "polymarket" in source_label.casefold():
+        note("invalid_bookmaker_source")
+        return []
+
     pm_o = m.get("o") or []
     pm_t = m.get("t") or []
     if len(pm_o) != 2 or len(pm_t) != 2 or not live_bc:
@@ -1458,7 +1633,7 @@ def build_arb_candidates(m, live_bc, slip, bank=0.0, rate=0.0,
         if o <= 1.0:
             continue
         bk_legs[oc] = {
-            "source": bk_source,
+            "source": source_label,
             "outcome": oc,
             "o": o,
             "c": float(info.get("c", 0.0)),
@@ -1471,7 +1646,16 @@ def build_arb_candidates(m, live_bc, slip, bank=0.0, rate=0.0,
         other = pm_o[1 - i]
         bb = bk_legs.get(other)
         if bb:
-            pairs.append([pm_legs[i], bb])
+            pair = [pm_legs[i], bb]
+            if _is_pm_bookmaker_pair(
+                pair,
+                expected_bookmaker_source=source_label,
+                require_pm_token=True,
+                require_prices=True,
+            ):
+                pairs.append(pair)
+            else:
+                note("invalid_candidate_pair")
     if not pairs:
         note("no_opposite_bk_market")
     return pairs
@@ -2015,6 +2199,7 @@ def main():
                 "no_opposite_bk_market": 0,
                 "invalid_market_or_no_quotes": 0,
                 "invalid_calculation": 0,
+                "invalid_candidate_pair": 0,
                 "pm_depth_rejects": 0,
                 "below_roi": 0,
                 "roi_passed": 0,
@@ -2072,6 +2257,14 @@ def main():
                     scan_counts[_reason] = scan_counts.get(_reason, 0) + _count
                 scan_counts["candidate_pairs"] += len(pairs)
                 for bets in pairs:
+                    if not _is_pm_bookmaker_pair(
+                        bets,
+                        expected_bookmaker_source=_bk_src,
+                        require_pm_token=True,
+                        require_prices=True,
+                    ):
+                        scan_counts["invalid_candidate_pair"] += 1
+                        continue
                     r = compute(bets, plan_bank)
                     if not r:
                         scan_counts["invalid_calculation"] += 1

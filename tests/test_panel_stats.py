@@ -72,5 +72,57 @@ class SourceFreshnessTests(unittest.TestCase):
         self.assertEqual(result["unknown"]["phase"], "unknown")
 
 
+class CrossSourcePairValidationTests(unittest.TestCase):
+    @staticmethod
+    def trade_payload(books=("Polymarket", "1win")):
+        return {
+            "slug": "cs2-alpha-bravo-winner",
+            "q": "Alpha vs Bravo",
+            "bank": 100.0,
+            "profit": 4.0,
+            "roi": 0.04,
+            "payout": 104.0,
+            "rate": 1.0,
+            "currency": "USDT",
+            "legs": [
+                {
+                    "book": books[0], "outcome": "Alpha",
+                    "price_usd": 0.45, "amount_usdt": 50.0,
+                },
+                {
+                    "book": books[1], "outcome": "Bravo",
+                    "odds": 2.3, "stake_usdt": 50.0,
+                },
+            ],
+        }
+
+    def test_manual_trade_record_accepts_only_pm_plus_one_bookmaker(self):
+        with TemporaryDirectory() as tmp:
+            trade_file = Path(tmp) / "trades.jsonl"
+            with patch.object(web_app, "TRADES_FILE", trade_file):
+                result = asyncio.run(web_app.api_trade(self.trade_payload()))
+        self.assertTrue(result["ok"])
+
+    def test_manual_trade_record_rejects_two_bookmakers(self):
+        with TemporaryDirectory() as tmp:
+            trade_file = Path(tmp) / "trades.jsonl"
+            with patch.object(web_app, "TRADES_FILE", trade_file):
+                result = asyncio.run(
+                    web_app.api_trade(self.trade_payload(("1win", "BetBoom")))
+                )
+        self.assertEqual(result.status_code, 422)
+        self.assertFalse(trade_file.exists())
+
+    def test_scanner_arb_rejects_bookmaker_source_metadata_mismatch(self):
+        arb = {
+            "bk_source": "1win",
+            "bets": [
+                {"source": "Polymarket", "outcome": "Alpha", "token": "pm-1", "o": 2.1},
+                {"source": "BetBoom", "outcome": "Bravo", "o": 2.2},
+            ],
+        }
+        self.assertFalse(web_app._is_valid_scanner_arb(arb))
+
+
 if __name__ == '__main__':
     unittest.main()

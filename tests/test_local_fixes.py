@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import price_history
 import stats
+import arb_invariants
 import polyarb_v4
 import bot_live
 from event_phase import classify_event_phase
@@ -252,6 +253,19 @@ class PMBookRecoveryTests(unittest.TestCase):
             "stale_book",
         )
 
+    def test_book_diagnostic_reports_local_and_source_event_ages(self):
+        now = time.time()
+        with polyarb_v4.LOCK:
+            polyarb_v4.BOOKS[self.tokens[0]] = {
+                "bids": [(0.40, 2.0)], "asks": [(0.50, 3.0)],
+                "ts": now - 3.0, "last_change": now - 3.0,
+                "source_ts": now - 7.0,
+            }
+        diagnostic = polyarb_v4.pm_book_diagnostic(self.tokens[0], now)
+        self.assertEqual(diagnostic["book_age_sec"], 3.0)
+        self.assertEqual(diagnostic["source_event_age_sec"], 7.0)
+        self.assertEqual(diagnostic["source_event_ts"], now - 7.0)
+
     def test_missing_book_is_fetched_and_empty_ask_is_reported(self):
         token = self.tokens[0]
         response = self.FakeResponse({
@@ -283,6 +297,18 @@ class PMBookRecoveryTests(unittest.TestCase):
             "asks_available",
         )
 
+    def test_rest_book_reader_extracts_documented_snapshot_timestamp(self):
+        response = self.FakeResponse({
+            "timestamp": "1763700000",
+            "bids": [{"price": "0.40", "size": "5"}],
+            "asks": [{"price": "0.50", "size": "7"}],
+        })
+        with patch.object(polyarb_v4.requests, "get", return_value=response):
+            bids, asks, source_ts = polyarb_v4._fresh_pm_book(self.tokens[2])
+        self.assertEqual(bids, [(0.40, 5.0)])
+        self.assertEqual(asks, [(0.50, 7.0)])
+        self.assertEqual(source_ts, 1763700000.0)
+
     def test_rest_refresh_does_not_overwrite_newer_websocket_book(self):
         token = self.tokens[3]
         now = time.time()
@@ -300,6 +326,63 @@ class PMBookRecoveryTests(unittest.TestCase):
         self.assertEqual(
             polyarb_v4.pm_book_diagnostic(token)["rest_refresh"],
             "websocket_newer",
+        )
+
+    def test_rest_snapshot_timestamp_becomes_the_source_watermark(self):
+        token = self.tokens[0]
+        now = time.time()
+        with polyarb_v4.LOCK:
+            polyarb_v4.BOOKS[token] = {
+                "bids": [(0.40, 5.0)], "asks": [(0.50, 7.0)],
+                "ts": now - 20.0, "last_change": now - 20.0,
+                "source_ts": 1763700000.0,
+            }
+        with patch.object(
+            polyarb_v4, "_fresh_pm_book",
+            return_value=([(0.41, 6.0)], [(0.51, 8.0)], 1763700100.0),
+        ):
+            polyarb_v4._refresh_pm_book_worker(token, now - 10.0, "stale_book")
+        with polyarb_v4.LOCK:
+            self.assertEqual(polyarb_v4.BOOKS[token]["source_ts"], 1763700100.0)
+            self.assertEqual(polyarb_v4.BOOKS[token]["asks"], [(0.51, 8.0)])
+
+    def test_newer_rest_snapshot_replaces_late_arriving_older_ws_book(self):
+        token = self.tokens[2]
+        now = time.time()
+        with polyarb_v4.LOCK:
+            polyarb_v4.BOOKS[token] = {
+                "bids": [(0.40, 5.0)], "asks": [(0.50, 7.0)],
+                "ts": now, "last_change": now,
+                "source_ts": 1763699999.0,
+            }
+        with patch.object(
+            polyarb_v4, "_fresh_pm_book",
+            return_value=([(0.42, 6.0)], [(0.49, 8.0)], 1763700000.0),
+        ):
+            polyarb_v4._refresh_pm_book_worker(token, now - 1.0, "stale_book")
+        with polyarb_v4.LOCK:
+            self.assertEqual(polyarb_v4.BOOKS[token]["asks"], [(0.49, 8.0)])
+            self.assertEqual(polyarb_v4.BOOKS[token]["source_ts"], 1763700000.0)
+
+    def test_older_rest_snapshot_does_not_replace_newer_source_book(self):
+        token = self.tokens[1]
+        now = time.time()
+        with polyarb_v4.LOCK:
+            polyarb_v4.BOOKS[token] = {
+                "bids": [(0.40, 5.0)], "asks": [(0.50, 7.0)],
+                "ts": now - 20.0, "last_change": now - 20.0,
+                "source_ts": 1763700000.0,
+            }
+        with patch.object(
+            polyarb_v4, "_fresh_pm_book",
+            return_value=([(0.30, 6.0)], [(0.35, 8.0)], 1763699999.0),
+        ):
+            polyarb_v4._refresh_pm_book_worker(token, now - 10.0, "stale_book")
+        with polyarb_v4.LOCK:
+            self.assertEqual(polyarb_v4.BOOKS[token]["asks"], [(0.50, 7.0)])
+        self.assertEqual(
+            polyarb_v4.pm_book_diagnostic(token)["rest_refresh"],
+            "rest_snapshot_older",
         )
 
     def test_failed_rest_refresh_is_rate_limited(self):
@@ -331,6 +414,91 @@ class PMBookRecoveryTests(unittest.TestCase):
             )
         self.assertEqual(len(pairs), 2)
         self.assertTrue(all(pair[0]["pm_verified"] is False for pair in pairs))
+        self.assertTrue(all(polyarb_v4._is_pm_bookmaker_pair(pair) for pair in pairs))
+        self.assertTrue(all(
+            sum(leg.get("source") == "Polymarket" for leg in pair) == 1
+            and len(pair) == 2
+            for pair in pairs
+        ))
+        for pair in pairs:
+            pm_leg = next(leg for leg in pair if leg["source"] == "Polymarket")
+            bookmaker_leg = next(leg for leg in pair if leg["source"] != "Polymarket")
+            self.assertEqual({pm_leg["outcome"], bookmaker_leg["outcome"]}, {"Yes", "No"})
+            self.assertNotEqual(pm_leg["outcome"], bookmaker_leg["outcome"])
+
+    def test_candidate_builder_rejects_polymarket_as_the_bookmaker_source(self):
+        market = {"o": ["Yes", "No"], "t": self.tokens[:2]}
+        now = time.time()
+        with polyarb_v4.LOCK:
+            for token in self.tokens[:2]:
+                polyarb_v4.BOOKS[token] = {
+                    "bids": [(0.48, 100.0)], "asks": [(0.50, 100.0)],
+                    "ts": now, "last_change": now,
+                }
+        with patch.object(polyarb_v4, "_maybe_refresh_stale", return_value=False):
+            pairs = polyarb_v4.build_arb_candidates(
+                market,
+                {"Yes": {"o": 2.0}, "No": {"o": 2.0}},
+                0.0,
+                bk_source="Polymarket",
+            )
+        self.assertEqual(pairs, [])
+
+    def test_pair_validator_rejects_same_source_or_wrong_leg_count(self):
+        pm = {
+            "source": "Polymarket", "outcome": "Alpha",
+            "token": "pm-token", "o": 2.0,
+        }
+        one_bookmaker = {"source": "1win", "outcome": "Bravo", "o": 2.0}
+        second_bookmaker = {"source": "BetBoom", "outcome": "Charlie", "o": 2.1}
+        self.assertTrue(polyarb_v4._is_pm_bookmaker_pair([pm, one_bookmaker]))
+        self.assertFalse(polyarb_v4._is_pm_bookmaker_pair([pm, dict(pm)]))
+        self.assertFalse(polyarb_v4._is_pm_bookmaker_pair([
+            pm, {"source": "1win", "outcome": "Alpha", "o": 2.0}
+        ]))
+        self.assertFalse(
+            polyarb_v4._is_pm_bookmaker_pair([one_bookmaker, second_bookmaker])
+        )
+        self.assertFalse(polyarb_v4._is_pm_bookmaker_pair(
+            [pm, one_bookmaker], expected_bookmaker_source="BetBoom"
+        ))
+        self.assertFalse(polyarb_v4._is_pm_bookmaker_pair([
+            pm, {"source": "UnknownBook", "outcome": "Bravo", "o": 2.0}
+        ]))
+        self.assertFalse(polyarb_v4._is_pm_bookmaker_pair(
+            [pm, {"source": "1win", "outcome": "Bravo", "o": float("nan")}],
+            require_pm_token=True,
+            require_prices=True,
+        ))
+        self.assertFalse(
+            polyarb_v4._is_pm_bookmaker_pair([pm, one_bookmaker, second_bookmaker])
+        )
+
+    def test_alternate_monitor_requires_explicit_pm_and_single_bk_kinds(self):
+        pm = {
+            "source": "POLYMARKET", "sourceKind": "pm",
+            "outcome": "Alpha", "o": 2.1,
+        }
+        book = {
+            "source": "LocalBook", "sourceKind": "bc",
+            "outcome": "Bravo", "o": 2.2,
+        }
+        other_book = {
+            "source": "SecondBook", "sourceKind": "bc",
+            "outcome": "Alpha", "o": 2.3,
+        }
+        self.assertTrue(arb_invariants.is_pm_bookmaker_pair(
+            [pm, book], source_kind_key="sourceKind",
+            allow_unregistered_bookmaker=True, require_prices=True,
+        ))
+        self.assertFalse(arb_invariants.is_pm_bookmaker_pair(
+            [book, other_book], source_kind_key="sourceKind",
+            allow_unregistered_bookmaker=True, require_prices=True,
+        ))
+        self.assertFalse(arb_invariants.is_pm_bookmaker_pair(
+            [pm, other_book], source_kind_key="sourceKind",
+            allow_unregistered_bookmaker=True, require_prices=True,
+        ))
 
     def test_no_ask_market_row_contains_market_outcome_and_book_state(self):
         details = []
@@ -347,6 +515,191 @@ class PMBookRecoveryTests(unittest.TestCase):
         self.assertEqual(details[0]["outcome"], "Yes")
         self.assertEqual(details[0]["token_id"], self.tokens[0])
         self.assertEqual(details[0]["book_state"], "missing_book")
+
+
+class PMStreamEventTests(unittest.TestCase):
+    def setUp(self):
+        self.token = "unit-test-pm-stream-%s" % id(self)
+        with polyarb_v4.LOCK:
+            polyarb_v4.BOOKS.pop(self.token, None)
+        with polyarb_v4._PM_REFRESH_LOCK:
+            polyarb_v4._PM_REFRESH_INFLIGHT.discard(self.token)
+            polyarb_v4._PM_REFRESH_COOLDOWN.pop(self.token, None)
+
+    def tearDown(self):
+        with polyarb_v4.LOCK:
+            polyarb_v4.BOOKS.pop(self.token, None)
+        with polyarb_v4._PM_REFRESH_LOCK:
+            polyarb_v4._PM_REFRESH_INFLIGHT.discard(self.token)
+            polyarb_v4._PM_REFRESH_COOLDOWN.pop(self.token, None)
+            polyarb_v4._PM_REFRESH_DIAGNOSTICS.pop(self.token, None)
+
+    def test_clob_timestamp_normalizes_milliseconds_and_seconds(self):
+        self.assertEqual(
+            polyarb_v4._parse_clob_event_timestamp("1763700000000"),
+            1763700000.0,
+        )
+        self.assertEqual(
+            polyarb_v4._parse_clob_event_timestamp(1763700000),
+            1763700000.0,
+        )
+        self.assertIsNone(polyarb_v4._parse_clob_event_timestamp("not-a-time"))
+
+    def test_feed_sends_a_market_ping_within_ten_seconds(self):
+        if not polyarb_v4.HAS_WS:
+            self.skipTest("websocket-client is not installed")
+        clock = {"now": 0.0, "reads": 0}
+        sent = []
+
+        class FakeWebSocket:
+            def send(self, message):
+                sent.append((message, clock["now"]))
+
+            def settimeout(self, _timeout):
+                return None
+
+            def recv(self):
+                clock["now"] += 1.0
+                clock["reads"] += 1
+                if clock["reads"] >= 11:
+                    polyarb_v4.STOP.set()
+                return ""
+
+            def close(self):
+                return None
+
+        polyarb_v4.STOP.clear()
+        try:
+            with patch.object(polyarb_v4.websocket, "create_connection", return_value=FakeWebSocket()):
+                with patch.object(polyarb_v4.time, "monotonic", side_effect=lambda: clock["now"]):
+                    polyarb_v4.Feed([self.token]).run()
+        finally:
+            polyarb_v4.STOP.clear()
+        ping_times = [at for message, at in sent if message == "PING"]
+        self.assertTrue(ping_times, "feed did not send a heartbeat during the first 10 seconds")
+        self.assertLessEqual(ping_times[0], 10.0)
+
+    def test_valid_snapshot_and_delta_keep_event_time_and_dispatch_after_commit(self):
+        updates = []
+        feed = polyarb_v4.Feed([])
+        with patch.object(polyarb_v4, "_PM_UPDATE_CALLBACK", updates.append):
+            feed._a({
+                "event_type": "book", "asset_id": self.token,
+                "timestamp": "1763699999000",
+                "bids": [{"price": "0.40", "size": "5"}],
+                "asks": [{"price": "0.50", "size": "7"}],
+            })
+            updates.clear()
+            feed._a({
+                "event_type": "price_change", "timestamp": "1763700000000",
+                "price_changes": [{
+                    "asset_id": self.token, "side": "SELL",
+                    "price": "0.50", "size": "3",
+                    "best_bid": "0.40", "best_ask": "0.50",
+                }],
+            })
+        with polyarb_v4.LOCK:
+            book = dict(polyarb_v4.BOOKS[self.token])
+        self.assertEqual(book["asks"], [(0.50, 3.0)])
+        self.assertEqual(book["source_ts"], 1763700000.0)
+        self.assertEqual(updates, [self.token])
+
+    def test_older_delta_does_not_change_a_newer_book(self):
+        current = time.time()
+        newer_timestamp = 1763700000.0
+        initial = {
+            "bids": [(0.40, 5.0)], "asks": [(0.50, 7.0)],
+            "ts": current, "last_change": current,
+            "source_ts": newer_timestamp,
+        }
+        with polyarb_v4.LOCK:
+            polyarb_v4.BOOKS[self.token] = dict(initial)
+        polyarb_v4.Feed([])._a({
+            "event_type": "price_change",
+            "timestamp": "1763699999000",
+            "price_changes": [{
+                "asset_id": self.token, "side": "SELL",
+                "price": "0.50", "size": "1",
+            }],
+        })
+        with polyarb_v4.LOCK:
+            self.assertEqual(polyarb_v4.BOOKS[self.token], initial)
+
+    def test_older_snapshot_does_not_replace_a_newer_book(self):
+        current = time.time()
+        initial = {
+            "bids": [(0.40, 5.0)], "asks": [(0.50, 7.0)],
+            "ts": current, "last_change": current,
+            "source_ts": 1763700000.0,
+        }
+        with polyarb_v4.LOCK:
+            polyarb_v4.BOOKS[self.token] = dict(initial)
+        polyarb_v4.Feed([])._a({
+            "event_type": "book", "asset_id": self.token,
+            "timestamp": "1763699999000",
+            "bids": [{"price": "0.45", "size": "2"}],
+            "asks": [{"price": "0.55", "size": "3"}],
+        })
+        with polyarb_v4.LOCK:
+            self.assertEqual(polyarb_v4.BOOKS[self.token], initial)
+
+    def test_delta_without_snapshot_requests_rest_recovery(self):
+        with patch.object(polyarb_v4, "_schedule_pm_book_refresh") as schedule:
+            polyarb_v4.Feed([])._a({
+                "event_type": "price_change",
+                "timestamp": "1763700000000",
+                "price_changes": [{
+                    "asset_id": self.token, "side": "BUY",
+                    "price": "0.40", "size": "5",
+                }],
+            })
+        schedule.assert_called_once_with(self.token, "missing_snapshot")
+        with polyarb_v4.LOCK:
+            self.assertNotIn(self.token, polyarb_v4.BOOKS)
+
+    def test_best_bid_mismatch_invalidates_book_and_requests_recovery(self):
+        current = time.time()
+        with polyarb_v4.LOCK:
+            polyarb_v4.BOOKS[self.token] = {
+                "bids": [(0.40, 5.0)], "asks": [(0.50, 7.0)],
+                "ts": current, "last_change": current,
+                "source_ts": 1763699999.0,
+            }
+        with patch.object(polyarb_v4, "_schedule_pm_book_refresh") as schedule:
+            polyarb_v4.Feed([])._a({
+                "event_type": "price_change",
+                "timestamp": "1763700000000",
+                "price_changes": [{
+                    "asset_id": self.token, "side": "BUY",
+                    "price": "0.60", "size": "2",
+                    "best_bid": "0.55", "best_ask": "0.50",
+                }],
+            })
+        schedule.assert_called_once_with(self.token, "top_of_book_mismatch")
+        with polyarb_v4.LOCK:
+            self.assertNotIn(self.token, polyarb_v4.BOOKS)
+
+    def test_best_ask_mismatch_invalidates_book_and_requests_recovery(self):
+        current = time.time()
+        with polyarb_v4.LOCK:
+            polyarb_v4.BOOKS[self.token] = {
+                "bids": [(0.40, 5.0)], "asks": [(0.50, 7.0)],
+                "ts": current, "last_change": current,
+                "source_ts": 1763699999.0,
+            }
+        with patch.object(polyarb_v4, "_schedule_pm_book_refresh") as schedule:
+            polyarb_v4.Feed([])._a({
+                "event_type": "price_change",
+                "timestamp": "1763700000000",
+                "price_changes": [{
+                    "asset_id": self.token, "side": "SELL",
+                    "price": "0.50", "size": "2",
+                    "best_bid": "0.40", "best_ask": "0.51",
+                }],
+            })
+        schedule.assert_called_once_with(self.token, "top_of_book_mismatch")
+        with polyarb_v4.LOCK:
+            self.assertNotIn(self.token, polyarb_v4.BOOKS)
 
 
 class CalculationTests(unittest.TestCase):

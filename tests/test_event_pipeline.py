@@ -190,6 +190,18 @@ class ScannerIngressTests(unittest.TestCase):
         self.loop.close()
         asyncio.set_event_loop(None)
 
+    @staticmethod
+    def _valid_arb(slug, roi):
+        return {
+            "slug": slug,
+            "bk_source": "1win",
+            "roi": roi,
+            "bets": [
+                {"source": "Polymarket", "outcome": "Alpha", "token": "pm-alpha", "o": 2.1},
+                {"source": "1win", "outcome": "Bravo", "o": 2.2},
+            ],
+        }
+
     def _payload(self, seq=1, roi=0.07):
         return {
             "type": "scanner.snapshot",
@@ -198,7 +210,7 @@ class ScannerIngressTests(unittest.TestCase):
             "session_id": "test-session",
             "seq": seq,
             "sent_at": time.time(),
-            "arbs": {"event-slug": {"roi": roi}},
+            "arbs": {"event-slug": self._valid_arb("event-slug", roi)},
             "scan_status": {"state": "running", "ts": time.time()},
         }
 
@@ -213,6 +225,22 @@ class ScannerIngressTests(unittest.TestCase):
         self.assertEqual(web_app._scanner_state["seq"], 1)
         self.assertIn("scanner_to_backend_ms", web_app._scanner_state["scan_status"])
         self.assertTrue(web_app._broadcast_wakeup.is_set())
+
+    def test_ingress_drops_bookmaker_vs_bookmaker_candidates(self):
+        payload = self._payload()
+        payload["arbs"]["event-slug"]["bets"] = [
+            {"source": "1win", "outcome": "Alpha", "o": 2.1},
+            {"source": "BetBoom", "outcome": "Bravo", "o": 2.2},
+        ]
+        ws = _FakeBrowserlessWS(
+            [json.dumps(payload)], headers={"authorization": "Bearer unit-test-secret"}
+        )
+        with patch.dict(os.environ, {"POLYARB_SCANNER_WS_TOKEN": "unit-test-secret"}):
+            self.loop.run_until_complete(web_app.scanner_ingest_ws(ws))
+        self.assertEqual(web_app._scanner_state["arbs"], {})
+        self.assertEqual(
+            web_app._scanner_state["scan_status"]["invalid_arb_pairs_dropped"], 1
+        )
 
     def test_missing_auth_is_rejected_before_accept(self):
         ws = _FakeBrowserlessWS(["{}"], host="127.0.0.1", headers={})
@@ -258,7 +286,7 @@ class ScannerIngressTests(unittest.TestCase):
         web_app._scanner_state = {
             "seq": 9,
             "received_at": time.time(),
-            "arbs": {"event-slug": {"roi": 0.08}},
+            "arbs": {"event-slug": self._valid_arb("event-slug", 0.08)},
             "scan_status": {"state": "running", "ts": time.time()},
         }
         web_app._broadcast_wakeup.set()
@@ -319,7 +347,9 @@ class ScannerIngressTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             live_file = Path(tmp) / "arbs_live.json"
             status_file = Path(tmp) / "scanner_status.json"
-            live_file.write_text(json.dumps({"file-slug": {"roi": 0.09}}), encoding="utf-8")
+            live_file.write_text(json.dumps({
+                "file-slug": self._valid_arb("file-slug", 0.09)
+            }), encoding="utf-8")
             status_file.write_text(json.dumps({"state": "running", "ts": time.time()}), encoding="utf-8")
             with patch.object(web_app, "LIVE_FILE", live_file), \
                  patch.object(web_app, "STATUS_FILE", status_file), \

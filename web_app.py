@@ -24,6 +24,7 @@ from typing import Set, Dict, List
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
+from arb_invariants import is_pm_bookmaker_pair
 
 try:
     import price_history
@@ -62,6 +63,33 @@ _scanner_seq = -1
 _broadcast_wakeup = None
 SCANNER_WS_MAX_BYTES = 8 * 1024 * 1024
 SCANNER_STATE_STALE_SECONDS = 3.0
+
+
+def _is_valid_scanner_arb(arb):
+    """Validate the serialized scanner candidate before it reaches a client."""
+    if not isinstance(arb, dict):
+        return False
+    bookmaker_source = arb.get("bk_source")
+    if not isinstance(bookmaker_source, str) or not bookmaker_source.strip():
+        return False
+    return is_pm_bookmaker_pair(
+        arb.get("bets"),
+        expected_bookmaker_source=bookmaker_source,
+        require_pm_token=True,
+        require_prices=True,
+    )
+
+
+def _filter_pinned_signal_pairs(scan_status):
+    if not isinstance(scan_status, dict):
+        return {}
+    filtered = dict(scan_status)
+    snapshots = filtered.get("pinned_signal_snapshots")
+    if isinstance(snapshots, list):
+        valid = [row for row in snapshots if _is_valid_scanner_arb(row)]
+        filtered["pinned_signal_snapshots"] = valid
+        filtered["invalid_pinned_signal_snapshots_dropped"] = len(snapshots) - len(valid)
+    return filtered
 
 def _configured_onewin_event_origin():
     """Return a normalized HTTPS origin used by the read-only 1win event links."""
@@ -392,11 +420,23 @@ async def _broadcast_loop():
                     should_broadcast = True
             if should_broadcast:
                 enriched = _build_enriched(raw or {})
+                enriched = {
+                    slug: arb for slug, arb in enriched.items()
+                    if _is_valid_scanner_arb(arb)
+                }
+                scan_status = _filter_pinned_signal_pairs(scan_status)
+                dropped_count = len(raw or {}) - len(enriched)
+                previous_dropped = _finite_number(
+                    scan_status.get("invalid_arb_pairs_dropped"), 0, 5000
+                ) or 0
+                scan_status["invalid_arb_pairs_dropped"] = max(
+                    int(previous_dropped), dropped_count
+                )
                 msg = json.dumps({
                     "type": "snapshot",
                     "ts": time.time(),
                     "arbs": list(enriched.values()),
-                    "total": len(raw or {}),
+                    "total": len(enriched),
                     "hidden_count": len(_hidden),
                     "config": _load_config(),
                     "scan_status": scan_status or {},
@@ -491,6 +531,11 @@ async def ws_endpoint(ws: WebSocket):
         enriched = _build_enriched(raw)
         if not isinstance(scan_status, dict):
             scan_status = {}
+        enriched = {
+            slug: arb for slug, arb in enriched.items()
+            if _is_valid_scanner_arb(arb)
+        }
+        scan_status = _filter_pinned_signal_pairs(scan_status)
         await ws.send_text(json.dumps({
             "type": "snapshot",
             "ts": time.time(),
@@ -570,13 +615,18 @@ async def scanner_ingest_ws(ws: WebSocket):
                     or not isinstance(scan_status, dict)):
                 await ws.close(code=1008)
                 return
-            valid_arbs = True
+            valid_arbs = {}
+            invalid_arb_pairs = 0
             for slug, arb in arbs.items():
                 if (not isinstance(slug, str) or not slug or len(slug) > 512
                         or not isinstance(arb, dict)):
-                    valid_arbs = False
+                    valid_arbs = None
                     break
-            if not valid_arbs:
+                if not _is_valid_scanner_arb(arb):
+                    invalid_arb_pairs += 1
+                    continue
+                valid_arbs[slug] = arb
+            if valid_arbs is None:
                 await ws.close(code=1008)
                 return
             if session_id != _scanner_session_id:
@@ -586,6 +636,7 @@ async def scanner_ingest_ws(ws: WebSocket):
                 continue
             _scanner_seq = seq
             scan_status = dict(scan_status)
+            scan_status["invalid_arb_pairs_dropped"] = invalid_arb_pairs
             scan_status["scanner_to_backend_ms"] = round(
                 max(0.0, time.time() - float(sent_at)) * 1000, 1
             )
@@ -593,7 +644,7 @@ async def scanner_ingest_ws(ws: WebSocket):
                 "session_id": session_id,
                 "seq": seq,
                 "received_at": time.time(),
-                "arbs": arbs,
+                "arbs": valid_arbs,
                 "scan_status": scan_status,
             }
             if _broadcast_wakeup is not None:
@@ -711,6 +762,20 @@ async def api_trade(payload: dict):
                                         status_code=422)
                 clean_leg[key] = value
         clean_legs.append(clean_leg)
+    if not is_pm_bookmaker_pair(clean_legs, source_key="book"):
+        return JSONResponse({
+            "ok": False,
+            "err": "trade must contain one Polymarket leg and one bookmaker leg with opposite outcomes",
+        }, status_code=422)
+    pm_leg = next(leg for leg in clean_legs if leg["book"].strip().casefold() == "polymarket")
+    bookmaker_leg = next(leg for leg in clean_legs if leg is not pm_leg)
+    pm_price = _finite_number(pm_leg.get("price_usd"), 0.000001, 0.999999)
+    bookmaker_odds = _finite_number(bookmaker_leg.get("odds"), 1.000001, 1_000_000.0)
+    if pm_price is None or bookmaker_odds is None:
+        return JSONResponse({
+            "ok": False,
+            "err": "trade requires a Polymarket price and bookmaker odds",
+        }, status_code=422)
     rec = {
         "slug": slug.strip(),
         "q": payload.get("q", "") if isinstance(payload.get("q", ""), str) else "",

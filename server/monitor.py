@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import requests
+from arb_invariants import is_pm_bookmaker_pair
 
 try:
 	import websocket
@@ -408,7 +409,13 @@ class Monitor:
 			status = "WAIT"
 			roi = 0.0
 			rr = None
-			if len(bets) == len(m["o"]):
+			if (len(bets) == len(m["o"])
+					and is_pm_bookmaker_pair(
+						bets,
+						source_kind_key="sourceKind",
+						allow_unregistered_bookmaker=True,
+						require_prices=True,
+					)):
 				rr = compute(bets, self.bank)
 				if rr:
 					roi = rr["roi"]
