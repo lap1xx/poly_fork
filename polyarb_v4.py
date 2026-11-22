@@ -76,7 +76,9 @@ PINNED_SIGNAL_MIN_ROI = 0.05
 TIMEOUT = 15.0
 PM_CATALOG_TIMEOUT = (3.0, 5.0)
 PM_CATALOG_WORKERS = 7
-PM_CATALOG_PAGE_LIMIT = 500
+# Gamma currently returns at most 100 events per page and omits next_cursor
+# on terminal short pages, so use the observed page size as the safe boundary.
+PM_CATALOG_PAGE_LIMIT = 100
 PM_CATALOG_MAX_PAGES = 50
 PM_CATALOG_MAX_RETRIES = 3
 PM_CATALOG_RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
@@ -1344,15 +1346,21 @@ def _fetch_pm_catalog_query(tag, mode, page_limit=PM_CATALOG_PAGE_LIMIT):
         if not isinstance(page_events, list):
             error = "InvalidEventsShape"
             break
-        if "next_cursor" not in payload:
-            error = "MissingNextCursor"
-            break
 
         pages += 1
         raw_event_rows += len(page_events)
         valid_events = [event for event in page_events if isinstance(event, dict)]
         invalid_event_rows += len(page_events) - len(valid_events)
         events.extend(valid_events)
+
+        if "next_cursor" not in payload:
+            if len(page_events) < effective_page_limit:
+                # Gamma currently omits this field on terminal short pages.
+                cursor_exhausted = True
+            else:
+                # A full page without a cursor could be silently truncated.
+                error = "MissingNextCursor"
+            break
 
         next_cursor = payload.get("next_cursor")
         cursor_text = str(next_cursor).strip() if next_cursor is not None else ""

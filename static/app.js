@@ -641,6 +641,9 @@ function updateArbCard(card, a) {
     '<span class="bk-chip pm">Polymarket</span>';
   setCardMarkup(card, '.arb-bks', chips, '_renderedBooks');
   const stakes = Array.isArray(a.stakes) ? a.stakes : [];
+  const ageNote = (age, label) => window.PolyArbQuoteQuality
+    ? window.PolyArbQuoteQuality.formatAgeAtCalculation(age, label)
+    : `${label}: возраст неизвестен`;
   const legRows = legs.map((leg, i) => {
     if (!leg || !leg.source) return '';
     const amount = Number(stakes[i] || 0);
@@ -650,9 +653,11 @@ function updateArbCard(card, a) {
       const price = Number(leg.pm_avg_ask || leg.pm_best_ask || 0);
       const shares = price > 0 ? ` · ${(amount / price).toFixed(2)} долей` : '';
       const priceText = price > 0 ? ` @ ${(price * 100).toFixed(1)}¢` : '';
-      return `<span>${outcome} · ${amount.toFixed(2)} USDT${shares}${priceText}</span>`;
+      const bookAge = ageNote(leg.pm_book_age_sec ?? leg.pm_age, 'Стакан PM');
+      return `<span>${outcome} · ${amount.toFixed(2)} USDT${shares}${priceText} · ${escapeHtml(bookAge)}</span>`;
     }
-    return `<span>${escapeHtml(leg.source)} · ${outcome} · ${amount.toFixed(2)} USDT @ ${fmtOdds(leg.o)}×</span>`;
+    const quoteAge = ageNote(leg.odds_age_sec, 'Котировка');
+    return `<span>${escapeHtml(leg.source)} · ${outcome} · ${amount.toFixed(2)} USDT @ ${fmtOdds(leg.o)}× · ${escapeHtml(quoteAge)}</span>`;
   }).filter(Boolean).join('');
   setCardMarkup(card, '.arb-stakes', legRows, '_renderedStakes');
 }

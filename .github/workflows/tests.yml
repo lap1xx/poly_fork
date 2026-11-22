@@ -46,8 +46,14 @@ jobs:
       - name: Check dashboard source filter syntax
         run: node --check static/source_filter.js
 
+      - name: Check dashboard quote quality syntax
+        run: node --check static/quote_quality.js
+
       - name: Test bankroll planner
         run: node tests/test_bankroll_plan.cjs
 
       - name: Test bookmaker source filter
         run: node tests/test_source_filter.cjs
+
+      - name: Test quote freshness labels
+        run: node tests/test_quote_quality.cjs

@@ -114,7 +114,8 @@ class PMCatalogRefreshTests(unittest.TestCase):
             "tag": tag, "mode": mode, "pages": pages,
             "raw_event_rows": len(events or []), "invalid_event_rows": 0,
             "events": list(events or []), "cursor_exhausted": exhausted,
-            "page_cap_hit": page_cap_hit, "effective_page_limit": 500,
+            "page_cap_hit": page_cap_hit,
+            "effective_page_limit": polyarb_v4.PM_CATALOG_PAGE_LIMIT,
             "last_http_status": None, "error": error,
         }
 
@@ -243,9 +244,45 @@ class PMCatalogRefreshTests(unittest.TestCase):
         self.assertIsNone(result["error"])
         self.assertEqual(result["pages"], 2)
         self.assertEqual([event["id"] for event in result["events"]], ["e1", "e2"])
-        self.assertEqual(get.call_args_list[0].kwargs["params"]["limit"], 500)
+        self.assertEqual(
+            get.call_args_list[0].kwargs["params"]["limit"],
+            polyarb_v4.PM_CATALOG_PAGE_LIMIT,
+        )
         self.assertEqual(get.call_args_list[1].kwargs["params"]["after_cursor"], "cursor-1")
         self.assertNotIn("offset", get.call_args_list[1].kwargs["params"])
+
+    def test_short_page_without_next_cursor_is_terminal(self):
+        response = self.FakeResponse({"events": [{"id": "e1"}]})
+        with patch.object(polyarb_v4.requests, "get", return_value=response):
+            result = polyarb_v4._fetch_pm_catalog_query("cs2", "live", page_limit=100)
+        self.assertTrue(result["cursor_exhausted"])
+        self.assertIsNone(result["error"])
+        self.assertEqual(result["pages"], 1)
+        self.assertEqual(result["events"], [{"id": "e1"}])
+
+    def test_full_page_without_next_cursor_fails_closed_and_keeps_rows(self):
+        events = [{"id": "e%d" % i} for i in range(100)]
+        response = self.FakeResponse({"events": events})
+        with patch.object(polyarb_v4.requests, "get", return_value=response):
+            result = polyarb_v4._fetch_pm_catalog_query("cs2", "general", page_limit=100)
+        self.assertFalse(result["cursor_exhausted"])
+        self.assertEqual(result["error"], "MissingNextCursor")
+        self.assertEqual(result["pages"], 1)
+        self.assertEqual(result["events"], events)
+
+    def test_short_cursorless_terminal_page_after_full_page_is_counted(self):
+        first_page = self.FakeResponse({
+            "events": [{"id": "e%d" % i} for i in range(100)],
+            "next_cursor": "cursor-1",
+        })
+        last_page = self.FakeResponse({"events": [{"id": "last"}]})
+        with patch.object(polyarb_v4.requests, "get", side_effect=[first_page, last_page]):
+            result = polyarb_v4._fetch_pm_catalog_query("cs2", "general", page_limit=100)
+        self.assertTrue(result["cursor_exhausted"])
+        self.assertIsNone(result["error"])
+        self.assertEqual(result["pages"], 2)
+        self.assertEqual(result["raw_event_rows"], 101)
+        self.assertEqual(result["events"][-1], {"id": "last"})
 
     def test_repeated_cursor_fails_closed(self):
         pages = [

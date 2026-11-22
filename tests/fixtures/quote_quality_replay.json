@@ -1,0 +1,44 @@
+{
+  "fixture_kind": "captured_read_only_snapshot",
+  "source_snapshot": "poly_catalog_scan_results_20261121_1424/catalog_1win_scan.json",
+  "source_commit": "30e383c820c39e04721cdb261d4c80f9d8dcce2f",
+  "market_slug": "cs2-100t-cw-2026-11-24",
+  "question": "Counter-Strike: 100 Thieves vs Chinggis Warriors (BO1) - PGL Major Singapore Stage 1",
+  "captured_at_epoch": 1795260267.4133646,
+  "planned_stake_usdt": 40.0,
+  "onewin": {
+    "quote_ttl_seconds": 30.0,
+    "provider_timestamp": null,
+    "quotes": [
+      {
+        "outcome": "100 Thieves",
+        "odds": 1.13,
+        "local_received_at_epoch": 1795260243.4059057
+      },
+      {
+        "outcome": "Chinggis Warriors",
+        "odds": 5.13,
+        "local_received_at_epoch": 1795260243.4059057
+      }
+    ]
+  },
+  "polymarket": {
+    "book_ttl_seconds": 30.0,
+    "books": [
+      {
+        "outcome": "100 Thieves",
+        "token_id": "fixture-pm-100-thieves",
+        "local_received_at_epoch": 1795260260.2328897,
+        "source_event_timestamp_epoch": 1795260260.063,
+        "asks": [[0.83, 377.1], [0.84, 4625.0]]
+      },
+      {
+        "outcome": "Chinggis Warriors",
+        "token_id": "fixture-pm-chinggis-warriors",
+        "local_received_at_epoch": 1795260260.2328897,
+        "source_event_timestamp_epoch": 1795260260.063,
+        "asks": [[0.18, 5171.44], [0.21, 190.0]]
+      }
+    ]
+  }
+}
