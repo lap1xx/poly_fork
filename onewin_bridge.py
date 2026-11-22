@@ -1003,14 +1003,15 @@ class OneWinStream:
         if binding["swap"]:
             sides = {"home": sides["away"], "away": sides["home"]}
             ages = {"home": ages["away"], "away": ages["home"]}
+        # Preserve full precision for downstream TTL checks; round only in UI.
         return {
             binding["pm_home"]: {
                 "src": "1win", "o": sides["home"], "c": 0.0,
-                "age_sec": round(ages["home"], 1),
+                "age_sec": ages["home"],
             },
             binding["pm_away"]: {
                 "src": "1win", "o": sides["away"], "c": 0.0,
-                "age_sec": round(ages["away"], 1),
+                "age_sec": ages["away"],
             },
         }
 

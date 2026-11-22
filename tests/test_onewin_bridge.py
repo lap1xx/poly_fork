@@ -3,6 +3,9 @@ import json
 import time
 import unittest
 from urllib.parse import parse_qs, urlsplit
+from unittest.mock import patch
+
+from opportunity import normalize_scanner_snapshot
 
 
 class OneWinFeedTests(unittest.TestCase):
@@ -131,6 +134,71 @@ class OneWinFeedTests(unittest.TestCase):
         self.assertEqual(result["Team Bravo"]["o"], 2.07)
         self.assertLessEqual(result["Team Alpha"]["age_sec"], self.ow.ODDS_MAX_AGE_SECONDS)
         self.assertLessEqual(result["Team Bravo"]["age_sec"], self.ow.ODDS_MAX_AGE_SECONDS)
+
+    def test_unrounded_onewin_age_crosses_ttl_in_opportunity_replay(self):
+        self.stream.bind(self.slug, ["Team Alpha", "Team Bravo"])
+        self.stream._connected.set()
+        quote_received_at = 2_000_000_000.0
+        base = {
+            "matchId": 12345,
+            "isBaseOddsGroups": True,
+            "oddsGroups": [{
+                "id": "map3-winner", "name": "Map 3. Winner", "isBase": True,
+                "oddsList": [
+                    {"id": 11, "name": "Team Alpha", "cf": 1.91, "status": 1},
+                    {"id": 12, "name": "Team Bravo", "cf": 2.07, "status": 1},
+                ],
+            }],
+        }
+        with patch.object(self.ow.time, "time", return_value=quote_received_at):
+            self.stream._on_match_odds(base, snapshot=True)
+
+        sampled_at = quote_received_at + 29.94
+        with patch.object(self.ow.time, "time", return_value=sampled_at), \
+             patch.object(self.ow, "ODDS_MAX_AGE_SECONDS", 30.0):
+            live = self.stream.live_bc(self.slug)
+        precise_age = live["Team Bravo"]["age_sec"]
+        self.assertAlmostEqual(precise_age, 29.94, places=6)
+
+        candidate = {
+            "slug": self.slug,
+            "q": "Team Alpha vs Team Bravo",
+            "sport": "cs2",
+            "market_type": "winner",
+            "phase": "prematch",
+            "currency": "USDT",
+            "roi": 0.04,
+            "stakes": [20.0, 20.0],
+            "profit": 1.6,
+            "ts": sampled_at,
+            "bk_source": "1win",
+            "bk_odds_age_sec": precise_age,
+            "bets": [
+                {
+                    "source": "Polymarket", "outcome": "Team Alpha",
+                    "token": "pm-team-alpha", "o": 1 / (0.4 * 1.04),
+                    "pm_best_ask": 0.4, "pm_avg_ask": 0.4,
+                    "pm_book_age_sec": 1.0,
+                },
+                {
+                    "source": "1win", "outcome": "Team Bravo",
+                    "o": live["Team Bravo"]["o"],
+                    "odds_age_sec": precise_age,
+                },
+            ],
+        }
+        envelope = {
+            "type": "scanner.snapshot", "schema_version": 1,
+            "scanner_id": "polyarb_v4", "session_id": "onewin-ttl-replay",
+            "seq": 1, "sent_at": sampled_at, "arbs": {self.slug: candidate},
+        }
+        result = normalize_scanner_snapshot(
+            envelope, now_epoch=sampled_at + 0.07
+        )
+        self.assertEqual(result["rejected"], [])
+        opportunity = result["opportunities"][0]
+        self.assertEqual(opportunity["status"], "stale")
+        self.assertAlmostEqual(opportunity["legs"][1]["age_ms"], 30_010.0, places=3)
 
     def test_delta_updates_price_and_blocked_or_deleted_odds_are_not_used(self):
         self.stream.bind(self.slug, ["Team Alpha", "Team Bravo"])

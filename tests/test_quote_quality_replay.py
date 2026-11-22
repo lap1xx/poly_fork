@@ -123,7 +123,13 @@ class QuoteQualityReplayTests(unittest.TestCase):
         with patch.object(onewin_bridge.time, "time", return_value=self.capture_time):
             fresh = stream.live_bc(slug)
         self.assertEqual(set(fresh), set(self.onewin_quotes))
-        self.assertAlmostEqual(fresh["100 Thieves"]["age_sec"], 24.0)
+        expected_age = (
+            self.capture_time
+            - self.onewin_quotes["100 Thieves"]["local_received_at_epoch"]
+        )
+        self.assertAlmostEqual(
+            fresh["100 Thieves"]["age_sec"], expected_age, places=6
+        )
 
         latest_received = min(
             quote["local_received_at_epoch"]
