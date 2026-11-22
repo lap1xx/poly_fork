@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 import unittest
+from jsonschema import Draft202012Validator, FormatChecker, ValidationError
 
 from opportunity import (
     OpportunityNormalizationError,
@@ -23,6 +24,10 @@ class OpportunityContractReplayTests(unittest.TestCase):
     def setUpClass(cls):
         cls.fixture = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
         cls.schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+        Draft202012Validator.check_schema(cls.schema)
+        cls.validator = Draft202012Validator(
+            cls.schema, format_checker=FormatChecker()
+        )
 
     def make_snapshot(self, *, pm_age_delta=0.0, bookmaker_age_delta=0.0):
         fixture = self.fixture
@@ -177,6 +182,18 @@ class OpportunityContractReplayTests(unittest.TestCase):
         )
         self.assertEqual(self.schema["title"], "PolyFork Opportunity v1")
         self.assertIn("legs", self.schema["required"])
+
+    def test_normalized_replay_record_validates_against_json_schema(self):
+        result = normalize_scanner_snapshot(self.make_snapshot())
+        self.assertEqual(result["rejected"], [])
+        self.validator.validate(result["opportunities"][0])
+
+    def test_json_schema_rejects_probability_above_one(self):
+        result = normalize_scanner_snapshot(self.make_snapshot())
+        opportunity = result["opportunities"][0]
+        opportunity["legs"][0]["price"] = 1.01
+        with self.assertRaises(ValidationError):
+            self.validator.validate(opportunity)
 
 
 if __name__ == "__main__":
