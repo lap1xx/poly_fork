@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import onewin_bridge
 import polyarb_v4
+from opportunity import normalize_scanner_snapshot
 
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "quote_quality_replay.json"
@@ -142,6 +143,74 @@ class QuoteQualityReplayTests(unittest.TestCase):
         self.assertEqual(
             polyarb_v4._classify_signal_drop_reason(has_fresh_bookmaker=False),
             "no_fresh_bookmaker_pair",
+        )
+
+    def test_onewin_age_survives_scanner_candidate_and_opportunity_replay(self):
+        stream, slug, match_key = self._make_onewin_stream()
+        quote_received_at = self.capture_time - 29.94
+        for odd in stream.stakes[match_key]["winner"]["odds"].values():
+            odd["receivedAt"] = quote_received_at
+            odd["cf"] = 10.0 if odd["name"] == "Chinggis Warriors" else 2.0
+
+        market = {
+            "slug": slug,
+            "q": self.fixture["question"],
+            "o": list(self.pm_books),
+            "t": self.tokens,
+        }
+        with patch.object(onewin_bridge, "ODDS_MAX_AGE_SECONDS", 30.0), \
+             patch.object(onewin_bridge.time, "time", return_value=self.capture_time), \
+             patch.object(polyarb_v4, "_maybe_refresh_stale", return_value=False):
+            live_quotes = stream.live_bc(slug)
+            pairs = polyarb_v4.build_arb_candidates(
+                market,
+                live_quotes,
+                slip=0.0,
+                bank=self.fixture["planned_stake_usdt"],
+                bk_source="1win",
+                market_slug=slug,
+            )
+            bets = next(pair for pair in pairs if pair[0]["outcome"] == "100 Thieves")
+            calculation = polyarb_v4.compute(
+                bets, self.fixture["planned_stake_usdt"]
+            )
+            refined = polyarb_v4.refine_stakes(bets, calculation, 1.0)
+
+        bookmaker_age = next(
+            leg["odds_age_sec"] for leg in bets if leg["source"] == "1win"
+        )
+        self.assertAlmostEqual(bookmaker_age, 29.94, places=6)
+        serialized_bets = polyarb_v4._serialize_candidate_bets(bets)
+        candidate = {
+            "slug": slug,
+            "q": self.fixture["question"],
+            "sport": "cs2",
+            "market_type": "winner",
+            "phase": "prematch",
+            "currency": "USDT",
+            "roi": float(refined["roi"]),
+            "stakes": [float(value) for value in refined["stakes"]],
+            "profit": float(refined["profit"]),
+            "ts": self.capture_time,
+            "bk_source": "1win",
+            "bk_odds_age_sec": bookmaker_age,
+            "bets": serialized_bets,
+        }
+        payload = {
+            "type": "scanner.snapshot", "schema_version": 1,
+            "scanner_id": "polyarb_v4", "session_id": "1win-candidate-replay",
+            "seq": 1, "sent_at": self.capture_time,
+            "arbs": {slug: candidate},
+        }
+        normalized = normalize_scanner_snapshot(
+            payload, now_epoch=self.capture_time + 0.07
+        )
+        self.assertEqual(normalized["rejected"], [])
+        self.assertEqual(normalized["opportunities"][0]["status"], "stale")
+        self.assertAlmostEqual(
+            normalized["opportunities"][0]["legs"][1]["age_ms"],
+            30_010.0,
+            places=3,
         )
 
     def test_duplicate_1win_winner_groups_remain_fail_closed(self):

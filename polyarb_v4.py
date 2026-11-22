@@ -1979,6 +1979,28 @@ def _prune_recent_signal_drops(drops, now):
     return [row for _slug, row in ordered[:MAX_RECENT_SIGNAL_DROPS]]
 
 
+def _serialize_candidate_bets(bets):
+    return [
+        {
+            "source": bet.get("source"),
+            "outcome": bet.get("outcome"),
+            "token": bet.get("token"),
+            "o": float(bet.get("o") or 0),
+            "c": float(bet.get("c") or 0),
+            "s": float(bet.get("s") or 0),
+            "pm_age": bet.get("pm_age"),
+            "pm_best_ask": bet.get("pm_best_ask"),
+            "pm_best_bid": bet.get("pm_best_bid"),
+            "pm_avg_ask": bet.get("pm_avg_ask"),
+            "pm_book_age_sec": bet.get("pm_book_age_sec"),
+            "pm_target_usd": bet.get("pm_target_usd"),
+            "pm_target_shares": bet.get("pm_target_shares"),
+            "odds_age_sec": bet.get("odds_age_sec"),
+        }
+        for bet in bets
+    ]
+
+
 def _pinned_signal_key(snapshot):
     bets = snapshot.get("bets") or []
     pm_leg = next((leg for leg in bets if leg.get("source") == "Polymarket"), {})
@@ -2603,24 +2625,7 @@ def main():
                             "total_bank": float(bank),
                             "currency": "USDT",
                             "rate": 1.0,
-                            "bets": [
-                                {
-                                    "source": b.get("source"),
-                                    "outcome": b.get("outcome"),
-                                    "token": b.get("token"),
-                                    "o": float(b.get("o") or 0),
-                                    "c": float(b.get("c") or 0),
-                                    "s": float(b.get("s") or 0),
-                                    "pm_age": b.get("pm_age"),
-                                    "pm_best_ask": b.get("pm_best_ask"),
-                                    "pm_best_bid": b.get("pm_best_bid"),
-                                    "pm_avg_ask": b.get("pm_avg_ask"),
-                                    "pm_book_age_sec": b.get("pm_book_age_sec"),
-                                    "pm_target_usd": b.get("pm_target_usd"),
-                                    "pm_target_shares": b.get("pm_target_shares"),
-                                    "odds_age_sec": b.get("odds_age_sec"),
-                                } for b in bets
-                            ],
+                            "bets": _serialize_candidate_bets(bets),
                             "stakes": _display_stakes,
                             "payout": float(r["payout"]),
                             "profit": float(_prf),
