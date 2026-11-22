@@ -153,6 +153,7 @@ class _FakeBrowserlessWS:
         self.headers = headers or {}
         self.accepted = False
         self.closed = None
+        self.sent_text = []
 
     async def accept(self):
         self.accepted = True
@@ -164,6 +165,9 @@ class _FakeBrowserlessWS:
 
     async def close(self, code=1000):
         self.closed = code
+
+    async def send_text(self, message):
+        self.sent_text.append(message)
 
 
 class ScannerIngressTests(unittest.TestCase):
@@ -311,6 +315,108 @@ class ScannerIngressTests(unittest.TestCase):
             self.loop.run_until_complete(run_loop_once())
         self.assertEqual(client.messages[0]["arbs"][0]["slug"], "event-slug")
         self.assertEqual(client.messages[0]["scan_status"]["delivery_transport"], "scanner_ws")
+
+    def test_scanner_ingest_to_ui_snapshot_adds_opportunity_v1_and_keeps_legacy_arb(self):
+        slug = "offline-e2e-market"
+        sent_at = time.time()
+        legacy_arb = {
+            "slug": slug,
+            "q": "Team A vs Team B",
+            "sport": "cs2",
+            "market_type": "winner",
+            "phase": "prematch",
+            "currency": "USDT",
+            "roi": 0.04,
+            "stakes": [20.0, 20.0],
+            "profit": 1.6,
+            "ts": sent_at,
+            "bk_source": "1win",
+            "bk_odds_age_sec": 2.0,
+            "bets": [
+                {
+                    "source": "Polymarket", "outcome": "Team A",
+                    "token": "offline-pm-token", "o": 1 / (0.4 * 1.04),
+                    "pm_best_ask": 0.4, "pm_avg_ask": 0.4,
+                    "pm_age": 1.0, "pm_book_age_sec": 1.0,
+                },
+                {
+                    "source": "1win", "outcome": "Team B", "o": 2.7,
+                    "odds_age_sec": 2.0,
+                },
+            ],
+        }
+        payload = {
+            "type": "scanner.snapshot", "schema_version": 1,
+            "scanner_id": "polyarb_v4", "session_id": "offline-e2e",
+            "seq": 1, "sent_at": sent_at, "arbs": {slug: legacy_arb},
+            "scan_status": {"state": "running", "ts": sent_at},
+        }
+        ingress = _FakeBrowserlessWS(
+            [json.dumps(payload)], headers={"authorization": "Bearer unit-test-secret"}
+        )
+        with patch.dict(os.environ, {"POLYARB_SCANNER_WS_TOKEN": "unit-test-secret"}):
+            self.loop.run_until_complete(web_app.scanner_ingest_ws(ingress))
+        self.assertEqual(web_app._scanner_state["sent_at"], sent_at)
+
+        class Client:
+            def __init__(self):
+                self.messages = []
+                self.sent = asyncio.Event()
+
+            async def send_text(self, message):
+                self.messages.append(json.loads(message))
+                self.sent.set()
+
+        client = Client()
+        web_app._clients.clear()
+        web_app._clients.add(client)
+        web_app._broadcast_wakeup.set()
+
+        async def run_loop_once():
+            task = asyncio.create_task(web_app._broadcast_loop())
+            try:
+                await asyncio.wait_for(client.sent.wait(), timeout=0.5)
+            finally:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+        with patch.object(
+            web_app, "_build_enriched",
+            side_effect=lambda raw: {slug: {"slug": key, **arb} for key, arb in raw.items()},
+        ), patch.object(web_app, "_load_config", return_value={}):
+            self.loop.run_until_complete(run_loop_once())
+
+        snapshot = client.messages[0]
+        self.assertEqual(snapshot["type"], "snapshot")
+        self.assertEqual(snapshot["arbs"][0]["bets"], legacy_arb["bets"])
+        self.assertEqual(snapshot["arbs"][0]["roi"], 0.04)
+        contract = snapshot["opportunities_v1"]
+        self.assertEqual(contract["schema_version"], 1)
+        self.assertEqual(contract["rejected"], [])
+        self.assertEqual(len(contract["opportunities"]), 1)
+        opportunity = contract["opportunities"][0]
+        self.assertEqual(opportunity["market"]["slug"], slug)
+        self.assertEqual(opportunity["status"], "active")
+        self.assertEqual(opportunity["legs"][0]["price"], 0.4)
+        self.assertEqual(opportunity["legs"][1]["price"], 2.7)
+
+    def test_initial_ui_snapshot_contains_opportunity_v1_envelope(self):
+        ws = _FakeBrowserlessWS(
+            [], headers={"origin": "http://127.0.0.1:8080"}
+        )
+        with patch.object(web_app, "_build_enriched", return_value={}), \
+             patch.object(web_app, "_load_config", return_value={}), \
+             patch.object(web_app, "_load_json", side_effect=lambda _path, default: default):
+            self.loop.run_until_complete(web_app.ws_endpoint(ws))
+        self.assertTrue(ws.accepted)
+        snapshot = json.loads(ws.sent_text[0])
+        self.assertEqual(snapshot["type"], "snapshot")
+        self.assertEqual(snapshot["arbs"], [])
+        self.assertEqual(snapshot["opportunities_v1"]["schema_version"], 1)
+        self.assertEqual(snapshot["opportunities_v1"]["opportunities"], [])
 
     def test_stale_scanner_state_falls_back_to_latest_atomic_files(self):
         class Client:

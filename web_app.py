@@ -25,6 +25,7 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from arb_invariants import is_pm_bookmaker_pair
+from opportunity import normalize_scanner_snapshot
 
 try:
     import price_history
@@ -78,6 +79,31 @@ def _is_valid_scanner_arb(arb):
         require_pm_token=True,
         require_prices=True,
     )
+
+
+def _opportunities_v1_snapshot(raw, scanner_state=None):
+    """Build the additive Opportunity v1 view without changing legacy arbs."""
+    now = time.time()
+    state = scanner_state if isinstance(scanner_state, dict) else {}
+    sent_at = _finite_number(state.get("sent_at"), 0.0)
+    if sent_at is None:
+        sent_at = now
+    session_id = state.get("session_id")
+    if not isinstance(session_id, str) or not session_id or len(session_id) > 80:
+        session_id = "web-app-file-fallback"
+    seq = state.get("seq")
+    if isinstance(seq, bool) or not isinstance(seq, int) or seq < 1:
+        seq = 1
+    envelope = {
+        "type": "scanner.snapshot",
+        "schema_version": 1,
+        "scanner_id": "polyarb_v4",
+        "session_id": session_id,
+        "seq": seq,
+        "sent_at": sent_at,
+        "arbs": raw if isinstance(raw, dict) else {},
+    }
+    return normalize_scanner_snapshot(envelope, now_epoch=now)
 
 
 def _filter_pinned_signal_pairs(scan_status):
@@ -501,6 +527,9 @@ async def _broadcast_loop():
                     "type": "snapshot",
                     "ts": time.time(),
                     "arbs": list(enriched.values()),
+                    "opportunities_v1": _opportunities_v1_snapshot(
+                        raw or {}, scanner_state if scanner_fresh else None
+                    ),
                     "total": len(enriched),
                     "hidden_count": len(_hidden),
                     "config": _load_config(),
@@ -588,9 +617,11 @@ async def ws_endpoint(ws: WebSocket):
         if _scanner_state is not None:
             raw = _scanner_state.get("arbs", {})
             scan_status = _scanner_state.get("scan_status", {})
+            opportunity_state = _scanner_state
         else:
             raw = _load_json(LIVE_FILE, {})
             scan_status = _load_json(STATUS_FILE, {})
+            opportunity_state = None
         if not isinstance(raw, dict):
             raw = {}
         enriched = _build_enriched(raw)
@@ -605,6 +636,9 @@ async def ws_endpoint(ws: WebSocket):
             "type": "snapshot",
             "ts": time.time(),
             "arbs": list(enriched.values()),
+            "opportunities_v1": _opportunities_v1_snapshot(
+                raw, opportunity_state
+            ),
             "total": len(raw),
             "hidden_count": len(_hidden),
             "config": _load_config(),
@@ -708,6 +742,7 @@ async def scanner_ingest_ws(ws: WebSocket):
             _scanner_state = {
                 "session_id": session_id,
                 "seq": seq,
+                "sent_at": float(sent_at),
                 "received_at": time.time(),
                 "arbs": valid_arbs,
                 "scan_status": scan_status,
