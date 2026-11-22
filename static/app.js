@@ -22,19 +22,21 @@ const state = {
   suggestedCapped: false,
   audioCtx: null,
   soundEnabled: localStorage.getItem('poly_arb_sound') !== 'off',
-  bkFilter: JSON.parse(localStorage.getItem('poly_arb_bks') || 'null'),
-  config: { rate: 1, bank: 100, currency: 'USDT', pm_fee_pct: 0.04, safe_fork_threshold: 0.45 },
+  config: {
+    rate: 1, bank: 100, currency: 'USDT', pm_fee_pct: 0.04,
+    safe_fork_threshold: 0.45, min_roi_pct: 3,
+    enabled_bk_sources: ['1win'], available_bk_sources: ['1win', 'BetBoom'],
+  },
   dailyStats: null,
 };
 
 const pmBookCache = {};  // slug -> {best_ask, best_bid, ask_depth_usd}
+const quoteFlashTimers = new WeakMap();
 
 const BK_LIST = [
   { id: '1win',    name: '1win',    speed: 0, color: 'onewin' },
   { id: 'betboom', name: 'BetBoom', speed: 0, color: 'bb' },
 ];
-if (!state.bkFilter) state.bkFilter = Object.fromEntries(BK_LIST.map(b => [b.id, true]));
-
 /* ============= SOUND ============= */
 function ensureAudioCtx() {
   if (state.audioCtx) return state.audioCtx;
@@ -101,6 +103,31 @@ function fmtOdds(n) { return (Number(n) || 0).toFixed(3); }
 function fmtPct(n, sign = true) {
   const v = (Number(n) || 0) * 100;
   return (sign && v >= 0 ? '+' : '') + v.toFixed(2) + '%';
+}
+function setLiveQuoteValue(element, value, scope) {
+  if (!element) return;
+  const nextValue = String(value == null ? '—' : value);
+  const nextScope = String(scope || '');
+  const sameScope = element.dataset.quoteFlashScope === nextScope;
+  const previousValue = element.dataset.quoteFlashValue;
+  if (element.textContent !== nextValue) element.textContent = nextValue;
+
+  const previousTimer = quoteFlashTimers.get(element);
+  if (!sameScope) {
+    if (previousTimer) clearTimeout(previousTimer);
+    element.classList.remove('quote-change-flash');
+  } else if (previousValue !== undefined && previousValue !== nextValue) {
+    if (previousTimer) clearTimeout(previousTimer);
+    element.classList.remove('quote-change-flash');
+    void element.offsetWidth;
+    element.classList.add('quote-change-flash');
+    quoteFlashTimers.set(element, setTimeout(() => {
+      element.classList.remove('quote-change-flash');
+      quoteFlashTimers.delete(element);
+    }, 1200));
+  }
+  element.dataset.quoteFlashScope = nextScope;
+  element.dataset.quoteFlashValue = nextValue;
 }
 function fmtAgo(sec) {
   if (!isFinite(sec) || sec < 0) return '—';
@@ -245,6 +272,7 @@ function connectWS() {
 
     state.scanStatus = msg.scan_status || null;
     if (msg.config) state.config = { ...state.config, ...msg.config };
+    syncRuntimeControlsFromStatus(state.scanStatus);
     const reportedBank = Number(state.scanStatus?.bank_usdt || msg.config?.bank || 0);
     const bankInput = document.getElementById('risk-total-bank');
     if (reportedBank > 0 && Number.isFinite(reportedBank)) {
@@ -286,11 +314,7 @@ function checkWsFreshness() {
 }
 
 function activeBookmakerList() {
-  const enabledIds = window.PolyArbSourceFilter.activeSourceIds(
-    state.scanStatus?.enabled_bk_sources,
-    BK_LIST.map(bookmaker => bookmaker.id),
-  );
-  return BK_LIST.filter(bookmaker => enabledIds.includes(bookmaker.id));
+  return BK_LIST;
 }
 
 /* ============= FILTERS ============= */
@@ -308,7 +332,7 @@ function applyFilters() {
     if (!sports.has(a.sport)) return false;
     if ((a.roi || 0) < minRoi) return false;
     if (!window.PolyArbSourceFilter.includesSelectedProvider(
-      a, state.bkFilter, state.scanStatus?.enabled_bk_sources,
+      a, null, state.scanStatus?.enabled_bk_sources,
     )) return false;
     return true;
   });
@@ -579,9 +603,30 @@ function createArbCard() {
   const card = document.createElement('div');
   card.className = 'arb';
   card.innerHTML = '<div class="arb-head"><div class="arb-title"></div><div class="arb-roi"></div></div>' +
-    '<div class="arb-tags"></div><div class="arb-meta"><div class="arb-bks"></div><span class="arb-age"></span></div>' +
+    '<div class="arb-tags"></div><div class="arb-market"><span class="arb-market-label">РЫНОК</span><b class="arb-market-value"></b></div>' +
+    '<div class="arb-meta"><div class="arb-bks"></div><span class="arb-age"></span></div>' +
     '<div class="arb-stakes"></div>';
   return card;
+}
+
+function renderArbLegRow(leg, stake) {
+  if (!leg || !leg.source) return '';
+  const view = window.PolyArbMarketDisplay.legDisplay(leg, stake);
+  const amount = view.stake > 0 ? `${view.stake.toFixed(2)} USDT` : '—';
+  const odds = view.odds > 0 ? `${fmtOdds(view.odds)}×` : '—';
+  const oddsLabel = view.isPolymarket ? 'ЭФФ. КЭФ' : 'КЭФ';
+  const pmPrice = view.pmPriceCents == null
+    ? '' : `<small class="arb-pm-price">${view.pmPriceCents.toFixed(1)}¢ цена</small>`;
+  const ageLabel = view.isPolymarket ? 'Стакан PM' : 'Котировка';
+  const ageText = window.PolyArbQuoteQuality
+    ? window.PolyArbQuoteQuality.formatAgeAtCalculation(view.quoteAgeSec, ageLabel)
+    : `${ageLabel}: возраст неизвестен`;
+  return `<div class="arb-leg ${view.isPolymarket ? 'pm' : 'bookmaker'}">` +
+    `<div class="arb-leg-head"><span class="arb-leg-source">${escapeHtml(view.source)}</span>` +
+    `<b class="arb-leg-outcome">${escapeHtml(view.outcome)}</b></div>` +
+    `<div class="arb-leg-values"><span><small>СТАВКА</small><b>${amount}</b></span>` +
+    `<span><small>${oddsLabel}</small><b>${odds}${pmPrice}</b></span></div>` +
+    `<div class="arb-leg-age">${escapeHtml(ageText)}</div></div>`;
 }
 
 function setCardText(card, selector, value) {
@@ -621,7 +666,6 @@ function updateArbCard(card, a) {
   setCardText(card, '.arb-age', fmtAgo(a.age_sec));
 
   const tags = [`<span class="tag ${escapeHtml(sportClass(a.sport))}">${escapeHtml(a.sport || '')}</span>`];
-  if (a.market_type) tags.push(`<span class="tag mtype">${escapeHtml(a.market_type)}</span>`);
   tags.push(`<span class="tag phase-${phase}">${phaseLabels[phase]}</span>`);
   if (a.is_streamer) tags.push('<span class="tag streamer">СТРИМЕР</span>');
   const pmAge = pmLeg.pm_age || a.pm_age;
@@ -635,30 +679,14 @@ function updateArbCard(card, a) {
     tags.push('<span class="tag pm-age">СВЕЖЕСТЬ ?</span>');
   }
   setCardMarkup(card, '.arb-tags', tags.join(''), '_renderedTags');
+  setCardText(card, '.arb-market-value', window.PolyArbMarketDisplay.marketTypeLabel(a.market_type));
 
   const bkClass = bbLeg.source === '1win' ? 'onewin' : bbLeg.source === 'Polymarket' ? 'other' : 'bb';
   const chips = `<span class="bk-chip ${bkClass}">${escapeHtml(bbLeg.source || 'БК')}</span>` +
     '<span class="bk-chip pm">Polymarket</span>';
   setCardMarkup(card, '.arb-bks', chips, '_renderedBooks');
   const stakes = Array.isArray(a.stakes) ? a.stakes : [];
-  const ageNote = (age, label) => window.PolyArbQuoteQuality
-    ? window.PolyArbQuoteQuality.formatAgeAtCalculation(age, label)
-    : `${label}: возраст неизвестен`;
-  const legRows = legs.map((leg, i) => {
-    if (!leg || !leg.source) return '';
-    const amount = Number(stakes[i] || 0);
-    if (!Number.isFinite(amount) || amount <= 0) return '';
-    const outcome = escapeHtml(leg.outcome || 'исход');
-    if (leg.source === 'Polymarket') {
-      const price = Number(leg.pm_avg_ask || leg.pm_best_ask || 0);
-      const shares = price > 0 ? ` · ${(amount / price).toFixed(2)} долей` : '';
-      const priceText = price > 0 ? ` @ ${(price * 100).toFixed(1)}¢` : '';
-      const bookAge = ageNote(leg.pm_book_age_sec ?? leg.pm_age, 'Стакан PM');
-      return `<span>${outcome} · ${amount.toFixed(2)} USDT${shares}${priceText} · ${escapeHtml(bookAge)}</span>`;
-    }
-    const quoteAge = ageNote(leg.odds_age_sec, 'Котировка');
-    return `<span>${escapeHtml(leg.source)} · ${outcome} · ${amount.toFixed(2)} USDT @ ${fmtOdds(leg.o)}× · ${escapeHtml(quoteAge)}</span>`;
-  }).filter(Boolean).join('');
+  const legRows = legs.map((leg, i) => renderArbLegRow(leg, stakes[i])).filter(Boolean).join('');
   setCardMarkup(card, '.arb-stakes', legRows, '_renderedStakes');
 }
 
@@ -711,30 +739,17 @@ function updatePinnedSnapshotCard(card, row) {
   setCardText(card, '.arb-age', `СНИМОК ${lockedText} · ${Math.floor(expiresIn / 60)}:${String(expiresIn % 60).padStart(2, '0')} ДО СНЯТИЯ`);
 
   const tags = [`<span class="tag ${escapeHtml(sportClass(row.sport))}">${escapeHtml(row.sport || '')}</span>`];
-  if (row.market_type) tags.push(`<span class="tag mtype">${escapeHtml(row.market_type)}</span>`);
   tags.push(`<span class="tag phase-${phase}">${phaseLabels[phase]}</span>`);
   tags.push('<span class="tag snapshot-lock">СНИМОК · НЕАКТИВНО</span>');
   setCardMarkup(card, '.arb-tags', tags.join(''), '_renderedTags');
+  setCardText(card, '.arb-market-value', window.PolyArbMarketDisplay.marketTypeLabel(row.market_type));
 
   const bkClass = bookmakerLeg.source === '1win' ? 'onewin' : 'bb';
   const chips = `<span class="bk-chip ${bkClass}">${escapeHtml(bookmakerLeg.source || 'БК')}</span>` +
     '<span class="bk-chip pm">Polymarket</span>';
   setCardMarkup(card, '.arb-bks', chips, '_renderedBooks');
 
-  const legRows = bets.map((leg, index) => {
-    if (!leg || !leg.source) return '';
-    const amount = Number(stakes[index] || 0);
-    const outcome = escapeHtml(leg.outcome || 'исход');
-    if (leg.source === 'Polymarket') {
-      const price = Number(leg.pm_avg_ask || leg.pm_best_ask || row.pm_best_ask || 0);
-      const capturedShares = Number(leg.pm_target_shares || 0);
-      const shareCount = capturedShares > 0 ? capturedShares : (price > 0 ? amount / price : 0);
-      const shares = shareCount > 0 ? ` · ${shareCount.toFixed(2)} долей` : '';
-      const priceText = price > 0 ? ` @ ${(price * 100).toFixed(1)}¢` : '';
-      return `<span>${outcome} · ${amount.toFixed(2)} USDT${shares}${priceText}</span>`;
-    }
-    return `<span>${escapeHtml(leg.source)} · ${outcome} · ${amount.toFixed(2)} USDT @ ${fmtOdds(leg.o)}×</span>`;
-  }).filter(Boolean).join('');
+  const legRows = bets.map((leg, index) => renderArbLegRow(leg, stakes[index])).filter(Boolean).join('');
   setCardMarkup(card, '.arb-stakes', legRows, '_renderedStakes');
 }
 
@@ -882,7 +897,7 @@ function refreshDetail() {
   const eventTitle = a.title && a.q && a.title !== a.q
     ? `${a.title} · ${a.q}` : (a.title || a.q || a.slug);
   document.getElementById('det-title').textContent = eventTitle + (frozen ? ' · ЗАКРЕПЛЁННЫЙ СНИМОК' : '');
-  const tags = [`<span class="tag mtype">${escapeHtml(a.market_type || 'МАТЧ')}</span>`,
+  const tags = [`<span class="tag mtype">${escapeHtml(window.PolyArbMarketDisplay.marketTypeLabel(a.market_type))}</span>`,
                 `<span class="tag ${escapeHtml(sportClass(a.sport))}">${escapeHtml(a.sport || '')}</span>`];
   const detailPhase = ['live','prematch','unknown'].includes(a.phase) ? a.phase : 'unknown';
   const detailPhaseLabel = { live: 'LIVE', prematch: 'ПРЕМАТЧ', unknown: 'СТАТУС НЕ ПОДТВЕРЖДЁН' }[detailPhase];
@@ -916,12 +931,7 @@ function refreshDetail() {
 
   const pmAsk = Number(pmLeg.pm_best_ask || a.pm_best_ask || 0);
   document.getElementById('kpi-depth-label').textContent = frozen ? 'ASK В СНИМКЕ' : 'ЛУЧШИЙ ASK';
-  document.getElementById('kpi-odds-label').textContent = frozen ? 'КОЭФ. В СНИМКЕ' : 'КЭФ СЕЙЧАС';
   document.getElementById('kpi-depth').textContent = pmAsk ? (pmAsk * 100).toFixed(1) + '¢' : '—';
-
-  const bbO = bbLeg.o || 0;
-  const pmO = pmLeg.o || 0;
-  document.getElementById('kpi-odds').innerHTML = `${fmtOdds(bbO)}<br><span style="color:var(--txt2);font-size:14px">${fmtOdds(pmO)}</span>`;
 
   const safeEl = document.getElementById('safe-banner');
   if (a.pm_low_price_flag) {
@@ -993,6 +1003,7 @@ async function loadPmBook(slug) {
       avg_for_size: book.avg_for_size,
       requested_usd: requestedUsd,
     };
+    renderHowMuch(a);
 
     const pmUsd = parseFloat(document.getElementById('hm-pm-stake')?.value || '0');
 
@@ -1115,8 +1126,21 @@ function renderHowMuch(a) {
   const bbLeg = (a.bets || []).find(l => l.source && l.source !== 'Polymarket') || {};
   const frozen = Boolean(a.inactive_snapshot);
   document.getElementById('hm-bb-name').textContent = bbLeg.source || 'Букмекер';
-  document.getElementById('hm-bb-outcome').textContent = `${bbLeg.outcome || '—'} · кэф ${fmtOdds(bbLeg.o)}×`;
-  document.getElementById('hm-pm-outcome').textContent = `${pmLeg.outcome || '—'} · кэф ${fmtOdds(pmLeg.o)}×`;
+  document.getElementById('hm-bb-outcome').textContent = bbLeg.outcome || '—';
+  document.getElementById('hm-pm-outcome').textContent = pmLeg.outcome || '—';
+  const quoteScope = frozen
+    ? `snapshot:${state.activeSnapshotId || a.slug}` : `active:${a.slug}`;
+  const bookmakerOdds = bbLeg.o ? `${fmtOdds(bbLeg.o)}×` : '—';
+  const polymarketOdds = pmLeg.o ? `${fmtOdds(pmLeg.o)}×` : '—';
+  setLiveQuoteValue(document.getElementById('hm-bb-odds'), bookmakerOdds, quoteScope);
+  document.getElementById('kpi-bookmaker-label').textContent = bbLeg.source || 'БК';
+  setLiveQuoteValue(document.getElementById('kpi-bookmaker-odds'), bookmakerOdds, quoteScope);
+  setLiveQuoteValue(document.getElementById('kpi-polymarket-odds'), polymarketOdds, quoteScope);
+  document.getElementById('market-label').textContent = window.PolyArbMarketDisplay.marketTypeLabel(a.market_type);
+  document.getElementById('market-bk-name').textContent = bbLeg.source || 'Букмекер';
+  document.getElementById('market-bk-outcome').textContent = bbLeg.outcome || '—';
+  document.getElementById('market-pm-outcome').textContent = pmLeg.outcome || '—';
+  document.getElementById('kpi-odds-label').textContent = frozen ? 'КЭФЫ В СНИМКЕ' : 'КЭФЫ В РАСЧЁТЕ';
   document.getElementById('hm-title').textContent = frozen ? 'СОХРАНЁННЫЕ СТАВКИ' : 'СКОЛЬКО СТАВИТЬ';
   document.getElementById('hm-rate').textContent = frozen ? 'СУММЫ ЗАМОРОЖЕНЫ · USDT' : 'суммы в USDT';
 
@@ -1146,24 +1170,19 @@ function renderHowMuch(a) {
   // лучшее ask из стакана, а не среднее по $50
   const cachedBook = !frozen && pmBookCache[state.activeSlug]?.outcome === pmLeg.outcome
     ? pmBookCache[state.activeSlug] : null;
-  const pmBestAsk = cachedBook?.best_ask;
-  if (pmBestAsk) {
-    document.getElementById('hm-price').textContent = (pmBestAsk * 100).toFixed(1) + '¢';
-  } else {
-    const snapshotAsk = Number(pmLeg.pm_best_ask || a.pm_best_ask);
-    document.getElementById('hm-price').textContent = snapshotAsk > 0 && snapshotAsk < 1
-      ? (snapshotAsk * 100).toFixed(1) + '¢' : '—';
-  }
+  const pmBestAsk = Number(cachedBook?.best_ask || pmLeg.pm_best_ask || a.pm_best_ask || 0);
+  const pmPriceLabel = document.getElementById('hm-pm-price-label');
+  if (pmPriceLabel) pmPriceLabel.textContent = frozen ? 'ASK В СНИМКЕ' : 'ЦЕНА ДОЛИ · ASK';
+  const pmPriceText = pmBestAsk > 0 && pmBestAsk < 1 ? (pmBestAsk * 100).toFixed(1) + '¢' : '—';
+  setLiveQuoteValue(document.getElementById('hm-pm-price'), pmPriceText, quoteScope);
   const avg = cachedBook?.avg_for_size;
   const enteredUsd = Number(document.getElementById('hm-pm-stake').value);
   if (frozen) {
     const capturedAvg = Number(pmLeg.pm_avg_ask || 0);
-    document.getElementById('hm-price-label').textContent = 'Ask при фиксации';
     document.getElementById('hm-avg-label').textContent = 'Средняя при фиксации';
     document.getElementById('hm-avg').textContent = capturedAvg > 0
       ? (capturedAvg * 100).toFixed(1) + '¢ · сохранённое значение' : '—';
   } else {
-    document.getElementById('hm-price-label').textContent = 'Цена доли в стакане';
     document.getElementById('hm-avg-label').textContent = 'Средняя по стакану';
     document.getElementById('hm-avg').textContent = avg && avg.avg_price && Math.abs(cachedBook.requested_usd - enteredUsd) < 0.005
       ? (avg.avg_price * 100).toFixed(1) + '¢ · ' + cachedBook.requested_usd.toFixed(2) + ' USDT' + (avg.full ? '' : ' · неполный объём') : '—';
@@ -1175,7 +1194,7 @@ function renderHowMuch(a) {
   document.getElementById('hm-shares-label').textContent = frozen ? 'Доли в снимке' : 'Оценка долей PM';
   document.getElementById('hm-shares').textContent = shares > 0
     ? `${shares.toLocaleString('ru-RU', { maximumFractionDigits: 4 })} долей` : '—';
-  document.getElementById('hm-eff').textContent = pmLeg.o ? fmtOdds(pmLeg.o) : '—';
+  setLiveQuoteValue(document.getElementById('hm-eff'), pmLeg.o ? fmtOdds(pmLeg.o) : '—', quoteScope);
 
   recalcHowMuch();
 
@@ -1278,28 +1297,151 @@ function updateCalcHint() {
   hint.style.color = 'var(--txt)';
 }
 
-/* ============= BK FILTER MODAL ============= */
+/* ============= LIVE SCANNER CONTROLS ============= */
+function canonicalSources(sources) {
+  const known = new Set(BK_LIST.map(bookmaker => bookmaker.id));
+  return [...new Set((Array.isArray(sources) ? sources : [])
+    .map(source => window.PolyArbSourceFilter.sourceId(source))
+    .filter(id => id && known.has(id)))];
+}
+function configuredBookmakerIds() {
+  return canonicalSources(state.config.enabled_bk_sources || ['1win']);
+}
+function availableBookmakerIds() {
+  const sources = Array.isArray(state.scanStatus?.available_bk_sources)
+    ? state.scanStatus.available_bk_sources : state.config.available_bk_sources;
+  return canonicalSources(sources || ['1win']);
+}
+function activeBookmakerIds() {
+  const sources = Array.isArray(state.scanStatus?.enabled_bk_sources)
+    ? state.scanStatus.enabled_bk_sources : state.config.active_bk_sources;
+  return canonicalSources(sources || configuredBookmakerIds());
+}
+function sourceNames(ids) {
+  return BK_LIST.filter(bookmaker => ids.includes(bookmaker.id))
+    .map(bookmaker => bookmaker.name);
+}
+function updateSourceStatus() {
+  const el = document.getElementById('source-status');
+  if (!el) return;
+  const requested = configuredBookmakerIds();
+  const available = availableBookmakerIds();
+  const active = activeBookmakerIds();
+  const running = Boolean(state.scanStatus?.state === 'running' || state.config.scanner_running);
+  if (!running) {
+    el.textContent = `Сохранено: ${sourceNames(requested).join(' + ') || 'не выбрано'}`;
+    return;
+  }
+  const waiting = requested.some(id => !active.includes(id)) || active.some(id => !requested.includes(id));
+  el.textContent = waiting
+    ? `Применяется: ${sourceNames(requested).join(' + ') || 'не выбрано'}`
+    : `Активно: ${sourceNames(active).join(' + ') || 'ожидание feed'}`;
+  el.title = available.length
+    ? `Доступно в этом запуске: ${sourceNames(available).join(' + ')}`
+    : 'В текущем запуске нет доступных bookmaker feeds';
+}
+function syncRuntimeControlsFromStatus(scanStatus) {
+  if (scanStatus && Array.isArray(scanStatus.enabled_bk_sources)) {
+    state.config.active_bk_sources = scanStatus.enabled_bk_sources;
+  }
+  const statusRoi = Number(scanStatus?.min_roi_pct);
+  if (Number.isFinite(statusRoi) && statusRoi >= 0 && statusRoi <= 100) {
+    state.config.active_min_roi_pct = statusRoi;
+  }
+  const roiInput = document.getElementById('f-minroi');
+  const currentRoi = Number(state.config.active_min_roi_pct ?? state.config.min_roi_pct ?? 3);
+  if (roiInput && Number.isFinite(currentRoi) && document.activeElement !== roiInput) {
+    roiInput.value = String(currentRoi);
+  }
+  updateSourceStatus();
+}
+async function loadRuntimeConfig() {
+  try {
+    const r = await fetch('/api/config');
+    if (!r.ok) return;
+    const config = await r.json();
+    state.config = { ...state.config, ...config };
+    const roiInput = document.getElementById('f-minroi');
+    if (roiInput && document.activeElement !== roiInput) {
+      roiInput.value = String(Number(config.active_min_roi_pct ?? config.min_roi_pct ?? 3));
+    }
+    const bankInput = document.getElementById('risk-total-bank');
+    if (bankInput && Number(config.bank) > 0) bankInput.value = Number(config.bank).toFixed(2);
+    updateBankLimit();
+    updateSourceStatus();
+    applyFilters();
+  } catch (e) {
+    updateSourceStatus();
+  }
+}
+async function postRuntimeConfig(payload, successMessage) {
+  try {
+    const r = await fetch('/api/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const j = await r.json();
+    if (!r.ok || !j.ok) {
+      toast('Ошибка: ' + (j.err || `HTTP ${r.status}`), true);
+      return false;
+    }
+    state.config = { ...state.config, ...(j.config || {}) };
+    if (Object.prototype.hasOwnProperty.call(payload, 'min_roi_pct')) {
+      state.config.active_min_roi_pct = Number(payload.min_roi_pct);
+    }
+    if (Array.isArray(payload.enabled_bk_sources)) {
+      state.config.enabled_bk_sources = payload.enabled_bk_sources;
+    }
+    if (successMessage) toast(successMessage);
+    syncRuntimeControlsFromStatus(state.scanStatus);
+    applyFilters();
+    return true;
+  } catch (e) {
+    toast('Сеть: ' + e.message, true);
+    return false;
+  }
+}
 function openBkModal() {
-  const activeBookmakers = activeBookmakerList();
+  const selected = new Set(configuredBookmakerIds());
+  const available = new Set(availableBookmakerIds());
   const grid = document.getElementById('bk-grid');
-  grid.innerHTML = activeBookmakers.map(b => {
-    const on = state.bkFilter[b.id] !== false;
-    return `<div class="bk-item ${on ? 'on' : ''}" onclick="toggleBk('${b.id}')">
-      <div class="mark">✓</div>
-      <div class="name">${escapeHtml(b.name)}</div>
-      <div class="speed">${b.speed}с</div>
-    </div>`;
-  }).join('') || '<div class="bk-empty">Нет включённых поддерживаемых источников</div>';
-  const cnt = activeBookmakers.filter(b => state.bkFilter[b.id] !== false).length;
-  document.getElementById('bk-sub').textContent = `Отмечено ${cnt} из ${activeBookmakers.length}`;
+  grid.innerHTML = activeBookmakerList().map(bookmaker => {
+    const on = selected.has(bookmaker.id) && available.has(bookmaker.id);
+    const disabled = !available.has(bookmaker.id);
+    const source = bookmaker.id === 'betboom' ? 'BetBoom' : '1win';
+    return `<button class="bk-item ${on ? 'on' : ''} ${disabled ? 'disabled' : ''}"
+      type="button" aria-pressed="${on}" ${disabled ? 'disabled' : ''}
+      onclick="toggleBk('${bookmaker.id}')">
+      <span class="mark">✓</span>
+      <span class="name">${escapeHtml(bookmaker.name)}</span>
+      <span class="speed">${disabled ? 'недоступен' : on ? 'включён' : 'выключен'}</span>
+    </button>`;
+  }).join('') || '<div class="bk-empty">В текущем запуске нет доступных feeds.</div>';
+  const active = activeBookmakerIds();
+  const running = Boolean(state.scanStatus?.state === 'running' || state.config.scanner_running);
+  const pending = running && (
+    [...selected].some(id => !active.includes(id)) || active.some(id => !selected.has(id))
+  );
+  document.getElementById('bk-sub').textContent = !running
+    ? `Сохранено: ${sourceNames([...selected]).join(' + ') || '—'} · применится при запуске сканера`
+    : pending
+      ? `Запрошено: ${sourceNames([...selected]).join(' + ') || '—'} · сканер применяет изменение`
+      : `Активно: ${sourceNames(active).join(' + ') || 'ожидание feed'} · изменения применяются без перезапуска`;
   document.getElementById('modal-bk').classList.remove('hidden');
 }
-function toggleBk(id) {
-  if (!activeBookmakerList().some(bookmaker => bookmaker.id === id)) return;
-  state.bkFilter[id] = state.bkFilter[id] === false;
-  localStorage.setItem('poly_arb_bks', JSON.stringify(state.bkFilter));
-  applyFilters();
-  openBkModal();
+async function toggleBk(id) {
+  if (!availableBookmakerIds().includes(id)) return;
+  const next = new Set(configuredBookmakerIds().filter(source => availableBookmakerIds().includes(source)));
+  if (next.has(id)) next.delete(id); else next.add(id);
+  if (!next.size) {
+    toast('Оставьте включённым хотя бы один источник котировок', true);
+    return;
+  }
+  const payload = [...next].map(source => source === 'betboom' ? 'BetBoom' : '1win');
+  if (await postRuntimeConfig({ enabled_bk_sources: payload }, 'Источники переданы сканеру')) {
+    openBkModal();
+  }
 }
 function closeBkModal() { document.getElementById('modal-bk').classList.add('hidden'); }
 
@@ -1314,6 +1456,7 @@ async function openConfig() {
     document.getElementById('cfg-bank').value = j.bank || 100;
     document.getElementById('cfg-fee').value = ((j.pm_fee_pct ?? 0.04) * 100).toFixed(1);
     document.getElementById('cfg-safe').value = (j.safe_fork_threshold || 0.45);
+    syncRuntimeControlsFromStatus(state.scanStatus);
   } catch (e) {}
   document.getElementById('modal-config').classList.remove('hidden');
 }
@@ -1325,24 +1468,24 @@ async function saveConfig() {
     pm_fee_pct: parseFloat(document.getElementById('cfg-fee').value || '4') / 100,
     safe_fork_threshold: parseFloat(document.getElementById('cfg-safe').value || '0.45'),
   };
-  try {
-    const r = await fetch('/api/config', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
-    const j = await r.json();
-    if (j.ok) {
-      state.config = { ...state.config, ...(j.config || payload) };
-      const bankInput = document.getElementById('risk-total-bank');
-      if (bankInput) bankInput.value = Number(state.config.bank || 100).toFixed(2);
-      updateBankLimit();
-      toast('Настройки сохранены');
-      closeConfig();
-    } else {
-      toast('Ошибка: ' + (j.err || 'unknown'), true);
-    }
-  } catch (e) { toast('Сеть: ' + e.message, true); }
+  if (await postRuntimeConfig(payload, 'Настройки сохранены')) {
+    const bankInput = document.getElementById('risk-total-bank');
+    if (bankInput) bankInput.value = Number(state.config.bank || 100).toFixed(2);
+    updateBankLimit();
+    closeConfig();
+  }
+}
+async function saveMinRoi() {
+  const input = document.getElementById('f-minroi');
+  const value = Number(input?.value);
+  if (!Number.isFinite(value) || value < 0 || value > 100) {
+    toast('Минимальный ROI должен быть от 0 до 100%', true);
+    syncRuntimeControlsFromStatus(state.scanStatus);
+    return;
+  }
+  if (!await postRuntimeConfig(
+    { min_roi_pct: value }, `Порог ROI ${value}% передан сканеру`,
+  )) syncRuntimeControlsFromStatus(state.scanStatus);
 }
 
 /* ============= EDIT MODAL ============= */
@@ -1695,7 +1838,12 @@ function init() {
     if (el) el.addEventListener('change', applyFilters);
   });
   const minRoiEl = document.getElementById('f-minroi');
-  if (minRoiEl) minRoiEl.addEventListener('input', applyFilters);
+  if (minRoiEl) {
+    minRoiEl.addEventListener('input', applyFilters);
+    minRoiEl.addEventListener('change', saveMinRoi);
+  }
+  const bkSettingsBtn = document.getElementById('btn-bk-settings');
+  if (bkSettingsBtn) bkSettingsBtn.addEventListener('click', openBkModal);
 
   const soundBtn = document.getElementById('st-sound');
   if (soundBtn) soundBtn.addEventListener('click', toggleSound);
@@ -1772,6 +1920,7 @@ function init() {
   }, 1000);
 
   loadDaily();
+  loadRuntimeConfig();
   connectWS();
 }
 

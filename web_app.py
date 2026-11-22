@@ -140,6 +140,57 @@ def _finite_number(value, minimum=None, maximum=None):
         return None
     return number
 
+
+def _normalize_enabled_bk_sources(value, default=("1win",)):
+    if not isinstance(value, (list, tuple, set)):
+        value = default
+    normalized = set()
+    for source in value:
+        key = str(source or "").strip().lower().replace(" ", "")
+        if key in ("1win", "onewin"):
+            normalized.add("1win")
+        elif key in ("betboom", "bb"):
+            normalized.add("BetBoom")
+    return [source for source in ("1win", "BetBoom") if source in normalized]
+
+
+def _current_scanner_status():
+    if isinstance(_scanner_state, dict):
+        status = _scanner_state.get("scan_status")
+        received = _scanner_state.get("received_at", 0)
+        try:
+            if isinstance(status, dict) and time.time() - float(received or 0) <= 5.0:
+                return dict(status)
+        except (TypeError, ValueError, OverflowError):
+            pass
+    status = _load_json(STATUS_FILE, {})
+    return status if isinstance(status, dict) else {}
+
+
+def _runtime_config_payload():
+    cfg = _load_config()
+    status = _current_scanner_status()
+    running = (
+        status.get("state") == "running"
+        and _finite_number(status.get("ts"), 0.0, None) is not None
+        and time.time() - float(status.get("ts", 0)) <= 5.0
+    )
+    caps = status.get("available_bk_sources")
+    cfg["available_bk_sources"] = (
+        _normalize_enabled_bk_sources(caps, default=())
+        if isinstance(caps, list) else ["1win", "BetBoom"]
+    )
+    cfg["scanner_running"] = bool(running)
+    cfg["active_bk_sources"] = (
+        _normalize_enabled_bk_sources(status.get("enabled_bk_sources"), default=())
+        if running else []
+    )
+    active_roi = _finite_number(status.get("min_roi_pct"), 0.0, 100.0) if running else None
+    cfg["active_min_roi_pct"] = (
+        active_roi if active_roi is not None else cfg["min_roi_pct"]
+    )
+    return cfg
+
 def _csv_safe(value):
     if isinstance(value, str) and value.lstrip().startswith(("=", "+", "-", "@", "\t", "\r")):
         return "'" + value
@@ -200,6 +251,17 @@ def _load_config():
     if safe_threshold is None:
         safe_threshold = SAFE_FORK_THRESHOLD
 
+    min_roi_pct = _finite_number(cfg.get("min_roi_pct", 3.0), 0.0, 100.0)
+    if min_roi_pct is None:
+        min_roi_pct = 3.0
+    enabled_bk_sources = _normalize_enabled_bk_sources(
+        cfg.get("enabled_bk_sources", ["1win"])
+    ) or ["1win"]
+    try:
+        roi_revision = max(0, int(cfg.get("roi_revision", 0)))
+    except (TypeError, ValueError):
+        roi_revision = 0
+
     return {
         "rate": rate,
         "bank": bank,
@@ -207,6 +269,9 @@ def _load_config():
         "poll": poll,
         "pm_fee_pct": pm_fee_pct,
         "safe_fork_threshold": safe_threshold,
+        "min_roi_pct": min_roi_pct,
+        "roi_revision": roi_revision,
+        "enabled_bk_sources": enabled_bk_sources,
         "secondary_bk": sec,
     }
 
@@ -656,7 +721,7 @@ async def scanner_ingest_ws(ws: WebSocket):
 
 @app.get("/api/config")
 async def api_config():
-    cfg = _load_config()
+    cfg = _runtime_config_payload()
     sec_enabled = bk_adapter.is_secondary_enabled() if bk_adapter else False
     cfg["secondary_bk"]["enabled"] = sec_enabled
     return cfg
@@ -673,6 +738,7 @@ async def api_config_save(payload: dict):
             "bank": (1.0, 1_000_000_000.0),
             "pm_fee_pct": (0.0, 1.0),
             "safe_fork_threshold": (0.01, 0.99),
+            "min_roi_pct": (0.0, 100.0),
         }
         for k, (minimum, maximum) in limits.items():
             if k in payload:
@@ -681,10 +747,43 @@ async def api_config_save(payload: dict):
                     return JSONResponse({"ok": False, "err": "invalid " + k},
                                         status_code=422)
                 cfg[k] = value
+        if "enabled_bk_sources" in payload:
+            raw_sources = payload["enabled_bk_sources"]
+            if (not isinstance(raw_sources, list) or len(raw_sources) > 2
+                    or any(not isinstance(source, str) for source in raw_sources)):
+                return JSONResponse({"ok": False, "err": "enabled_bk_sources must be a list"},
+                                    status_code=422)
+            enabled_sources = _normalize_enabled_bk_sources(raw_sources, default=())
+            if (not enabled_sources or any(
+                    not _normalize_enabled_bk_sources([source], default=())
+                    for source in raw_sources)):
+                return JSONResponse({"ok": False, "err": "select at least one supported bookmaker"},
+                                    status_code=422)
+            status = _current_scanner_status()
+            running = status.get("state") == "running" and (
+                _finite_number(status.get("ts"), 0.0, None) is not None
+                and time.time() - float(status.get("ts", 0)) <= 5.0
+            )
+            available = status.get("available_bk_sources")
+            if running and isinstance(available, list):
+                available_sources = set(
+                    _normalize_enabled_bk_sources(available, default=())
+                )
+                if not set(enabled_sources).issubset(available_sources):
+                    return JSONResponse({
+                        "ok": False,
+                        "err": "Один из источников недоступен в текущем запуске сканера",
+                    }, status_code=409)
+            cfg["enabled_bk_sources"] = enabled_sources
+        if "min_roi_pct" in payload:
+            try:
+                cfg["roi_revision"] = max(0, int(cfg.get("roi_revision", 0))) + 1
+            except (TypeError, ValueError):
+                cfg["roi_revision"] = 1
         cfg["currency"] = "USDT"
         cfg["rate"] = 1.0
         _save_json(CONFIG_FILE, cfg)
-        return {"ok": True, "config": _load_config()}
+        return {"ok": True, "config": _runtime_config_payload()}
     except Exception as e:
         return JSONResponse({"ok": False, "err": str(e)}, status_code=500)
 

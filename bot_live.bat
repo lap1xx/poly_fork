@@ -6,7 +6,7 @@ if not exist ".venv\Scripts\python.exe" (
     pause
     exit /b 1
 )
-".venv\Scripts\python.exe" -B bot_live.py --no-bb --min-roi 3.0 %*
+".venv\Scripts\python.exe" -B bot_live.py --open-browser %*
 set "EXIT_CODE=%ERRORLEVEL%"
 pause
 exit /b %EXIT_CODE%

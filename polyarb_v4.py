@@ -46,11 +46,22 @@ BB_ENABLED = False
 _BB_ERR = None
 
 try:
-    from bk_router import get_router, is_prematch_slug
+    from bk_router import get_router, is_prematch_slug, normalize_enabled_sources
     ROUTER_ENABLED = True
     BB_ENABLED = True  # косвенно, чтобы старая логика тоже работала
 except Exception as _router_err:
     _BB_ERR = _router_err
+    def normalize_enabled_sources(sources, default=("1win",)):
+        if not isinstance(sources, (list, tuple, set)):
+            sources = default
+        selected = set()
+        for source in sources:
+            key = str(source or "").strip().lower().replace(" ", "")
+            if key in ("1win", "onewin"):
+                selected.add("1win")
+            elif key in ("betboom", "bb"):
+                selected.add("BetBoom")
+        return [name for name in ("1win", "BetBoom") if name in selected]
     try:
         from bb_bridge import get_global_stream, bind_slug, get_live_bc, wait_ready
         BB_ENABLED = True
@@ -210,6 +221,9 @@ DEFAULT_CFG = {
     "poll": 1.0,
     "slip": 0.0,
     "live_min_roi_show": -3.0,
+    "min_roi_pct": 3.0,
+    "roi_revision": 0,
+    "enabled_bk_sources": ["1win"],
 }
 DEFAULT_BK = {
     "BetBoom": {"comm": 0.0, "min_bet": 50, "update_seconds": 1},
@@ -245,6 +259,20 @@ def load_cfg():
             c = json.load(f)
         o = dict(DEFAULT_CFG)
         o.update(c)
+        try:
+            roi_pct = float(o.get("min_roi_pct", 3.0))
+            if not math.isfinite(roi_pct) or not 0.0 <= roi_pct <= 100.0:
+                raise ValueError("invalid min_roi_pct")
+            o["min_roi_pct"] = roi_pct
+        except (TypeError, ValueError):
+            o["min_roi_pct"] = 3.0
+        try:
+            o["roi_revision"] = max(0, int(o.get("roi_revision", 0)))
+        except (TypeError, ValueError):
+            o["roi_revision"] = 0
+        o["enabled_bk_sources"] = normalize_enabled_sources(
+            o.get("enabled_bk_sources", ["1win"])
+        ) or ["1win"]
         if str(c.get("currency", "")).upper() != "USDT":
             legacy_bank = c.get("bank")
             legacy_rate = c.get("rate")
@@ -264,6 +292,19 @@ def load_cfg():
         return o
     except Exception:
         return dict(DEFAULT_CFG)
+
+
+def select_runtime_sources(configured, available, *, no_bb=False):
+    """Select only available feeds while preserving the launcher's hard --no-bb deny."""
+    wanted = normalize_enabled_sources(configured)
+    available_set = set(normalize_enabled_sources(available, default=()))
+    if no_bb:
+        wanted = [source for source in wanted if source != "BetBoom"]
+    selected = [source for source in wanted if source in available_set]
+    if not selected:
+        selected = [source for source in ("1win", "BetBoom")
+                    if source in available_set and (source != "BetBoom" or not no_bb)][:1]
+    return selected
 
 
 def load_bk():
@@ -2002,8 +2043,8 @@ def main():
                     help="deprecated legacy flag; Gamma metadata determines event phase")
     ap.add_argument("--poll", type=float, default=0.3, help="seconds between checks")
     ap.add_argument("--bank", type=float, default=0.0, help="override total bank size (USDT)")
-    ap.add_argument("--min-roi", type=float, default=3.0,
-                    help="show arbs with roi >= this %% (default 3.0)")
+    ap.add_argument("--min-roi", type=float, default=None,
+                    help="initial ROI threshold in %% (dashboard changes apply live)")
     ap.add_argument("--no-bb", action="store_true", help="disable BetBoom fallback; keep 1win")
     ap.add_argument("--watch", action="store_true", help="auto-refresh PM live markets")
     ap.add_argument("--watch-sec", type=int, default=60, help="watch refresh interval")
@@ -2020,7 +2061,12 @@ def main():
     bank    = args.bank if args.bank > 0 else float(cfg.get("bank", 100))
     slip    = float(cfg.get("slip", 0.0))
     poll    = args.poll if args.poll > 0 else float(cfg.get("poll", 1.0))
-    min_roi = args.min_roi / 100.0
+    min_roi = float(args.min_roi if args.min_roi is not None
+                    else cfg.get("min_roi_pct", 3.0)) / 100.0
+    try:
+        roi_revision = int(cfg.get("roi_revision", 0))
+    except (TypeError, ValueError):
+        roi_revision = 0
 
     slugs = [x.strip() for x in args.slugs.split(",") if x.strip()]
     if not slugs and not args.watch:
@@ -2079,6 +2125,12 @@ def main():
               % ("disabled" if args.no_bb else "enabled"))
         try:
             router = get_router(use_bb=not args.no_bb, use_onewin=True)
+            selected_sources = select_runtime_sources(
+                cfg.get("enabled_bk_sources", ["1win"]),
+                router.available_sources(),
+                no_bb=args.no_bb,
+            )
+            router.configure_sources(selected_sources)
             router.set_odds_update_callback(update_queue.put_onewin_match)
             router.start()
             ok_ow = router.wait_onewin(timeout=60, min_matches=1)
@@ -2087,8 +2139,12 @@ def main():
                 ok_bb = router.wait_bb(timeout=60)
             print("[*] 1win feed ready: %s | BetBoom fallback ready: %s" % (ok_ow, ok_bb))
             if not ok_ow and not ok_bb:
-                print("[!] neither 1win nor the enabled BetBoom fallback is ready — exiting")
-                return 1
+                if args.watch:
+                    print("[!] no selected bookmaker feed is ready yet; watch mode stays up "
+                          "so feeds can be changed from the dashboard")
+                else:
+                    print("[!] neither selected bookmaker feed is ready — exiting")
+                    return 1
             st = router.stats()
             print("[*] BK stats: %s" % st)
         except Exception as e:
@@ -2241,7 +2297,7 @@ def main():
     last_publish = 0.0
     last_phase_refresh = 0.0
     last_router_health_refresh = 0.0
-    last_bank_config_check = 0.0
+    last_runtime_config_check = 0.0
     router_stats_cache = {}
     router_feed_health_cache = {}
     phase_counts_cache = {"live": 0, "prematch": 0, "unknown": 0}
@@ -2250,15 +2306,51 @@ def main():
     try:
         while not STOP.is_set():
             now = time.time()
-            if args.bank <= 0 and now - last_bank_config_check >= 1.0:
-                last_bank_config_check = now
+            runtime_sources_changed = False
+            if now - last_runtime_config_check >= 1.0:
+                last_runtime_config_check = now
                 try:
-                    configured_bank = float(load_cfg().get("bank", bank))
-                    if math.isfinite(configured_bank) and configured_bank > 0 \
-                            and abs(configured_bank - bank) >= 0.005:
-                        bank = configured_bank
-                        initial_dirty.update(market_map)
-                        print("[*] bankroll updated from dashboard config: %.2f USDT" % bank)
+                    runtime_cfg = load_cfg()
+                    if args.bank <= 0:
+                        configured_bank = float(runtime_cfg.get("bank", bank))
+                        if math.isfinite(configured_bank) and configured_bank > 0 \
+                                and abs(configured_bank - bank) >= 0.005:
+                            bank = configured_bank
+                            initial_dirty.update(market_map)
+                            print("[*] bankroll updated from dashboard config: %.2f USDT" % bank)
+                    try:
+                        current_roi_revision = int(runtime_cfg.get("roi_revision", 0))
+                    except (TypeError, ValueError):
+                        current_roi_revision = roi_revision
+                    if current_roi_revision != roi_revision:
+                        configured_roi = runtime_cfg.get("min_roi_pct", 3.0)
+                        try:
+                            configured_roi = float(configured_roi)
+                        except (TypeError, ValueError):
+                            configured_roi = None
+                        if configured_roi is not None and math.isfinite(configured_roi) \
+                                and 0.0 <= configured_roi <= 100.0:
+                            new_min_roi = configured_roi / 100.0
+                            if abs(new_min_roi - min_roi) >= 1e-9:
+                                min_roi = new_min_roi
+                                initial_dirty.update(market_map)
+                                print("[*] minimum ROI updated from dashboard: %.2f%%"
+                                      % configured_roi)
+                        roi_revision = current_roi_revision
+                    if router is not None:
+                        wanted_sources = select_runtime_sources(
+                            runtime_cfg.get("enabled_bk_sources", ["1win"]),
+                            router.available_sources(),
+                            no_bb=args.no_bb,
+                        )
+                        if set(wanted_sources) != set(router.active_sources()):
+                            if router.configure_sources(wanted_sources):
+                                initial_dirty.update(market_map)
+                                best_by_slug.clear()
+                                best_by_slug_updated_at.clear()
+                                runtime_sources_changed = True
+                                print("[*] bookmaker feeds updated from dashboard: %s"
+                                      % (", ".join(wanted_sources) or "none"))
                 except (TypeError, ValueError):
                     pass
             source_events = update_queue.drain(timeout=min(0.1, max(0.01, poll)))
@@ -2270,6 +2362,10 @@ def main():
             if initial_dirty:
                 dirty_slugs.update(initial_dirty)
                 initial_dirty.clear()
+            if runtime_sources_changed:
+                retry_bind()
+                dirty_slugs.update(newly_bound_slugs)
+                newly_bound_slugs.clear()
             snapshot_changed = False
 
             if args.watch and now - last_pm_refresh >= args.watch_sec:
@@ -2725,6 +2821,10 @@ def main():
                 "enabled_bk_sources": (
                     (["1win"] if router is not None and router.use_onewin else [])
                     + (["BetBoom"] if (router.use_bb if router is not None else BB_ENABLED) else [])
+                ),
+                "available_bk_sources": (
+                    router.available_sources() if router is not None
+                    else (["BetBoom"] if BB_ENABLED and not args.no_bb else [])
                 ),
                 "pm_markets": len(market_map),
                 "phase_counts": phase_counts,

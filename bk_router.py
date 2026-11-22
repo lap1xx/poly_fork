@@ -30,6 +30,20 @@ _ow = None
 _OW_ERR = None
 
 
+def normalize_enabled_sources(sources, default=("1win",)):
+    """Normalize the dashboard bookmaker selection to the two supported feeds."""
+    if not isinstance(sources, (list, tuple, set)):
+        sources = default
+    normalized = set()
+    for source in sources:
+        key = str(source or "").strip().lower().replace(" ", "")
+        if key in ("1win", "onewin"):
+            normalized.add("1win")
+        elif key in ("betboom", "bb"):
+            normalized.add("BetBoom")
+    return [source for source in ("1win", "BetBoom") if source in normalized]
+
+
 def _load_onewin():
     """Load the optional 1win adapter only after an explicit opt-in."""
     global _ow, _OW_ERR
@@ -55,9 +69,11 @@ def is_prematch_slug(slug: str) -> bool:
 
 class BKRouter:
     def __init__(self, use_bb=True, use_onewin=False):
-        self.use_bb = use_bb and BB_OK
+        self.allow_bb = bool(use_bb and BB_OK)
+        self.allow_onewin = bool(use_onewin and _load_onewin() is not None)
+        self.use_bb = self.allow_bb
         # Keep module loading lazy; the scanner explicitly opts into 1win.
-        self.use_onewin = bool(use_onewin and _load_onewin() is not None)
+        self.use_onewin = self.allow_onewin
         self.bindings = {}
         self.fallback_bindings = {}
         self._markets = {}
@@ -68,6 +84,64 @@ class BKRouter:
         self._odds_update_callback = None
         self._onewin_stream = None
         self._lock = threading.RLock()
+        self._started = False
+
+    def available_sources(self):
+        return (["1win"] if self.allow_onewin else []) + (
+            ["BetBoom"] if self.allow_bb else []
+        )
+
+    def active_sources(self):
+        return (["1win"] if self.use_onewin else []) + (
+            ["BetBoom"] if self.use_bb else []
+        )
+
+    def configure_sources(self, sources):
+        """Switch feeds at runtime, dropping bindings so no stale source survives."""
+        wanted = set(normalize_enabled_sources(sources))
+        selected = wanted.intersection(self.available_sources())
+        if not selected:
+            return False
+        new_onewin = "1win" in selected
+        new_bb = "BetBoom" in selected
+        with self._lock:
+            old_onewin, old_bb = self.use_onewin, self.use_bb
+            if (old_onewin, old_bb) == (new_onewin, new_bb):
+                return True
+            self.use_onewin, self.use_bb = new_onewin, new_bb
+            self._onewin_ready = None if new_onewin else False
+            self.bindings.clear()
+            self.fallback_bindings.clear()
+            self._active_sources.clear()
+            self._bb_retry_after.clear()
+            self._onewin_retry_after.clear()
+        if self._started:
+            if old_onewin and not new_onewin:
+                try:
+                    _ow.stop_global_stream()
+                except Exception:
+                    pass
+                self._onewin_stream = None
+            if old_bb and not new_bb:
+                try:
+                    _bb.stop_global_stream()
+                except Exception:
+                    pass
+            if new_onewin and not old_onewin:
+                try:
+                    self._onewin_stream = _ow.get_global_stream(verbose=False)
+                    if self._odds_update_callback is not None:
+                        self._onewin_stream.set_odds_update_callback(
+                            self._odds_update_callback
+                        )
+                except Exception:
+                    self._onewin_ready = False
+            if new_bb and not old_bb:
+                try:
+                    _bb.get_global_stream(verbose=False)
+                except Exception:
+                    self.use_bb = False
+        return True
 
     def set_odds_update_callback(self, callback):
         """Set a lightweight listener for read-only 1win odds-cache updates."""
@@ -79,6 +153,7 @@ class BKRouter:
                 pass
 
     def start(self):
+        self._started = True
         if self.use_bb:
             try:
                 _bb.get_global_stream(verbose=False)
@@ -109,6 +184,7 @@ class BKRouter:
                 _ow.stop_global_stream()
             except Exception:
                 pass
+        self._started = False
 
     def wait_bb(self, timeout=60):
         if not self.use_bb:

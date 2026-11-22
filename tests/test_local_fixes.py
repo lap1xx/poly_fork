@@ -78,7 +78,8 @@ class EventPhaseTests(unittest.TestCase):
             bot_live.main()
         command = run.call_args.args[0]
         self.assertIn("--watch", command)
-        self.assertEqual(command[command.index("--min-roi") + 1], "3.0")
+        self.assertNotIn("--min-roi", command)
+        self.assertNotIn("--no-bb", command)
         self.assertNotIn("--bank", command)
         self.assertNotIn("--live", command)
         self.assertEqual(run.call_args.kwargs["cwd"], str(bot_live.HERE))
@@ -87,6 +88,30 @@ class EventPhaseTests(unittest.TestCase):
         scanner_token = run.call_args.kwargs["env"]["POLYARB_SCANNER_WS_TOKEN"]
         self.assertEqual(backend_token, "test-ephemeral-token")
         self.assertEqual(scanner_token, backend_token)
+
+    def test_explicit_min_roi_and_no_bb_are_passed_to_scanner(self):
+        with patch.object(bot_live.sys, "argv", [
+                 "bot_live.py", "--min-roi", "6.5", "--no-bb"
+             ]), \
+             patch.object(bot_live.subprocess, "Popen"), \
+             patch.object(bot_live.subprocess, "run") as run, \
+             patch.object(bot_live.secrets, "token_urlsafe", return_value="test-token"):
+            bot_live.main()
+        command = run.call_args.args[0]
+        self.assertIn("--no-bb", command)
+        self.assertEqual(command[command.index("--min-roi") + 1], "6.5")
+
+    def test_open_browser_waits_for_local_dashboard_and_does_not_pass_flag_to_scanner(self):
+        with patch.object(bot_live.sys, "argv", ["bot_live.py", "--open-browser"]), \
+             patch.object(bot_live.subprocess, "Popen") as popen, \
+             patch.object(bot_live.subprocess, "run") as run, \
+             patch.object(bot_live.secrets, "token_urlsafe", return_value="test-ephemeral-token"), \
+             patch.object(bot_live, "_wait_for_dashboard", return_value=True) as wait_ready, \
+             patch.object(bot_live.webbrowser, "open", return_value=True) as open_browser:
+            bot_live.main()
+        wait_ready.assert_called_once_with(popen.return_value)
+        open_browser.assert_called_once_with("http://127.0.0.1:8080")
+        self.assertNotIn("--open-browser", run.call_args.args[0])
 
 
 class PMCatalogRefreshTests(unittest.TestCase):

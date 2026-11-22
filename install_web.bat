@@ -40,6 +40,7 @@ if errorlevel 1 (
 )
 
 echo.
-echo Setup complete. Run start_all.bat to open the local dashboard.
+echo Setup complete. Double-click bot_live.bat to start the scanner and open the dashboard.
+echo Use start_all.bat only when you want to open the dashboard without starting the scanner.
 echo Legacy patch scripts and browser bridges were not run.
 pause
