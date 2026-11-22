@@ -418,6 +418,49 @@ class ScannerIngressTests(unittest.TestCase):
         self.assertEqual(snapshot["opportunities_v1"]["schema_version"], 1)
         self.assertEqual(snapshot["opportunities_v1"]["opportunities"], [])
 
+    def test_ui_opportunity_snapshot_marks_precise_1win_age_stale(self):
+        sent_at = time.time()
+        slug = "1win-ui-freshness-regression"
+        legacy_arb = {
+            "slug": slug,
+            "q": "Alpha vs Bravo",
+            "sport": "cs2",
+            "market_type": "winner",
+            "phase": "prematch",
+            "currency": "USDT",
+            "roi": 0.04,
+            "stakes": [20.0, 20.0],
+            "profit": 1.6,
+            "ts": sent_at,
+            "bk_source": "1win",
+            "bk_odds_age_sec": 29.94,
+            "bets": [
+                {
+                    "source": "Polymarket", "outcome": "Alpha",
+                    "token": "ui-freshness-pm-token", "o": 1 / (0.4 * 1.04),
+                    "pm_best_ask": 0.4, "pm_avg_ask": 0.4,
+                    "pm_age": 1.0, "pm_book_age_sec": 1.0,
+                },
+                {
+                    "source": "1win", "outcome": "Bravo", "o": 2.7,
+                    "odds_age_sec": 29.94,
+                },
+            ],
+        }
+        scanner_state = {
+            "sent_at": sent_at, "session_id": "1win-ui-replay", "seq": 1,
+        }
+        with patch.object(web_app.time, "time", return_value=sent_at + 0.07):
+            contract = web_app._opportunities_v1_snapshot(
+                {slug: legacy_arb}, scanner_state
+            )
+
+        self.assertEqual(contract["rejected"], [])
+        opportunity = contract["opportunities"][0]
+        self.assertEqual(opportunity["status"], "stale")
+        self.assertAlmostEqual(opportunity["legs"][1]["age_ms"], 30_010.0, places=3)
+        self.assertAlmostEqual(opportunity["legs"][0]["age_ms"], 1_070.0, places=3)
+
     def test_stale_scanner_state_falls_back_to_latest_atomic_files(self):
         class Client:
             def __init__(self):
