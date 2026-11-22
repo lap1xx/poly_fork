@@ -1,0 +1,140 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PolyFork Opportunity v1",
+  "description": "Normalized read-only opportunity between one prediction-market leg and one bookmaker leg. This draft is not wired into runtime yet.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "id",
+    "status",
+    "observed_at",
+    "computed_at",
+    "market",
+    "mapping",
+    "legs",
+    "calculation"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "id": {"type": "string", "minLength": 1, "maxLength": 768},
+    "status": {"enum": ["active", "stale", "suspended", "withdrawn"]},
+    "observed_at": {"$ref": "#/$defs/dateTime"},
+    "computed_at": {"$ref": "#/$defs/dateTime"},
+    "market": {"$ref": "#/$defs/market"},
+    "mapping": {"$ref": "#/$defs/mapping"},
+    "legs": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "items": {
+        "allOf": [
+          {"$ref": "#/$defs/legBase"},
+          {
+            "oneOf": [
+              {"$ref": "#/$defs/predictionMarketLeg"},
+              {"$ref": "#/$defs/bookmakerLeg"}
+            ]
+          }
+        ]
+      },
+      "contains": {"properties": {"source_kind": {"const": "prediction_market"}}, "required": ["source_kind"]},
+      "minContains": 1,
+      "maxContains": 1,
+      "allOf": [
+        {
+          "contains": {"properties": {"source_kind": {"const": "bookmaker"}}, "required": ["source_kind"]},
+          "minContains": 1,
+          "maxContains": 1
+        }
+      ]
+    },
+    "calculation": {"$ref": "#/$defs/calculation"},
+    "diagnostics": {
+      "type": "array",
+      "items": {"type": "string", "maxLength": 160},
+      "default": []
+    }
+  },
+  "$defs": {
+    "dateTime": {"type": "string", "format": "date-time"},
+    "market": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["slug", "question", "sport", "market_type", "phase"],
+      "properties": {
+        "slug": {"type": "string", "minLength": 1, "maxLength": 512},
+        "question": {"type": "string", "minLength": 1, "maxLength": 500},
+        "sport": {"type": "string", "minLength": 1, "maxLength": 80},
+        "market_type": {"type": "string", "minLength": 1, "maxLength": 80},
+        "phase": {"enum": ["live", "prematch", "unknown"]},
+        "starts_at": {"oneOf": [{"$ref": "#/$defs/dateTime"}, {"type": "null"}]}
+      }
+    },
+    "mapping": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "method", "reason_codes"],
+      "properties": {
+        "status": {"enum": ["accepted", "rejected", "ambiguous"]},
+        "method": {"enum": ["manual", "automated", "manual_alias", "unknown"]},
+        "confidence": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "reason_codes": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1, "maxLength": 100},
+          "uniqueItems": true
+        }
+      }
+    },
+    "legBase": {
+      "type": "object",
+      "required": ["source", "source_kind", "outcome", "price", "price_unit", "stake", "currency", "observed_at", "age_ms", "timestamp_basis"],
+      "properties": {
+        "source": {"type": "string", "minLength": 1, "maxLength": 80},
+        "source_kind": {"enum": ["prediction_market", "bookmaker"]},
+        "outcome": {"type": "string", "minLength": 1, "maxLength": 200},
+        "price": {"type": "number", "exclusiveMinimum": 0},
+        "price_unit": {"enum": ["probability", "decimal_odds"]},
+        "stake": {"type": "number", "minimum": 0},
+        "currency": {"enum": ["USDT", "USD", "RUB"]},
+        "observed_at": {"$ref": "#/$defs/dateTime"},
+        "age_ms": {"type": "number", "minimum": 0},
+        "timestamp_basis": {"enum": ["provider", "received_at"]},
+        "provider_observed_at": {"oneOf": [{"$ref": "#/$defs/dateTime"}, {"type": "null"}]},
+        "available_size": {"type": ["number", "null"], "minimum": 0},
+        "event_url": {"type": "string", "format": "uri", "maxLength": 2048}
+      }
+    },
+    "predictionMarketLeg": {
+      "type": "object",
+      "properties": {
+        "source_kind": {"const": "prediction_market"},
+        "price_unit": {"const": "probability"},
+        "price": {"type": "number", "exclusiveMinimum": 0, "maximum": 1},
+        "token_id": {"type": "string", "minLength": 1, "maxLength": 256}
+      },
+      "required": ["token_id"]
+    },
+    "bookmakerLeg": {
+      "type": "object",
+      "properties": {
+        "source_kind": {"const": "bookmaker"},
+        "price_unit": {"const": "decimal_odds"},
+        "price": {"type": "number", "exclusiveMinimum": 1}
+      }
+    },
+    "calculation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["roi_fraction", "total_stake", "projected_profit", "currency", "fee_fraction", "model_version"],
+      "properties": {
+        "roi_fraction": {"type": "number", "description": "Fraction, not percentage: 0.04 means 4%."},
+        "total_stake": {"type": "number", "minimum": 0},
+        "projected_profit": {"type": "number"},
+        "currency": {"enum": ["USDT", "USD", "RUB"]},
+        "fee_fraction": {"type": "number", "minimum": 0, "maximum": 1},
+        "model_version": {"type": "string", "minLength": 1, "maxLength": 80}
+      }
+    }
+  }
+}
