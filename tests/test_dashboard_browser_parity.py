@@ -39,6 +39,8 @@ def make_ui_snapshot_pair() -> dict:
     )
     now = time.time()
     slug = captured["market_slug"]
+    pm_event_url = f"https://polymarket.com/event/{slug}"
+    bookmaker_event_url = "https://f1w-7707.com/betting/match/esport/replay-match"
     legacy = {
         "slug": slug,
         "q": captured["question"],
@@ -55,6 +57,8 @@ def make_ui_snapshot_pair() -> dict:
         "source_age_sec": 30.01,
         "source_state": "stale",
         "age_sec": 3,
+        "pm_event_url": pm_event_url,
+        "bk_event_url": bookmaker_event_url,
         "bets": [
             {
                 "source": "Polymarket",
@@ -139,6 +143,8 @@ class DashboardBrowserParityTests(unittest.TestCase):
             shim = f"""
               (() => {{
                 const message = {snapshot_json};
+                window.__openedUrls = [];
+                window.open = (url) => {{ window.__openedUrls.push(String(url)); return {{ closed: false }}; }};
                 class ReplayWebSocket {{
                   static CONNECTING = 0; static OPEN = 1; static CLOSING = 2; static CLOSED = 3;
                   constructor(url) {{
@@ -174,6 +180,11 @@ class DashboardBrowserParityTests(unittest.TestCase):
                     self.assertEqual(card.locator(".arb-roi").inner_text(), "+3.10%")
                     warning_tags = card.locator(".arb-tags .pm-age").all_inner_texts()
                     self.assertEqual(sum("УСТАРЕЛИ" in tag or "КОТИРОВКИ УСТАРЕЛИ" in tag for tag in warning_tags), 1)
+                    expected_urls = {
+                        leg["source"]: leg["event_url"] for leg in expected["legs"]
+                    }
+                    self.assertEqual(expected_urls["Polymarket"], "https://polymarket.com/event/" + expected["market"]["slug"])
+                    self.assertEqual(expected_urls["1win"], "https://f1w-7707.com/betting/match/esport/replay-match")
 
                     # Card click opens the unchanged legacy detail/calculator path.
                     card.click()
@@ -182,6 +193,15 @@ class DashboardBrowserParityTests(unittest.TestCase):
                     self.assertEqual(detail_roi.inner_text(), "+3.10%")
                     self.assertEqual(page.locator("#market-pm-outcome").inner_text(), expected["legs"][0]["outcome"])
                     self.assertEqual(page.locator("#market-bk-outcome").inner_text(), expected["legs"][1]["outcome"])
+
+                    # Until the action migration is separately approved, buttons
+                    # remain legacy-backed; prove each opens its own v1 leg URL.
+                    page.locator("#btn-buy-pm").click()
+                    page.locator("#btn-open-bb").click()
+                    opened_urls = page.evaluate("window.__openedUrls")
+                    self.assertEqual(opened_urls, [
+                        expected_urls["Polymarket"], expected_urls["1win"]
+                    ])
                 finally:
                     browser.close()
         finally:
