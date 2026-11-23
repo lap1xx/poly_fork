@@ -2,6 +2,7 @@
 # bot_live.py - AUTO launcher for polyarb_v4.py
 # No imports from clob_utils. Just spawns polyarb_v4.py as subprocess.
 import sys, subprocess, os, pathlib, secrets, socket, time, webbrowser
+from runtime_settings import validate_cli_overrides
 
 HERE = pathlib.Path(__file__).parent
 POLYARB = str(HERE / "polyarb_v4.py")
@@ -21,9 +22,15 @@ def _wait_for_dashboard(web_proc, timeout=15.0):
 def main():
     args = sys.argv[1:]
     if "--help" in args or "-h" in args:
-        print("Usage: python bot_live.py [--min-roi 3.0] [--bank USDT_AMOUNT] [--open-browser] ...")
+        print("Usage: python bot_live.py [--min-roi 3.0] [--bank USDT_AMOUNT] [--poll SEC] [--watch-sec SEC] [--alert-gap SEC] [--open-browser] ...")
         print("Any extra args are passed through to polyarb_v4.py")
         return 0
+
+    try:
+        validate_cli_overrides(args)
+    except ValueError as exc:
+        print("[!] Некорректный параметр: " + str(exc))
+        return 2
 
     min_roi = None
     bank = None
@@ -53,9 +60,6 @@ def main():
     cmd = [
         sys.executable, "-B", POLYARB,
         "--watch",
-        "--watch-sec", "20",
-        "--poll", "0.3",
-        "--alert-gap", "120",
     ] + extra
     if min_roi is not None:
         cmd.extend(["--min-roi", min_roi])

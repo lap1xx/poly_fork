@@ -34,6 +34,37 @@ class RuntimeConfigTests(unittest.TestCase):
             saved = json.loads(config_path.read_text(encoding="utf-8"))
             self.assertEqual(saved["roi_revision"], 1)
 
+    def test_settings_update_migrates_legacy_bank_and_saves_shared_runtime_fields(self):
+        with TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.json"
+            config_path.write_text(json.dumps({
+                "bank": 2500, "rate": 85, "poll": 0.3,
+            }), encoding="utf-8")
+            with patch.object(web_app, "CONFIG_FILE", config_path), \
+                 patch.object(web_app, "_current_scanner_status", return_value={}):
+                result = asyncio.run(web_app.api_config_save({
+                    "poll": 0.5, "watch_sec": 45, "alert_gap": 0,
+                }))
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["config"]["bank"], 29.41)
+            self.assertEqual(result["config"]["poll"], 0.5)
+            self.assertEqual(result["config"]["watch_sec"], 45)
+            self.assertEqual(result["config"]["alert_gap"], 0)
+            saved = json.loads(config_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["currency"], "USDT")
+            self.assertEqual(saved["bank"], 29.41)
+
+    def test_settings_api_rejects_values_outside_shared_ranges(self):
+        for payload in ({"bank": 0.5}, {"poll": 0.01}, {"watch_sec": 1.5},
+                        {"alert_gap": 86401}, {"safe_fork_threshold": 1.0}):
+            with self.subTest(payload=payload), TemporaryDirectory() as tmp:
+                config_path = Path(tmp) / "config.json"
+                with patch.object(web_app, "CONFIG_FILE", config_path), \
+                     patch.object(web_app, "_current_scanner_status", return_value={}):
+                    result = asyncio.run(web_app.api_config_save(payload))
+                self.assertEqual(result.status_code, 422)
+                self.assertFalse(config_path.exists())
+
     def test_stopped_scanner_has_no_active_feeds_even_when_selection_is_saved(self):
         with TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "config.json"
@@ -47,6 +78,29 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertFalse(config["scanner_running"])
         self.assertEqual(config["enabled_bk_sources"], ["1win"])
         self.assertEqual(config["active_bk_sources"], [])
+
+    def test_config_payload_exposes_effective_runtime_settings_and_sources(self):
+        status = {
+            "state": "running", "ts": time.time(),
+            "enabled_bk_sources": ["1win"], "available_bk_sources": ["1win"],
+            "min_roi_pct": 4.5,
+            "runtime_settings": {
+                "bank_usdt": 200.0, "min_roi_pct": 4.5, "poll_sec": 0.5,
+                "watch_sec": 30, "alert_gap_sec": 0,
+                "sources": {"bank": "cli", "min_roi_pct": "config"},
+            },
+            "config_warnings": ["invalid saved value"],
+        }
+        with TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.json"
+            config_path.write_text(json.dumps({"currency": "USDT", "bank": 100}),
+                                   encoding="utf-8")
+            with patch.object(web_app, "CONFIG_FILE", config_path), \
+                 patch.object(web_app, "_current_scanner_status", return_value=status):
+                config = web_app._runtime_config_payload()
+        self.assertEqual(config["active_runtime_settings"], status["runtime_settings"])
+        self.assertEqual(config["config_warnings"], status["config_warnings"])
+        self.assertEqual(config["config_limits"]["poll"]["minimum"], 0.05)
 
     def test_dashboard_rejects_empty_or_unknown_feed_selection(self):
         for selected in ([], ["unknown"]):
@@ -91,6 +145,23 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(cfg["min_roi_pct"], 3.0)
         self.assertEqual(cfg["roi_revision"], 0)
         self.assertEqual(cfg["enabled_bk_sources"], ["1win"])
+
+    def test_scanner_reads_nested_settings_with_flat_config_precedence(self):
+        with TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.json"
+            config_path.write_text(json.dumps({
+                "currency": "USDT",
+                "scan": {"bank": 200, "poll": 0.5, "min_roi_pct": 4.0},
+                "bot": {"watch_sec": 30, "alert_gap": 60},
+                "poll": 0.75,
+            }), encoding="utf-8")
+            with patch.object(polyarb_v4, "CFG_FILE", str(config_path)):
+                cfg = polyarb_v4.load_cfg()
+        self.assertEqual(cfg["bank"], 200)
+        self.assertEqual(cfg["poll"], 0.75)
+        self.assertEqual(cfg["min_roi_pct"], 4.0)
+        self.assertEqual(cfg["watch_sec"], 30)
+        self.assertEqual(cfg["alert_gap"], 60)
 
     def test_malformed_scanner_config_falls_back_to_safe_defaults(self):
         with TemporaryDirectory() as tmp:

@@ -27,6 +27,11 @@ from fastapi.staticfiles import StaticFiles
 from arb_invariants import is_pm_bookmaker_pair
 from opportunity import normalize_scanner_snapshot
 from pm_fees import fetch_fee_schedule, fee_per_share
+from runtime_settings import (
+    normalize_runtime_settings,
+    settings_limits_payload,
+    validate_setting,
+)
 
 try:
     import price_history
@@ -215,6 +220,13 @@ def _runtime_config_payload():
     cfg["active_min_roi_pct"] = (
         active_roi if active_roi is not None else cfg["min_roi_pct"]
     )
+    cfg["active_runtime_settings"] = (
+        status.get("runtime_settings", {}) if running else {}
+    )
+    cfg["config_warnings"] = (
+        status.get("config_warnings", cfg.get("config_warnings", []))
+        if running else cfg.get("config_warnings", [])
+    )
     return cfg
 
 def _csv_safe(value):
@@ -248,17 +260,19 @@ def _load_config():
     cfg = _load_json(CONFIG_FILE, {})
     if not isinstance(cfg, dict):
         cfg = {}
-
-    raw_bank = _finite_number(cfg.get("bank"), 0.01, 1_000_000_000.0)
-    bank = raw_bank if raw_bank is not None else 100.0
-    if raw_bank is not None and str(cfg.get("currency", "")).upper() != "USDT":
-        legacy_rate = _finite_number(cfg.get("rate"), 0.01, 100_000.0) or 85.0
-        bank = round(raw_bank / legacy_rate, 2)
-    rate = 1.0
-
     bot_cfg = cfg.get("bot") if isinstance(cfg.get("bot"), dict) else {}
-    poll = _finite_number((bot_cfg or {}).get("poll", cfg.get("poll", 0.3)),
-                          0.05, 30.0) or 0.3
+    scan_cfg = cfg.get("scan") if isinstance(cfg.get("scan"), dict) else {}
+    normalized_source = dict(cfg)
+    for key in ("bank", "min_roi_pct", "poll", "watch_sec", "alert_gap",
+                "safe_fork_threshold", "roi_revision"):
+        if key not in normalized_source:
+            if key in scan_cfg:
+                normalized_source[key] = scan_cfg[key]
+            elif key in bot_cfg:
+                normalized_source[key] = bot_cfg[key]
+    settings, config_warnings, _legacy_migrated = normalize_runtime_settings(
+        normalized_source
+    )
 
     sec = cfg.get("secondary_bk")
     if not isinstance(sec, dict):
@@ -268,33 +282,24 @@ def _load_config():
         sec.setdefault("name", "1win")
         sec.setdefault("color", "#ff5a5a")
 
-    safe_threshold = _finite_number(
-        cfg.get("safe_fork_threshold", SAFE_FORK_THRESHOLD), 0.01, 0.99
-    )
-    if safe_threshold is None:
-        safe_threshold = SAFE_FORK_THRESHOLD
-
-    min_roi_pct = _finite_number(cfg.get("min_roi_pct", 3.0), 0.0, 100.0)
-    if min_roi_pct is None:
-        min_roi_pct = 3.0
     enabled_bk_sources = _normalize_enabled_bk_sources(
         cfg.get("enabled_bk_sources", ["1win"])
     ) or ["1win"]
-    try:
-        roi_revision = max(0, int(cfg.get("roi_revision", 0)))
-    except (TypeError, ValueError):
-        roi_revision = 0
 
     return {
-        "rate": rate,
-        "bank": bank,
+        "rate": 1.0,
+        "bank": settings["bank"],
         "currency": "USDT",
-        "poll": poll,
-        "safe_fork_threshold": safe_threshold,
-        "min_roi_pct": min_roi_pct,
-        "roi_revision": roi_revision,
+        "poll": settings["poll"],
+        "watch_sec": settings["watch_sec"],
+        "alert_gap": settings["alert_gap"],
+        "safe_fork_threshold": settings["safe_fork_threshold"],
+        "min_roi_pct": settings["min_roi_pct"],
+        "roi_revision": settings["roi_revision"],
         "enabled_bk_sources": enabled_bk_sources,
         "secondary_bk": sec,
+        "config_warnings": config_warnings,
+        "config_limits": settings_limits_payload(),
     }
 
 _load_hidden()
@@ -766,16 +771,29 @@ async def api_config_save(payload: dict):
         if not isinstance(cfg, dict):
             cfg = {}
         cfg.pop("pm_fee_pct", None)
-        limits = {
-            "bank": (1.0, 1_000_000_000.0),
-            "safe_fork_threshold": (0.01, 0.99),
-            "min_roi_pct": (0.0, 100.0),
-        }
-        for k, (minimum, maximum) in limits.items():
+        normalized_source = dict(cfg)
+        bot_cfg = cfg.get("bot") if isinstance(cfg.get("bot"), dict) else {}
+        scan_cfg = cfg.get("scan") if isinstance(cfg.get("scan"), dict) else {}
+        for key in ("bank", "min_roi_pct", "poll", "watch_sec", "alert_gap",
+                    "safe_fork_threshold", "roi_revision"):
+            if key not in normalized_source:
+                if key in scan_cfg:
+                    normalized_source[key] = scan_cfg[key]
+                elif key in bot_cfg:
+                    normalized_source[key] = bot_cfg[key]
+        normalized_settings, normalization_warnings, _legacy_migrated = (
+            normalize_runtime_settings(normalized_source)
+        )
+        cfg.update(normalized_settings)
+        cfg["currency"] = "USDT"
+        cfg["rate"] = 1.0
+        for k in ("bank", "safe_fork_threshold", "min_roi_pct", "poll",
+                  "watch_sec", "alert_gap"):
             if k in payload:
-                value = _finite_number(payload[k], minimum, maximum)
-                if value is None:
-                    return JSONResponse({"ok": False, "err": "invalid " + k},
+                try:
+                    value = validate_setting(payload[k], k)
+                except ValueError as exc:
+                    return JSONResponse({"ok": False, "err": str(exc)},
                                         status_code=422)
                 cfg[k] = value
         if "enabled_bk_sources" in payload:
@@ -814,7 +832,10 @@ async def api_config_save(payload: dict):
         cfg["currency"] = "USDT"
         cfg["rate"] = 1.0
         _save_json(CONFIG_FILE, cfg)
-        return {"ok": True, "config": _runtime_config_payload()}
+        result_config = _runtime_config_payload()
+        if normalization_warnings:
+            result_config["config_warnings"] = normalization_warnings
+        return {"ok": True, "config": result_config}
     except Exception as e:
         return JSONResponse({"ok": False, "err": str(e)}, status_code=500)
 

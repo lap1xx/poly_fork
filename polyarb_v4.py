@@ -35,6 +35,12 @@ from pm_fees import (
     fetch_fee_schedule as fetch_pm_fee_schedule,
     fee_per_share as pm_fee_per_share,
 )
+from runtime_settings import (
+    DEFAULT_RUNTIME_SETTINGS,
+    argparse_type as runtime_argparse_type,
+    normalize_runtime_settings,
+    resolve_setting,
+)
 if sys.platform == "win32":
     os.system("")
 
@@ -220,16 +226,19 @@ STATUS_FILE = "scanner_status.json"
 BK_FILE = "bk_profiles.json"
 
 DEFAULT_CFG = {
-    "bank": 100,
+    "bank": DEFAULT_RUNTIME_SETTINGS["bank"],
     "currency": "USDT",
     "rate": 1.0,
-    "poll": 1.0,
+    "poll": DEFAULT_RUNTIME_SETTINGS["poll"],
+    "watch_sec": DEFAULT_RUNTIME_SETTINGS["watch_sec"],
+    "alert_gap": DEFAULT_RUNTIME_SETTINGS["alert_gap"],
     "slip": 0.0,
     "live_min_roi_show": -3.0,
-    "min_roi_pct": 3.0,
+    "min_roi_pct": DEFAULT_RUNTIME_SETTINGS["min_roi_pct"],
     "roi_revision": 0,
     "enabled_bk_sources": ["1win"],
 }
+CONFIG_WARNINGS = []
 DEFAULT_BK = {
     "BetBoom": {"comm": 0.0, "min_bet": 50, "update_seconds": 1},
     "Winline": {"comm": 0.0, "min_bet": 100, "update_seconds": 2},
@@ -255,47 +264,48 @@ def line(s=""):
 
 
 def load_cfg():
+    global CONFIG_WARNINGS
     if not os.path.exists(CFG_FILE):
         with open(CFG_FILE, "w", encoding="utf-8") as f:
             json.dump(DEFAULT_CFG, f, indent=2)
+        CONFIG_WARNINGS = []
         return dict(DEFAULT_CFG)
     try:
         with open(CFG_FILE, encoding="utf-8") as f:
             c = json.load(f)
+        if not isinstance(c, dict):
+            raise ValueError("config root must be an object")
         o = dict(DEFAULT_CFG)
         o.update(c)
-        try:
-            roi_pct = float(o.get("min_roi_pct", 3.0))
-            if not math.isfinite(roi_pct) or not 0.0 <= roi_pct <= 100.0:
-                raise ValueError("invalid min_roi_pct")
-            o["min_roi_pct"] = roi_pct
-        except (TypeError, ValueError):
-            o["min_roi_pct"] = 3.0
-        try:
-            o["roi_revision"] = max(0, int(o.get("roi_revision", 0)))
-        except (TypeError, ValueError):
-            o["roi_revision"] = 0
+        normalized_source = dict(c)
+        scan_cfg = c.get("scan") if isinstance(c.get("scan"), dict) else {}
+        bot_cfg = c.get("bot") if isinstance(c.get("bot"), dict) else {}
+        for key in ("bank", "min_roi_pct", "poll", "watch_sec", "alert_gap",
+                    "safe_fork_threshold", "roi_revision"):
+            if key not in normalized_source:
+                if key in scan_cfg:
+                    normalized_source[key] = scan_cfg[key]
+                elif key in bot_cfg:
+                    normalized_source[key] = bot_cfg[key]
+        runtime_settings, warnings, legacy_migrated = normalize_runtime_settings(
+            normalized_source
+        )
+        o.update(runtime_settings)
+        o["currency"] = "USDT"
+        o["rate"] = 1.0
+        CONFIG_WARNINGS = warnings
         o["enabled_bk_sources"] = normalize_enabled_sources(
             o.get("enabled_bk_sources", ["1win"])
         ) or ["1win"]
-        if str(c.get("currency", "")).upper() != "USDT":
-            legacy_bank = c.get("bank")
-            legacy_rate = c.get("rate")
-            try:
-                legacy_bank = float(legacy_bank)
-                legacy_rate = float(legacy_rate)
-                if math.isfinite(legacy_bank) and legacy_bank > 0 and math.isfinite(legacy_rate) and legacy_rate > 0:
-                    o["bank"] = round(legacy_bank / legacy_rate, 2)
-                elif math.isfinite(legacy_bank) and legacy_bank > 0:
-                    o["bank"] = 100.0
-            except (TypeError, ValueError):
-                o["bank"] = 100.0
-            o["currency"] = "USDT"
-            o["rate"] = 1.0
+        if legacy_migrated and not warnings:
             with open(CFG_FILE, "w", encoding="utf-8") as f:
                 json.dump(o, f, ensure_ascii=False, indent=2)
         return o
-    except Exception:
+    except Exception as exc:
+        CONFIG_WARNINGS = [
+            "Не удалось прочитать config.json; используются безопасные настройки "
+            f"по умолчанию ({type(exc).__name__})."
+        ]
         return dict(DEFAULT_CFG)
 
 
@@ -2168,28 +2178,42 @@ def main():
     ap.add_argument("--slugs", default="", help="comma-separated PM slugs")
     ap.add_argument("--live", action="store_true",
                     help="deprecated legacy flag; Gamma metadata determines event phase")
-    ap.add_argument("--poll", type=float, default=0.3, help="seconds between checks")
-    ap.add_argument("--bank", type=float, default=0.0, help="override total bank size (USDT)")
-    ap.add_argument("--min-roi", type=float, default=None,
+    ap.add_argument("--poll", type=runtime_argparse_type("poll"), default=None,
+                    help="seconds between checks; CLI override of config.json")
+    ap.add_argument("--bank", type=runtime_argparse_type("bank"), default=None,
+                    help="override total bank size (USDT)")
+    ap.add_argument("--min-roi", type=runtime_argparse_type("min_roi_pct"), default=None,
                     help="initial ROI threshold in %% (dashboard changes apply live)")
     ap.add_argument("--no-bb", action="store_true", help="disable BetBoom fallback; keep 1win")
     ap.add_argument("--watch", action="store_true", help="auto-refresh PM live markets")
-    ap.add_argument("--watch-sec", type=int, default=60, help="watch refresh interval")
-    ap.add_argument("--alert-gap", type=int, default=120,
+    ap.add_argument("--watch-sec", type=runtime_argparse_type("watch_sec"), default=None,
+                    help="watch refresh interval; CLI override of config.json")
+    ap.add_argument("--alert-gap", type=runtime_argparse_type("alert_gap"), default=None,
                     help="minimum gap between signal updates and repeat reminders")
     args = ap.parse_args()
     if args.live:
         print("[!] --live is deprecated and ignored; event phase requires source evidence")
 
     cfg = load_cfg()
+    for warning in CONFIG_WARNINGS:
+        print("[!] Настройки: " + warning)
     bk  = load_bk()
     init_db()
 
-    bank    = args.bank if args.bank > 0 else float(cfg.get("bank", 100))
+    bank, bank_source = resolve_setting(cfg, args.bank, "bank")
     slip    = float(cfg.get("slip", 0.0))
-    poll    = args.poll if args.poll > 0 else float(cfg.get("poll", 1.0))
-    min_roi = float(args.min_roi if args.min_roi is not None
-                    else cfg.get("min_roi_pct", 3.0)) / 100.0
+    poll, poll_source = resolve_setting(cfg, args.poll, "poll")
+    watch_sec, watch_source = resolve_setting(cfg, args.watch_sec, "watch_sec")
+    alert_gap, alert_gap_source = resolve_setting(cfg, args.alert_gap, "alert_gap")
+    min_roi_pct, roi_source = resolve_setting(cfg, args.min_roi, "min_roi_pct")
+    min_roi = min_roi_pct / 100.0
+    runtime_setting_sources = {
+        "bank": bank_source,
+        "min_roi_pct": roi_source,
+        "poll": poll_source,
+        "watch_sec": watch_source,
+        "alert_gap": alert_gap_source,
+    }
     try:
         roi_revision = int(cfg.get("roi_revision", 0))
     except (TypeError, ValueError):
@@ -2241,6 +2265,15 @@ def main():
             "min_roi_pct": round(min_roi * 100, 3),
             "bank_usdt": round(bank, 2),
             "currency": "USDT",
+            "runtime_settings": {
+                "bank_usdt": round(bank, 2),
+                "min_roi_pct": round(min_roi * 100, 3),
+                "poll_sec": poll,
+                "watch_sec": watch_sec,
+                "alert_gap_sec": alert_gap,
+                "sources": dict(runtime_setting_sources),
+            },
+            "config_warnings": list(CONFIG_WARNINGS),
         })
 
     # ---------- BK bridge: 1win primary; BetBoom is a fallback ----------
@@ -2347,7 +2380,6 @@ def main():
         if router is not None:
             match_index.update(router.onewin_match_index())
 
-    alert_gap = max(0.0, float(args.alert_gap))
     newly_bound_slugs = set()
 
     def retry_bind():
@@ -2438,28 +2470,40 @@ def main():
                 last_runtime_config_check = now
                 try:
                     runtime_cfg = load_cfg()
-                    if args.bank <= 0:
+                    if args.bank is None:
                         configured_bank = float(runtime_cfg.get("bank", bank))
                         if math.isfinite(configured_bank) and configured_bank > 0 \
                                 and abs(configured_bank - bank) >= 0.005:
                             bank = configured_bank
+                            runtime_setting_sources["bank"] = "config"
                             initial_dirty.update(market_map)
                             print("[*] bankroll updated from dashboard config: %.2f USDT" % bank)
+                    if args.poll is None:
+                        configured_poll = float(runtime_cfg.get("poll", poll))
+                        if math.isfinite(configured_poll) and configured_poll > 0:
+                            poll = configured_poll
+                            runtime_setting_sources["poll"] = "config"
+                    if args.watch_sec is None:
+                        configured_watch_sec = int(runtime_cfg.get("watch_sec", watch_sec))
+                        if configured_watch_sec != watch_sec:
+                            watch_sec = configured_watch_sec
+                            runtime_setting_sources["watch_sec"] = "config"
+                    if args.alert_gap is None:
+                        configured_alert_gap = int(runtime_cfg.get("alert_gap", alert_gap))
+                        if configured_alert_gap != alert_gap:
+                            alert_gap = configured_alert_gap
+                            runtime_setting_sources["alert_gap"] = "config"
                     try:
                         current_roi_revision = int(runtime_cfg.get("roi_revision", 0))
                     except (TypeError, ValueError):
                         current_roi_revision = roi_revision
                     if current_roi_revision != roi_revision:
-                        configured_roi = runtime_cfg.get("min_roi_pct", 3.0)
-                        try:
-                            configured_roi = float(configured_roi)
-                        except (TypeError, ValueError):
-                            configured_roi = None
-                        if configured_roi is not None and math.isfinite(configured_roi) \
-                                and 0.0 <= configured_roi <= 100.0:
+                        configured_roi = float(runtime_cfg.get("min_roi_pct", min_roi * 100))
+                        if args.min_roi is None:
                             new_min_roi = configured_roi / 100.0
                             if abs(new_min_roi - min_roi) >= 1e-9:
                                 min_roi = new_min_roi
+                                runtime_setting_sources["min_roi_pct"] = "config"
                                 initial_dirty.update(market_map)
                                 print("[*] minimum ROI updated from dashboard: %.2f%%"
                                       % configured_roi)
@@ -2495,7 +2539,7 @@ def main():
                 newly_bound_slugs.clear()
             snapshot_changed = False
 
-            if args.watch and now - last_pm_refresh >= args.watch_sec:
+            if args.watch and now - last_pm_refresh >= watch_sec:
                 previous_market_map = dict(market_map)
                 fresh, refresh_complete = fetch_live_pm_markets(with_status=True)
                 had_previous_catalog = bool(market_map)
@@ -2966,6 +3010,15 @@ def main():
                 "best_candidate_batch_scope": "last_dispatch_batch",
                 "bank_usdt": round(bank, 2),
                 "currency": "USDT",
+                "runtime_settings": {
+                    "bank_usdt": round(bank, 2),
+                    "min_roi_pct": round(min_roi * 100, 3),
+                    "poll_sec": poll,
+                    "watch_sec": watch_sec,
+                    "alert_gap_sec": alert_gap,
+                    "sources": dict(runtime_setting_sources),
+                },
+                "config_warnings": list(CONFIG_WARNINGS),
             }
             if _now - last_status_write >= 1.0:
                 _write_scan_status(last_scan_status)

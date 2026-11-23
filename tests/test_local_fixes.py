@@ -82,6 +82,9 @@ class EventPhaseTests(unittest.TestCase):
         self.assertNotIn("--no-bb", command)
         self.assertNotIn("--bank", command)
         self.assertNotIn("--live", command)
+        self.assertNotIn("--poll", command)
+        self.assertNotIn("--watch-sec", command)
+        self.assertNotIn("--alert-gap", command)
         self.assertEqual(run.call_args.kwargs["cwd"], str(bot_live.HERE))
         popen.assert_called_once()
         backend_token = popen.call_args.kwargs["env"]["POLYARB_SCANNER_WS_TOKEN"]
@@ -89,9 +92,19 @@ class EventPhaseTests(unittest.TestCase):
         self.assertEqual(backend_token, "test-ephemeral-token")
         self.assertEqual(scanner_token, backend_token)
 
+    def test_launcher_rejects_invalid_runtime_override_before_starting_processes(self):
+        with patch.object(bot_live.sys, "argv", ["bot_live.py", "--poll", "0.01"]), \
+             patch.object(bot_live.subprocess, "Popen") as popen, \
+             patch.object(bot_live.subprocess, "run") as run:
+            code = bot_live.main()
+        self.assertEqual(code, 2)
+        popen.assert_not_called()
+        run.assert_not_called()
+
     def test_explicit_min_roi_and_no_bb_are_passed_to_scanner(self):
         with patch.object(bot_live.sys, "argv", [
-                 "bot_live.py", "--min-roi", "6.5", "--no-bb"
+                 "bot_live.py", "--min-roi", "6.5", "--no-bb",
+                 "--poll", "0.5", "--watch-sec", "30", "--alert-gap", "60",
              ]), \
              patch.object(bot_live.subprocess, "Popen"), \
              patch.object(bot_live.subprocess, "run") as run, \
@@ -100,6 +113,9 @@ class EventPhaseTests(unittest.TestCase):
         command = run.call_args.args[0]
         self.assertIn("--no-bb", command)
         self.assertEqual(command[command.index("--min-roi") + 1], "6.5")
+        self.assertEqual(command[command.index("--poll") + 1], "0.5")
+        self.assertEqual(command[command.index("--watch-sec") + 1], "30")
+        self.assertEqual(command[command.index("--alert-gap") + 1], "60")
 
     def test_open_browser_waits_for_local_dashboard_and_does_not_pass_flag_to_scanner(self):
         with patch.object(bot_live.sys, "argv", ["bot_live.py", "--open-browser"]), \

@@ -464,6 +464,22 @@ function renderScanStatus() {
     .filter(item => item.count > 0)
     .sort((a, b) => b.count - a.count)
     .map(item => `${item.label}: ${item.count}`);
+  const effective = status.runtime_settings || {};
+  const effectiveSources = effective.sources || {};
+  const sourceLabel = key => effectiveSources[key] === 'cli' ? 'CLI' : 'config/default';
+  if (effective.bank_usdt != null || effective.min_roi_pct != null) {
+    reasons.unshift(
+      `Активные настройки: банк ${Number(effective.bank_usdt ?? status.bank_usdt ?? 0).toFixed(2)} USDT (${sourceLabel('bank')}) · ` +
+      `ROI ${Number(effective.min_roi_pct ?? status.min_roi_pct ?? 0).toFixed(2)}% (${sourceLabel('min_roi_pct')}) · ` +
+      `poll ${Number(effective.poll_sec ?? 0).toFixed(2)} с (${sourceLabel('poll')}) · ` +
+      `каталог ${Number(effective.watch_sec ?? 0)} с (${sourceLabel('watch_sec')}) · ` +
+      `повтор ${Number(effective.alert_gap_sec ?? 0)} с (${sourceLabel('alert_gap')})`
+    );
+  }
+  const configWarnings = Array.isArray(status.config_warnings) ? status.config_warnings : [];
+  for (const warning of configWarnings.slice(0, 3).reverse()) {
+    reasons.unshift(`Предупреждение настроек: ${warning}`);
+  }
   if (status.pm_catalog_complete === false) {
     reasons.unshift(status.pm_catalog_retained
       ? 'каталог Polymarket неполный; прежние события временно сохранены'
@@ -1410,11 +1426,24 @@ function syncRuntimeControlsFromStatus(scanStatus) {
   if (scanStatus && Array.isArray(scanStatus.enabled_bk_sources)) {
     state.config.active_bk_sources = scanStatus.enabled_bk_sources;
   }
+  if (scanStatus && scanStatus.runtime_settings) {
+    state.config.active_runtime_settings = scanStatus.runtime_settings;
+  }
   const statusRoi = Number(scanStatus?.min_roi_pct);
   if (Number.isFinite(statusRoi) && statusRoi >= 0 && statusRoi <= 100) {
     state.config.active_min_roi_pct = statusRoi;
   }
   const roiInput = document.getElementById('f-minroi');
+  const roiLimits = state.config.config_limits?.min_roi_pct;
+  if (roiInput && roiLimits) {
+    roiInput.min = roiLimits.minimum;
+    roiInput.max = roiLimits.maximum;
+  }
+  if (roiInput) {
+    roiInput.title = scanStatus?.runtime_settings?.sources?.min_roi_pct === 'cli'
+      ? 'Сейчас действует CLI override; сохранённый порог начнёт действовать после запуска без --min-roi'
+      : 'Порог сканера применяется без перезапуска';
+  }
   const currentRoi = Number(state.config.active_min_roi_pct ?? state.config.min_roi_pct ?? 3);
   if (roiInput && Number.isFinite(currentRoi) && document.activeElement !== roiInput) {
     roiInput.value = String(currentRoi);
@@ -1519,20 +1548,69 @@ async function openConfig() {
     state.config = { ...state.config, ...j };
     const bankInput = document.getElementById('risk-total-bank');
     if (bankInput) bankInput.value = Number(j.bank || 100).toFixed(2);
-    document.getElementById('cfg-bank').value = j.bank || 100;
-    document.getElementById('cfg-safe').value = (j.safe_fork_threshold || 0.45);
+    document.getElementById('cfg-bank').value = j.bank ?? 100;
+    document.getElementById('cfg-safe').value = j.safe_fork_threshold ?? 0.45;
+    document.getElementById('cfg-poll').value = j.poll ?? 0.3;
+    document.getElementById('cfg-watch-sec').value = j.watch_sec ?? 20;
+    document.getElementById('cfg-alert-gap').value = j.alert_gap ?? 120;
+    const fieldLimits = {
+      'cfg-bank': 'bank', 'cfg-safe': 'safe_fork_threshold',
+      'cfg-poll': 'poll', 'cfg-watch-sec': 'watch_sec', 'cfg-alert-gap': 'alert_gap',
+    };
+    for (const [id, key] of Object.entries(fieldLimits)) {
+      const input = document.getElementById(id);
+      const limits = j.config_limits?.[key];
+      if (input && limits) {
+        input.min = limits.minimum;
+        input.max = limits.maximum;
+      }
+    }
+    const active = j.active_runtime_settings || {};
+    const sources = active.sources || {};
+    const activeStatus = document.getElementById('cfg-active-status');
+    if (activeStatus) {
+      activeStatus.textContent = j.scanner_running && Object.keys(active).length
+        ? `Сейчас активно: банк ${Number(active.bank_usdt ?? j.bank).toFixed(2)} USDT (${sources.bank === 'cli' ? 'CLI override' : 'config/default'}), ROI ${Number(active.min_roi_pct ?? j.min_roi_pct).toFixed(2)}% (${sources.min_roi_pct === 'cli' ? 'CLI override' : 'config/default'}), обработка ${Number(active.poll_sec ?? j.poll)} с (${sources.poll === 'cli' ? 'CLI override' : 'config/default'}), каталог ${Number(active.watch_sec ?? j.watch_sec)} с (${sources.watch_sec === 'cli' ? 'CLI override' : 'config/default'}), повтор сигнала ${Number(active.alert_gap_sec ?? j.alert_gap)} с (${sources.alert_gap === 'cli' ? 'CLI override' : 'config/default'}). CLI override имеет приоритет над сохранённым значением.`
+        : 'Сканер не передаёт активные настройки. Значения сохранятся в config.json и применятся при запуске.';
+    }
+    const warningBox = document.getElementById('cfg-warning');
+    const warnings = Array.isArray(j.config_warnings) ? j.config_warnings : [];
+    if (warningBox) {
+      warningBox.textContent = warnings.join(' ');
+      warningBox.classList.toggle('hidden', warnings.length === 0);
+    }
     syncRuntimeControlsFromStatus(state.scanStatus);
   } catch (e) {}
   document.getElementById('modal-config').classList.remove('hidden');
 }
 function closeConfig() { document.getElementById('modal-config').classList.add('hidden'); }
 async function saveConfig() {
+  const limits = state.config.config_limits || {};
+  const fields = [
+    ['bank', 'cfg-bank'], ['safe_fork_threshold', 'cfg-safe'], ['poll', 'cfg-poll'],
+    ['watch_sec', 'cfg-watch-sec'], ['alert_gap', 'cfg-alert-gap'],
+  ];
+  const values = {};
+  for (const [key, id] of fields) {
+    const input = document.getElementById(id);
+    const value = Number(input?.value);
+    const bound = limits[key] || { minimum: Number(input?.min), maximum: Number(input?.max) };
+    if (!Number.isFinite(value) || value < bound.minimum || value > bound.maximum
+        || (['watch_sec', 'alert_gap'].includes(key) && !Number.isInteger(value))) {
+      toast(`${key}: значение вне допустимого диапазона`, true);
+      return;
+    }
+    values[key] = value;
+  }
   const payload = {
-    bank: parseFloat(document.getElementById('cfg-bank').value || '100'),
-    currency: 'USDT',
-    safe_fork_threshold: parseFloat(document.getElementById('cfg-safe').value || '0.45'),
+    ...values,
   };
-  if (await postRuntimeConfig(payload, 'Настройки сохранены')) {
+  const activeSources = state.config.active_runtime_settings?.sources || {};
+  const cliOverrides = Object.keys(payload).filter(key => activeSources[key] === 'cli');
+  const successMessage = cliOverrides.length
+    ? `Сохранено. Сейчас действует CLI override для: ${cliOverrides.join(', ')}; эти поля применятся без override.`
+    : 'Настройки сохранены';
+  if (await postRuntimeConfig(payload, successMessage)) {
     const bankInput = document.getElementById('risk-total-bank');
     if (bankInput) bankInput.value = Number(state.config.bank || 100).toFixed(2);
     updateBankLimit();
@@ -1542,14 +1620,19 @@ async function saveConfig() {
 async function saveMinRoi() {
   const input = document.getElementById('f-minroi');
   const value = Number(input?.value);
-  if (!Number.isFinite(value) || value < 0 || value > 100) {
-    toast('Минимальный ROI должен быть от 0 до 100%', true);
+  const limits = state.config.config_limits?.min_roi_pct || { minimum: 0, maximum: 100 };
+  if (!Number.isFinite(value) || value < limits.minimum || value > limits.maximum) {
+    toast(`Минимальный ROI должен быть от ${limits.minimum} до ${limits.maximum}%`, true);
     syncRuntimeControlsFromStatus(state.scanStatus);
     return;
   }
-  if (!await postRuntimeConfig(
-    { min_roi_pct: value }, `Порог ROI ${value}% передан сканеру`,
-  )) syncRuntimeControlsFromStatus(state.scanStatus);
+  const cliOverride = state.config.active_runtime_settings?.sources?.min_roi_pct === 'cli';
+  const message = cliOverride
+    ? `Порог ROI ${value}% сохранён; сейчас действует CLI override`
+    : `Порог ROI ${value}% передан сканеру`;
+  if (!await postRuntimeConfig({ min_roi_pct: value }, message)) {
+    syncRuntimeControlsFromStatus(state.scanStatus);
+  }
 }
 
 /* ============= EDIT MODAL ============= */
