@@ -1687,13 +1687,16 @@ function openBookmakerEvent() {
 }
 async function openPMUrl() {
   const a = getActive(); if (!a) return;
+  const openPolymarketEvent = (value) => {
+    const safeUrl = window.PolyArbProviderLinks?.polymarketEventUrl(
+      value, window.location.origin,
+    );
+    if (!safeUrl) throw new Error('Небезопасная ссылка на Polymarket');
+    window.open(safeUrl, '_blank', 'noopener,noreferrer');
+  };
   if (a.pm_event_url) {
     try {
-      const eventUrl = new URL(a.pm_event_url, window.location.origin);
-      if (eventUrl.protocol !== 'https:' || eventUrl.hostname !== 'polymarket.com') {
-        throw new Error('Небезопасная ссылка на Polymarket');
-      }
-      window.open(eventUrl.href, '_blank', 'noopener,noreferrer');
+      openPolymarketEvent(a.pm_event_url);
     } catch (e) {
       toast('Не удалось открыть страницу события Polymarket', true);
     }
@@ -1702,9 +1705,9 @@ async function openPMUrl() {
   try {
     const r = await fetch('/api/pm_url/' + encodeURIComponent(a.slug));
     const j = await r.json();
-    if (j.url) window.open(j.url, '_blank', 'noopener,noreferrer');
+    if (j.url) openPolymarketEvent(j.url);
     else toast('PM URL \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D', true);
-  } catch (e) { toast('\u041E\u0448\u0438\u0431\u043A\u0430: ' + e.message, true); }
+  } catch (e) { toast('Не удалось открыть страницу события Polymarket', true); }
 }
 function markFilled() {
   const a = getActive();

@@ -125,6 +125,29 @@ class OpportunityContractReplayTests(unittest.TestCase):
         )
         self.assertEqual(len(opportunity["id"]), len("opp_v1_") + 64)
 
+    def test_calculation_uses_aligned_stakes_and_depth_average_not_account_bank_or_best_ask(self):
+        snapshot = self.make_snapshot()
+        candidate = snapshot["arbs"][self.fixture["market_slug"]]
+        candidate["bank"] = 900.0
+        candidate["total_bank"] = 1000.0
+        pm_leg = candidate["bets"][0]
+        pm_leg["pm_best_ask"] = 0.83
+        pm_leg["pm_avg_ask"] = 0.84
+        pm_leg["o"] = 1.0 / (0.84 * 1.04)
+
+        result = normalize_scanner_snapshot(snapshot)
+        self.assertEqual(result["rejected"], [])
+        opportunity = result["opportunities"][0]
+        self.assertEqual(
+            [leg["stake"] for leg in opportunity["legs"]],
+            candidate["stakes"],
+        )
+        self.assertEqual(opportunity["calculation"]["total_stake"], 40.0)
+        self.assertEqual(opportunity["calculation"]["projected_profit"], 1.6)
+        self.assertEqual(opportunity["calculation"]["roi_fraction"], 0.04)
+        self.assertEqual(opportunity["legs"][0]["price"], 0.84)
+        self.assertEqual(opportunity["legs"][0]["price_unit"], "probability")
+
     def test_stale_quote_is_explicitly_marked_stale(self):
         result = normalize_scanner_snapshot(
             self.make_snapshot(bookmaker_age_delta=31.0)

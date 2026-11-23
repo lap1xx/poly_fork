@@ -52,6 +52,9 @@ jobs:
       - name: Check dashboard quote quality syntax
         run: node --check static/quote_quality.js
 
+      - name: Check provider link helper syntax
+        run: node --check static/provider_links.js
+
       - name: Test bankroll planner
         run: node tests/test_bankroll_plan.cjs
 
@@ -63,3 +66,6 @@ jobs:
 
       - name: Test normalized market display adapter
         run: node tests/test_market_display.cjs
+
+      - name: Test provider event URL safety
+        run: node tests/test_provider_links.cjs

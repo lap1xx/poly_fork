@@ -51,13 +51,14 @@
 - Python-нормализатор и контрактная replay-fixture уже добавлены; TypeScript-клиент и миграция UI/transport остаются отдельными будущими шагами.
 - JSON Schema валидируется `jsonschema` только в dev/CI-зависимостях; replay проверяет как допустимый экземпляр, так и отказ для PM-цены выше 1. Браузерный dual-read adapter принимает только v1-контракт с `mapping.status=accepted` и совпадающими slug/token; при несовпадении карточка остаётся на legacy fallback.
 - Первый шаг dual-read реализован для отображения списка/карточек: market, две ноги, расчётный ROI, возраст котировок и неактивный статус читаются из `opportunities_v1`. Сортировка/фильтры и UI-only метаданные остаются на `arbs`; детали, калькулятор, ссылки/действия, закреплённые снимки и журнал также остаются legacy. Headless Chromium parity test запускает реальную страницу и production UI JS с replay-парой, нормализованной через production `Opportunity` adapter; WS-снимок инъецируется управляемым shim, а backend transport отдельно покрыт `test_event_pipeline.py`. CI устанавливает Chromium и гоняет этот regression до расширения миграции.
-- Не выводить legacy `bets[].o` из PM probability и bookmaker odds: это effective-odds поле с отдельной fee-семантикой. До расчётной миграции уточнить также `bank`/`total_stake`, `pm_best_ask`/`pm_avg_ask`, `pm_target_shares` и раздельные PM/bookmaker event links.
+- Семантика legacy `bank`/`total_bank`/`stakes`/`roi`/`profit`, PM ask/target fields и provider-specific links сведена в [legacy field contract](legacy-field-semantics.md); описания соответствующих canonical schema fields уточнены без смены версии/структуры. Не выводить legacy `bets[].o` из PM probability и bookmaker odds: для PM это fee-adjusted effective multiplier, для bookmaker — decimal odds.
 
 ## Подтверждено владельцем
 
 - `web_app.py` остаётся каноническим backend текущего локального приложения.
 
-## Остаётся уточнить до миграции UI-клиента
+## Остаётся до расчётной/UI migration
 
-- Единицу расчётов в canonical record и связь расчётного USDT с ценой Polymarket, прежде чем UI будет использовать normalized calculation вместо legacy-полей.
+- Передвигать PM price/calc в UI только после отдельной multi-level-book replay проверки: сейчас `refine_stakes()` уточняет effective odds для рассчитанной PM allocation, но serialized `pm_avg_ask` и `pm_target_shares` остаются от исходного probe-размера; определить и публиковать однозначный price size-basis.
+- Перенести bookmaker/Polymarket links в leg-specific `event_url` только вместе с тестом source binding. PM direct/fallback open paths уже используют общий exact HTTPS origin/path validator, покрытый `tests/test_provider_links.cjs`.
 - План подключения Mini App к общей модели и API; до этого она остаётся вне текущего поддерживаемого deployment target.

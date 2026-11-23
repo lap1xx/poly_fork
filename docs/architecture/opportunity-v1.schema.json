@@ -93,16 +93,16 @@
         "source": {"type": "string", "minLength": 1, "maxLength": 80},
         "source_kind": {"enum": ["prediction_market", "bookmaker"]},
         "outcome": {"type": "string", "minLength": 1, "maxLength": 200},
-        "price": {"type": "number", "exclusiveMinimum": 0},
+        "price": {"type": "number", "exclusiveMinimum": 0, "description": "Observed price for this leg in the units declared by price_unit; a Polymarket probability is USDT-equivalent per share, while a bookmaker price is decimal odds."},
         "price_unit": {"enum": ["probability", "decimal_odds"]},
-        "stake": {"type": "number", "minimum": 0},
+        "stake": {"type": "number", "minimum": 0, "description": "Planned monetary allocation to this leg, denominated in currency; not the account-wide bankroll."},
         "currency": {"enum": ["USDT", "USD", "RUB"]},
         "observed_at": {"$ref": "#/$defs/dateTime"},
         "age_ms": {"type": "number", "minimum": 0},
         "timestamp_basis": {"enum": ["provider", "received_at"]},
         "provider_observed_at": {"oneOf": [{"$ref": "#/$defs/dateTime"}, {"type": "null"}]},
         "available_size": {"type": ["number", "null"], "minimum": 0},
-        "event_url": {"type": "string", "format": "uri", "maxLength": 2048}
+        "event_url": {"type": "string", "format": "uri", "maxLength": 2048, "description": "Optional provider-native event page for this leg only. Consumers must validate HTTPS and the exact allowlisted origin for source; never reuse another leg's URL."}
       }
     },
     "predictionMarketLeg": {
@@ -128,9 +128,9 @@
       "additionalProperties": false,
       "required": ["roi_fraction", "total_stake", "projected_profit", "currency", "fee_fraction", "model_version"],
       "properties": {
-        "roi_fraction": {"type": "number", "description": "Fraction, not percentage: 0.04 means 4%."},
-        "total_stake": {"type": "number", "minimum": 0},
-        "projected_profit": {"type": "number"},
+        "roi_fraction": {"type": "number", "description": "Dimensionless projected return fraction, not percentage: 0.04 means 4%; intended to equal projected_profit divided by total_stake under the declared calculation model."},
+        "total_stake": {"type": "number", "minimum": 0, "description": "Sum of legs[].stake in calculation.currency for this opportunity; not the user's account-wide bankroll or stake limit."},
+        "projected_profit": {"type": "number", "description": "Pre-execution modelled net profit in calculation.currency; not realized P&L and not a guarantee of fills or returns."},
         "currency": {"enum": ["USDT", "USD", "RUB"]},
         "fee_fraction": {"type": "number", "minimum": 0, "maximum": 1},
         "model_version": {"type": "string", "minLength": 1, "maxLength": 80}
