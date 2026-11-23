@@ -9,6 +9,7 @@ const state = {
   wsLastMessageAt: 0,
   wsState: 'connecting',
   arbs: [],          // все enriched arbs
+  opportunitiesBySlug: new Map(), // validated Opportunity v1 rows for list-card dual-read
   visible: [],       // после фильтров
   activeSlug: null,
   activeSnapshotId: null,
@@ -283,6 +284,9 @@ function connectWS() {
     }
     state.pinnedSignalSnapshots = Array.isArray(state.scanStatus?.pinned_signal_snapshots)
       ? state.scanStatus.pinned_signal_snapshots : [];
+    state.opportunitiesBySlug = window.PolyArbMarketDisplay
+      ? window.PolyArbMarketDisplay.indexOpportunities(msg.opportunities_v1)
+      : new Map();
     const newArbs = Array.isArray(msg.arbs) ? msg.arbs : [];
     let hasNew = false;
     for (const a of newArbs) {
@@ -644,6 +648,10 @@ function setCardMarkup(card, selector, markup, cacheKey) {
 }
 
 function updateArbCard(card, a) {
+  // Dual-read is presentation-only: filters and the selected detail/action path stay on legacy arbs.
+  const legacy = a;
+  const opportunity = state.opportunitiesBySlug.get(String(legacy.slug || ''));
+  a = window.PolyArbMarketDisplay.opportunityCardDisplay(opportunity, legacy) || legacy;
   const slug = String(a.slug || '');
   const legs = Array.isArray(a.bets) ? a.bets : [];
   const pmLeg = legs.find(l => l && l.source === 'Polymarket') || {};
@@ -677,6 +685,14 @@ function updateArbCard(card, a) {
     tags.push(`<span class="${ageClass}">${ageLabel}${a.source_state === 'stale' ? ' · УСТАРЕЛИ' : ''}</span>`);
   } else {
     tags.push('<span class="tag pm-age">СВЕЖЕСТЬ ?</span>');
+  }
+  const opportunityStatusLabels = {
+    stale: 'КОТИРОВКИ УСТАРЕЛИ',
+    suspended: 'ВОЗМОЖНОСТЬ ПРИОСТАНОВЛЕНА',
+    withdrawn: 'ВОЗМОЖНОСТЬ СНЯТА',
+  };
+  if (opportunityStatusLabels[a.opportunity_status]) {
+    tags.push(`<span class="tag pm-age">${opportunityStatusLabels[a.opportunity_status]}</span>`);
   }
   setCardMarkup(card, '.arb-tags', tags.join(''), '_renderedTags');
   setCardText(card, '.arb-market-value', window.PolyArbMarketDisplay.marketTypeLabel(a.market_type));

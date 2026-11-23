@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "PolyFork Opportunity v1",
-  "description": "Normalized read-only opportunity between one prediction-market leg and one bookmaker leg. This draft is not wired into runtime yet.",
+  "description": "Normalized read-only opportunity between one prediction-market leg and one bookmaker leg. Published additively by the canonical backend and consumed by the dashboard list-card dual-read.",
   "type": "object",
   "additionalProperties": false,
   "required": [

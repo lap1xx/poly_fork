@@ -1,6 +1,6 @@
 # ADR-001: Канонический backend и доменная модель сигнала
 
-- **Статус:** Accepted for the current backend choice; Draft 2020-12 schema and replay instances are validated in CI; broader client adoption remains pending.
+- **Статус:** Accepted for the current backend choice; Draft 2020-12 schema and replay instances are validated in CI; additive backend publication and the first dashboard list/card dual-read are implemented, broader client adoption remains pending.
 - **Дата:** 2026-11-23
 - **Контекст:** `polyarb_v4.py` — основной read-only сканер; `scanner_publisher.py` публикует полные snapshot-сообщения в локальный защищённый ingest `/ws/scanner`; `web_app.py` проверяет сигналы и обслуживает используемую локальную панель. README прямо называет `miniapp/` незавершённым прототипом, а `server/api_bridge.py` — необязательным мостом Mini App с отдельным монитором и отдельной схемой данных.
 
@@ -49,8 +49,8 @@
 
 - Снижается риск поддерживать две конкурирующие модели сигнала и два несогласованных backend-контура.
 - Python-нормализатор и контрактная replay-fixture уже добавлены; TypeScript-клиент и миграция UI/transport остаются отдельными будущими шагами.
-- JSON Schema валидируется `jsonschema` только в dev/CI-зависимостях; replay проверяет как допустимый экземпляр, так и отказ для PM-цены выше 1.
-- Следующий шаг: добавить в веб-клиент dual-read адаптер для read-only отображения `market`, двух `legs` и `calculation`, сохраняя `arbs` как fallback и источник UI-only метаданных. Первой мигрировать только список/карточку; фильтры, калькулятор, ссылки/действия, закреплённые снимки и журнал оставить на legacy-контрактах до паритетных тестов.
+- JSON Schema валидируется `jsonschema` только в dev/CI-зависимостях; replay проверяет как допустимый экземпляр, так и отказ для PM-цены выше 1. Браузерный dual-read adapter принимает только v1-контракт с `mapping.status=accepted` и совпадающими slug/token; при несовпадении карточка остаётся на legacy fallback.
+- Первый шаг dual-read реализован для отображения списка/карточек: market, две ноги, расчётный ROI, возраст котировок и неактивный статус читаются из `opportunities_v1`. Сортировка/фильтры и UI-only метаданные остаются на `arbs`; детали, калькулятор, ссылки/действия, закреплённые снимки и журнал также остаются legacy. Перед расширением миграции нужны визуальная проверка и parity-тесты на реальных snapshot-парах.
 - Не выводить legacy `bets[].o` из PM probability и bookmaker odds: это effective-odds поле с отдельной fee-семантикой. До расчётной миграции уточнить также `bank`/`total_stake`, `pm_best_ask`/`pm_avg_ask`, `pm_target_shares` и раздельные PM/bookmaker event links.
 
 ## Подтверждено владельцем
