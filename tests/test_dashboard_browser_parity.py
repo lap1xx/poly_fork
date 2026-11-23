@@ -283,6 +283,7 @@ class DashboardBrowserParityTests(unittest.TestCase):
                                 "document.querySelector('#risk-limit-label')?.textContent === '25% на один план'"
                             )
                             self.assertIn("10,00 USDT", page.locator("#risk-limit").inner_text())
+                            # Preserve the local compact-diagnostics intent through the accessible remote toggle.
                             scan_toggle = page.locator("#btn-scan-details")
                             self.assertEqual(scan_toggle.get_attribute("aria-expanded"), "false")
                             self.assertFalse(page.locator("#scan-health-details").is_visible())

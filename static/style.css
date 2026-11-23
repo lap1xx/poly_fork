@@ -510,6 +510,13 @@ h1{font-size:20px;line-height:1.2;margin:7px 0 0;letter-spacing:-.025em}
 .scan-health-top .eyebrow{font-size:8px;color:#9db1bf;margin-bottom:4px}
 .scan-health-top b{font-size:10px;color:#dce8ed}
 .scan-health-time{font:9px var(--mono);color:#a7b8c4;white-space:nowrap;padding-top:3px}
+.scan-health-details{margin-top:3px}
+.scan-health-details>summary{display:flex;align-items:center;gap:5px;padding:4px 1px 1px;color:#91a7b5;
+  font-size:8px;font-weight:800;letter-spacing:.08em;cursor:pointer;list-style:none}
+.scan-health-details>summary::-webkit-details-marker{display:none}
+.scan-health-details>summary::before{content:"+";font:700 11px var(--mono);color:var(--green)}
+.scan-health-details[open]>summary::before{content:"−"}
+.scan-health-details>summary:focus-visible{outline:2px solid rgba(112,232,183,.65);outline-offset:2px;border-radius:3px}
 .scan-health-kpis{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:5px;margin:10px 0 7px}
 .scan-health-kpis>div{display:flex;flex-direction:column;gap:2px;padding:6px 7px;background:#0b1722;border:1px solid #263a49;border-radius:6px}
 .scan-health-kpis b{font:700 12px var(--mono);color:var(--green)}
