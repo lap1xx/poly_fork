@@ -978,6 +978,53 @@ class CalculationTests(unittest.TestCase):
                 else:
                     polyarb_v4.BOOKS[token] = old
 
+    def test_refine_publishes_additive_pm_depth_price_and_size_context(self):
+        token = "unit-test-token-refined-depth"
+        now = time.time()
+        book = {
+            "bids": [(0.49, 10000.0)],
+            "asks": [(0.50, 20.0), (0.55, 10000.0)],
+            "ts": now,
+            "last_change": now,
+        }
+        with polyarb_v4.LOCK:
+            old = polyarb_v4.BOOKS.get(token)
+            polyarb_v4.BOOKS[token] = book
+        try:
+            initial_avg = (20.0 * 0.50 + 20.0 * 0.55) / 40.0
+            bets = [
+                {
+                    "source": "Polymarket", "token": token,
+                    "o": (1.0 / initial_avg) / (1.0 + polyarb_v4.PM_FEE_PCT),
+                    "c": 0.0, "s": 0.0,
+                    "pm_best_ask": 0.50, "pm_avg_ask": initial_avg,
+                    "pm_target_usd": 20.0, "pm_target_shares": 40.0,
+                },
+                {"source": "1win", "o": 3.0, "c": 0.0, "s": 0.0},
+            ]
+            result = polyarb_v4.compute(bets, 40.0)
+            refined = polyarb_v4.refine_stakes(bets, result, 1.0)
+            self.assertIsNotNone(refined)
+            self.assertEqual(bets[0]["pm_avg_ask"], initial_avg)
+            self.assertEqual(bets[0]["pm_target_shares"], 40.0)
+            self.assertGreater(bets[0]["pm_refined_avg_ask"], initial_avg)
+            self.assertGreater(bets[0]["pm_refined_shares"], 40.0)
+            self.assertAlmostEqual(
+                bets[0]["pm_refined_stake_usd"], refined["stakes"][0], places=2
+            )
+            serialized = polyarb_v4._serialize_candidate_bets(bets)
+            self.assertAlmostEqual(
+                serialized[0]["pm_refined_avg_ask"],
+                bets[0]["pm_refined_avg_ask"],
+            )
+            self.assertEqual(serialized[0]["pm_target_shares"], 40.0)
+        finally:
+            with polyarb_v4.LOCK:
+                if old is None:
+                    polyarb_v4.BOOKS.pop(token, None)
+                else:
+                    polyarb_v4.BOOKS[token] = old
+
     def test_refine_rejects_insufficient_book_depth(self):
         token = "unit-test-token-depth"
         book = {"bids": [(0.49, 0.001)], "asks": [(0.50, 0.001)],

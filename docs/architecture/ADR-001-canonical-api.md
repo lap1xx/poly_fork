@@ -59,6 +59,6 @@
 
 ## Остаётся до расчётной/UI migration
 
-- Передвигать PM price/calc в UI только после отдельной multi-level-book replay проверки: сейчас `refine_stakes()` уточняет effective odds для рассчитанной PM allocation, но serialized `pm_avg_ask` и `pm_target_shares` остаются от исходного probe-размера; определить и публиковать однозначный price size-basis.
-- Перенести bookmaker/Polymarket links в leg-specific `event_url` только вместе с тестом source binding. PM direct/fallback open paths уже используют общий exact HTTPS origin/path validator, покрытый `tests/test_provider_links.cjs`.
+- PM refined VWAP/size теперь публикуется аддитивно и имеет multi-level-book regression; до расчётной миграции ещё определить convergence behavior и доказать совпадение последнего quote iteration с возвращённой stake allocation.
+- Opportunity v1 теперь переносит legacy PM/bookmaker URL отдельно в соответствующую leg; сами action-кнопки остаются legacy. Перед их миграцией добавить source-bound link action tests. PM direct/fallback open paths уже используют общий exact HTTPS origin/path validator, покрытый `tests/test_provider_links.cjs`.
 - План подключения Mini App к общей модели и API; до этого она остаётся вне текущего поддерживаемого deployment target.

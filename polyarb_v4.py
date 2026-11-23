@@ -1234,6 +1234,11 @@ def refine_stakes(bets, result, rate):
             avg = walk_book(b.get("token", ""), shares)
             if not avg or avg <= 0:
                 return None
+            # Preserve the initial candidate-sizing probe fields, but publish
+            # the depth price/size used by this stake-refinement iteration.
+            b["pm_refined_avg_ask"] = float(avg)
+            b["pm_refined_shares"] = float(shares)
+            b["pm_refined_stake_usd"] = float(stake_usdt)
             # Both legs are denominated in USDT; a PM share costs its ask in
             # USDT-equivalent and pays one USDT per winning share.
             new_o = (1.0 / avg) / (1.0 + PM_FEE_PCT)
@@ -1995,6 +2000,9 @@ def _serialize_candidate_bets(bets):
             "pm_book_age_sec": bet.get("pm_book_age_sec"),
             "pm_target_usd": bet.get("pm_target_usd"),
             "pm_target_shares": bet.get("pm_target_shares"),
+            "pm_refined_avg_ask": bet.get("pm_refined_avg_ask"),
+            "pm_refined_shares": bet.get("pm_refined_shares"),
+            "pm_refined_stake_usd": bet.get("pm_refined_stake_usd"),
             "odds_age_sec": bet.get("odds_age_sec"),
         }
         for bet in bets

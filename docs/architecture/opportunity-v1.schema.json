@@ -111,6 +111,8 @@
         "source_kind": {"const": "prediction_market"},
         "price_unit": {"const": "probability"},
         "price": {"type": "number", "exclusiveMinimum": 0, "maximum": 1},
+        "price_basis": {"enum": ["top_of_book", "depth_average"], "description": "Identifies whether price is the observed top ask or an average across the order-book depth walk."},
+        "price_size_shares": {"type": ["number", "null"], "minimum": 0, "description": "Optional share quantity used to derive a depth-average price; informational sizing context, not an order or fill."},
         "token_id": {"type": "string", "minLength": 1, "maxLength": 256}
       },
       "required": ["token_id"]

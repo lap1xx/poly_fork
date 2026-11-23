@@ -170,9 +170,33 @@ def normalize_scanner_arb(
         source = str(raw.get("source") or "").strip()
         stake = _finite_number(stakes[index], f"stakes[{index}]", minimum=0.0)
         if source_kind == "prediction_market":
-            price_value = raw.get("pm_avg_ask")
-            if price_value is None:
+            refined_price = raw.get("pm_refined_avg_ask")
+            refined_shares = raw.get("pm_refined_shares")
+            try:
+                has_refined_depth = (
+                    float(refined_price) > 0.0 and float(refined_shares) > 0.0
+                )
+            except (TypeError, ValueError, OverflowError):
+                has_refined_depth = False
+            if has_refined_depth:
+                price_value = refined_price
+                price_basis = "depth_average"
+                price_size_shares = _finite_number(
+                    refined_shares, "prediction_market.refined_shares", minimum=0.0
+                )
+            elif raw.get("pm_avg_ask") is not None:
+                price_value = raw.get("pm_avg_ask")
+                price_basis = "depth_average"
+                raw_size = raw.get("pm_target_shares")
+                price_size_shares = (
+                    _finite_number(
+                        raw_size, "prediction_market.target_shares", minimum=0.0
+                    ) if raw_size is not None else None
+                )
+            else:
                 price_value = raw.get("pm_best_ask")
+                price_basis = "top_of_book"
+                price_size_shares = None
             price = _finite_number(price_value, "prediction_market.ask", minimum=0.0)
             if not 0.0 < price <= 1.0:
                 raise OpportunityNormalizationError(
@@ -184,6 +208,8 @@ def normalize_scanner_arb(
                 "outcome": outcome,
                 "price": price,
                 "price_unit": "probability",
+                "price_basis": price_basis,
+                "price_size_shares": price_size_shares,
                 "stake": stake,
                 "currency": currency,
                 "observed_at": _iso_utc(received_epoch),
@@ -209,6 +235,12 @@ def normalize_scanner_arb(
                 "timestamp_basis": "received_at",
                 "provider_observed_at": None,
             }
+        event_url_key = (
+            "pm_event_url" if source_kind == "prediction_market" else "bk_event_url"
+        )
+        event_url = arb.get(event_url_key)
+        if isinstance(event_url, str) and event_url.strip():
+            leg["event_url"] = event_url.strip()
         normalized_legs.append(leg)
 
     roi = _finite_number(arb.get("roi"), "roi")

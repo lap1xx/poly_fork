@@ -148,6 +148,30 @@ class OpportunityContractReplayTests(unittest.TestCase):
         self.assertEqual(opportunity["legs"][0]["price"], 0.84)
         self.assertEqual(opportunity["legs"][0]["price_unit"], "probability")
 
+    def test_refined_pm_quote_and_provider_links_are_attached_to_their_legs(self):
+        snapshot = self.make_snapshot()
+        candidate = snapshot["arbs"][self.fixture["market_slug"]]
+        candidate["pm_event_url"] = "https://polymarket.com/event/captured-market"
+        candidate["bk_event_url"] = "https://example-bookmaker.test/event/123"
+        pm_leg = candidate["bets"][0]
+        pm_leg["pm_refined_avg_ask"] = 0.845
+        pm_leg["pm_refined_shares"] = 46.0
+        pm_leg["pm_refined_stake_usd"] = 38.18
+
+        result = normalize_scanner_snapshot(snapshot)
+        self.assertEqual(result["rejected"], [])
+        pm, bookmaker = result["opportunities"][0]["legs"]
+        self.assertEqual(pm["price"], 0.845)
+        self.assertEqual(pm["price_basis"], "depth_average")
+        self.assertEqual(pm["price_size_shares"], 46.0)
+        self.assertEqual(
+            pm["event_url"], "https://polymarket.com/event/captured-market"
+        )
+        self.assertEqual(
+            bookmaker["event_url"], "https://example-bookmaker.test/event/123"
+        )
+        self.validator.validate(result["opportunities"][0])
+
     def test_stale_quote_is_explicitly_marked_stale(self):
         result = normalize_scanner_snapshot(
             self.make_snapshot(bookmaker_age_delta=31.0)
