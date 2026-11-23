@@ -102,6 +102,40 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(config["config_warnings"], status["config_warnings"])
         self.assertEqual(config["config_limits"]["poll"]["minimum"], 0.05)
 
+    def test_scanner_and_backend_config_expose_identical_runtime_limits(self):
+        with patch.dict("os.environ", {"ONEWIN_MAX_ODDS_AGE_SECONDS": "45"}):
+            scanner_limits = polyarb_v4.runtime_limits_payload()
+            backend_limits = web_app.runtime_limits_payload()
+            status = {
+                "state": "running", "ts": time.time(),
+                "runtime_limits": scanner_limits,
+            }
+            with TemporaryDirectory() as tmp:
+                config_path = Path(tmp) / "config.json"
+                config_path.write_text(json.dumps({"currency": "USDT", "bank": 100}),
+                                       encoding="utf-8")
+                with patch.object(web_app, "CONFIG_FILE", config_path), \
+                     patch.object(web_app, "_current_scanner_status", return_value=status):
+                    config = web_app._runtime_config_payload()
+        self.assertEqual(scanner_limits, backend_limits)
+        self.assertEqual(config["runtime_limits"], scanner_limits)
+        self.assertEqual(config["runtime_limits"]["freshness"]["onewin_odds_max_age_sec"], 45.0)
+        self.assertEqual(config["runtime_limits"]["freshness"]["onewin_odds_age_source"], "env")
+
+    def test_invalid_onewin_ttl_is_reported_by_backend_config_api(self):
+        with patch.dict("os.environ", {"ONEWIN_MAX_ODDS_AGE_SECONDS": "not-a-number"}):
+            with TemporaryDirectory() as tmp:
+                config_path = Path(tmp) / "config.json"
+                config_path.write_text(json.dumps({"currency": "USDT", "bank": 100}),
+                                       encoding="utf-8")
+                with patch.object(web_app, "CONFIG_FILE", config_path), \
+                     patch.object(web_app, "_current_scanner_status", return_value={}):
+                    config = web_app._runtime_config_payload()
+        self.assertEqual(config["runtime_limits"]["freshness"]["onewin_odds_max_age_sec"], 30.0)
+        self.assertEqual(config["runtime_limits"]["freshness"]["onewin_odds_age_source"], "default")
+        self.assertTrue(any("ONEWIN_MAX_ODDS_AGE_SECONDS" in warning
+                            for warning in config["config_warnings"]))
+
     def test_dashboard_rejects_empty_or_unknown_feed_selection(self):
         for selected in ([], ["unknown"]):
             with self.subTest(selected=selected), TemporaryDirectory() as tmp:

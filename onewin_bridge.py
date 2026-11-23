@@ -24,6 +24,7 @@ from difflib import SequenceMatcher
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from urllib.parse import quote, urlencode, urlsplit, urlunsplit
+from runtime_settings import resolve_onewin_odds_max_age
 
 try:
     import requests
@@ -63,12 +64,9 @@ TEAM_ALIASES_FILE = os.getenv(
     "ONEWIN_TEAM_ALIASES_FILE",
     os.path.join(os.path.dirname(__file__), "team_aliases.json"),
 )
-try:
-    ODDS_MAX_AGE_SECONDS = float(os.getenv("ONEWIN_MAX_ODDS_AGE_SECONDS", "30"))
-    if not math.isfinite(ODDS_MAX_AGE_SECONDS) or not 1.0 <= ODDS_MAX_AGE_SECONDS <= 600.0:
-        raise ValueError("outside allowed range")
-except (TypeError, ValueError):
-    ODDS_MAX_AGE_SECONDS = 30.0
+ODDS_MAX_AGE_SECONDS, ODDS_MAX_AGE_SOURCE, ODDS_CONFIG_WARNINGS = (
+    resolve_onewin_odds_max_age(os.getenv("ONEWIN_MAX_ODDS_AGE_SECONDS"))
+)
 
 PM_TO_ONEWIN_SPORT = {
     "cs2-": 142,

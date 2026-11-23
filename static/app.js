@@ -178,36 +178,43 @@ function toast(msg, err) {
   el._t = setTimeout(() => el.classList.add('hidden'), 2400);
 }
 
-/* The same saved USDT bank drives scanner stake sizes and the dashboard's 40% guide. */
+/* The saved USDT bank and read-only runtime risk fraction drive the plan guide. */
 function getTotalBank() {
   const input = document.getElementById('risk-total-bank');
   const bank = Number(state.config.bank ?? input?.value);
   return Number.isFinite(bank) && bank > 0 ? bank : null;
 }
 
+function getPlanCapFraction() {
+  const fraction = Number(state.config.runtime_limits?.safety?.bankroll_plan_fraction);
+  return Number.isFinite(fraction) && fraction >= 0 && fraction <= 1 ? fraction : 0.4;
+}
+function getPlanCapPercent() { return Math.round(getPlanCapFraction() * 100); }
+
 function getPlanCap() {
   const totalBank = getTotalBank();
-  return totalBank === null ? null : totalBank * 0.4;
+  return totalBank === null ? null : totalBank * getPlanCapFraction();
 }
 
 function updatePlanRiskNote(exposureUsdt) {
   const note = document.getElementById('hm-risk-note');
   if (!note) return;
   const cap = getPlanCap();
+  const capPercent = getPlanCapPercent();
   note.classList.remove('safe', 'warn');
   if (cap === null) {
-    note.textContent = 'Укажите общий банк в настройках, чтобы применить 40%-ориентир к плану.';
+    note.textContent = `Укажите общий банк в настройках, чтобы применить ${capPercent}%-ориентир к плану.`;
     return;
   }
   if (exposureUsdt > cap + 0.01) {
     note.classList.add('warn');
-    note.textContent = `План ${fmtMoney(exposureUsdt)} выше 40%-ориентира ${fmtMoney(cap)} на ${fmtMoney(exposureUsdt - cap)}. Проверьте риск вручную.`;
+    note.textContent = `План ${fmtMoney(exposureUsdt)} выше ${capPercent}%-ориентира ${fmtMoney(cap)} на ${fmtMoney(exposureUsdt - cap)}. Проверьте риск вручную.`;
   } else if (state.suggestedCapped) {
     note.classList.add('safe');
-    note.textContent = `Рекомендация уменьшена до 40%-ориентира (${fmtMoney(cap)}); перепроверьте глубину стакана для нового объёма.`;
+    note.textContent = `Рекомендация уменьшена до ${capPercent}%-ориентира (${fmtMoney(cap)}); перепроверьте глубину стакана для нового объёма.`;
   } else {
     note.classList.add('safe');
-    note.textContent = `План ${fmtMoney(exposureUsdt)} в пределах ориентира ${fmtMoney(cap)} на один план.`;
+    note.textContent = `План ${fmtMoney(exposureUsdt)} в пределах ${capPercent}%-ориентира ${fmtMoney(cap)} на один план.`;
   }
 }
 
@@ -216,7 +223,11 @@ function updateBankLimit() {
   const output = document.getElementById('risk-limit');
   if (!input || !output) return;
   const bank = getTotalBank();
-  output.textContent = bank !== null ? fmtMoney(bank * 0.4) : '—';
+  output.textContent = bank !== null ? fmtMoney(bank * getPlanCapFraction()) : '—';
+  const capLabel = document.getElementById('risk-limit-label');
+  if (capLabel) capLabel.textContent = `${getPlanCapPercent()}% на один план`;
+  const riskHint = document.getElementById('risk-hint');
+  if (riskHint) riskHint.textContent = `${getPlanCapPercent()}% — read-only ориентир суммы одного плана. Автоматических ставок нет.`;
   if (state.activeSlug) {
     if (!state.detailEdited) renderHowMuch(getActive());
     else recalcHowMuch();
@@ -474,6 +485,23 @@ function renderScanStatus() {
       `poll ${Number(effective.poll_sec ?? 0).toFixed(2)} с (${sourceLabel('poll')}) · ` +
       `каталог ${Number(effective.watch_sec ?? 0)} с (${sourceLabel('watch_sec')}) · ` +
       `повтор ${Number(effective.alert_gap_sec ?? 0)} с (${sourceLabel('alert_gap')})`
+    );
+  }
+  const runtimeLimits = status.runtime_limits || {};
+  const freshnessLimits = runtimeLimits.freshness || {};
+  const catalogLimits = runtimeLimits.catalog || {};
+  const safetyLimits = runtimeLimits.safety || {};
+  if (Object.keys(runtimeLimits).length) {
+    const oneWinAgeSource = freshnessLimits.onewin_odds_age_source === 'env'
+      ? 'переменная среды' : 'общий default';
+    reasons.unshift(
+      `Только чтение: PM TTL ${Number(freshnessLimits.polymarket_book_ttl_sec || 0)} с ` +
+      `(диагностика ${Number(freshnessLimits.polymarket_stale_diagnostic_sec || 0)} с), ` +
+      `источник stale после ${Number(freshnessLimits.dashboard_source_stale_sec || 0)} с · ` +
+      `1win TTL ${Number(freshnessLimits.onewin_odds_max_age_sec || 0)} с (${oneWinAgeSource}) · ` +
+      `Gamma ${Number(catalogLimits.gamma_events_per_page || 0)}/страницу × ${Number(catalogLimits.gamma_max_pages_per_query || 0)} страниц, ` +
+      `${Number(catalogLimits.gamma_retries_per_page || 0)} повтора, ${Number(catalogLimits.gamma_workers || 0)} workers · ` +
+      `риск-план ${Number(safetyLimits.bankroll_plan_pct || 0)}% банка`
     );
   }
   const configWarnings = Array.isArray(status.config_warnings) ? status.config_warnings : [];
@@ -1370,10 +1398,11 @@ function updateCalcHint() {
   }
   const cap = getPlanCap();
   const overCap = cap !== null && bank > cap + 0.01;
+  const capPercent = getPlanCapPercent();
   const riskText = cap === null
-    ? 'Общий банк не задан: контроль 40% не рассчитан.'
-    : overCap ? `ПРЕДУПРЕЖДЕНИЕ: выше 40%-ориентира ${fmtMoney(cap)}.`
-      : `В пределах 40%-ориентира ${fmtMoney(cap)} на один план.`;
+    ? `Общий банк не задан: контроль ${capPercent}% не рассчитан.`
+    : overCap ? `ПРЕДУПРЕЖДЕНИЕ: выше ${capPercent}%-ориентира ${fmtMoney(cap)}.`
+      : `В пределах ${capPercent}%-ориентира ${fmtMoney(cap)} на один план.`;
   const riskClass = overCap ? 'warn' : cap !== null ? 'safe' : '';
   hint.innerHTML = `Банк: <b>${fmtMoney(bank)}</b> · Профит: <b style="color:${profit >= 0 ? 'var(--green)' : 'var(--red)'}">${profit >= 0 ? '+' : ''}${fmtMoney(profit)}</b> · ROI: <b style="color:${roi >= 0 ? 'var(--green)' : 'var(--red)'}">${fmtPct(roi)}</b><br><span class="risk-inline ${riskClass}">${riskText}</span>`;
   hint.style.color = 'var(--txt)';
@@ -1578,6 +1607,16 @@ async function openConfig() {
     if (warningBox) {
       warningBox.textContent = warnings.join(' ');
       warningBox.classList.toggle('hidden', warnings.length === 0);
+    }
+    const runtimeLimits = j.runtime_limits || {};
+    const freshness = runtimeLimits.freshness || {};
+    const catalog = runtimeLimits.catalog || {};
+    const safety = runtimeLimits.safety || {};
+    const limitsBox = document.getElementById('cfg-runtime-limits');
+    if (limitsBox) {
+      const ageSource = freshness.onewin_odds_age_source === 'env'
+        ? 'переменная среды' : 'общий default';
+      limitsBox.textContent = `Фиксированные runtime-лимиты (только чтение): PM book TTL ${Number(freshness.polymarket_book_ttl_sec || 0)} с; диагностика устаревшего PM book ${Number(freshness.polymarket_stale_diagnostic_sec || 0)} с; 1win TTL ${Number(freshness.onewin_odds_max_age_sec || 0)} с (${ageSource}); stale-порог источника в панели ${Number(freshness.dashboard_source_stale_sec || 0)} с; Gamma ${Number(catalog.gamma_events_per_page || 0)} событий/страницу, максимум ${Number(catalog.gamma_max_pages_per_query || 0)} страниц/запрос, ${Number(catalog.gamma_retries_per_page || 0)} повторов, ${Number(catalog.gamma_workers || 0)} workers; safety cap плана ${Number(safety.bankroll_plan_pct || 0)}% банка. Это только отображение действующих лимитов, значения здесь не меняются.`;
     }
     syncRuntimeControlsFromStatus(state.scanStatus);
   } catch (e) {}

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 
 
 SETTING_SPECS = {
@@ -66,6 +67,23 @@ SETTING_SPECS = {
 
 DEFAULT_RUNTIME_SETTINGS = {
     name: spec["default"] for name, spec in SETTING_SPECS.items()
+}
+
+# Fixed operational limits are reported as read-only facts, not editable config.
+# Keep their existing values unchanged while exposing one source of truth.
+ONEWIN_ODDS_MAX_AGE_ENV = "ONEWIN_MAX_ODDS_AGE_SECONDS"
+ONEWIN_ODDS_MAX_AGE_MIN_SECONDS = 1.0
+ONEWIN_ODDS_MAX_AGE_MAX_SECONDS = 600.0
+ONEWIN_ODDS_MAX_AGE_DEFAULT_SECONDS = 30.0
+RUNTIME_LIMIT_DEFAULTS = {
+    "pm_book_ttl_sec": 30.0,
+    "pm_book_stale_diagnostic_sec": 15.0,
+    "dashboard_source_stale_sec": 10.0,
+    "gamma_page_limit": 100,
+    "gamma_max_pages_per_query": 50,
+    "gamma_retries_per_page": 3,
+    "gamma_workers": 7,
+    "bankroll_plan_fraction": 0.40,
 }
 
 CLI_OPTIONS = {
@@ -193,4 +211,54 @@ def settings_limits_payload():
         }
         for name, spec in SETTING_SPECS.items()
         if name != "roi_revision"
+    }
+
+
+def resolve_onewin_odds_max_age(raw_value):
+    """Resolve the existing env-only OneWin freshness setting with diagnostics."""
+    if raw_value is None:
+        return ONEWIN_ODDS_MAX_AGE_DEFAULT_SECONDS, "default", []
+    try:
+        if isinstance(raw_value, bool):
+            raise ValueError
+        number = float(raw_value)
+        if (not math.isfinite(number)
+                or not ONEWIN_ODDS_MAX_AGE_MIN_SECONDS <= number
+                <= ONEWIN_ODDS_MAX_AGE_MAX_SECONDS):
+            raise ValueError
+        return number, "env", []
+    except (TypeError, ValueError, OverflowError):
+        return ONEWIN_ODDS_MAX_AGE_DEFAULT_SECONDS, "default", [
+            f"{ONEWIN_ODDS_MAX_AGE_ENV} некорректен; допустимо "
+            f"{ONEWIN_ODDS_MAX_AGE_MIN_SECONDS:g}–"
+            f"{ONEWIN_ODDS_MAX_AGE_MAX_SECONDS:g} секунд. "
+            f"Используется default {ONEWIN_ODDS_MAX_AGE_DEFAULT_SECONDS:g} с."
+        ]
+
+
+def runtime_limits_payload():
+    """Return the current read-only freshness, catalog and safety limits."""
+    one_win_age, one_win_source, warnings = resolve_onewin_odds_max_age(
+        os.environ.get(ONEWIN_ODDS_MAX_AGE_ENV)
+    )
+    defaults = RUNTIME_LIMIT_DEFAULTS
+    return {
+        "freshness": {
+            "polymarket_book_ttl_sec": defaults["pm_book_ttl_sec"],
+            "polymarket_stale_diagnostic_sec": defaults["pm_book_stale_diagnostic_sec"],
+            "onewin_odds_max_age_sec": one_win_age,
+            "onewin_odds_age_source": one_win_source,
+            "dashboard_source_stale_sec": defaults["dashboard_source_stale_sec"],
+        },
+        "catalog": {
+            "gamma_events_per_page": defaults["gamma_page_limit"],
+            "gamma_max_pages_per_query": defaults["gamma_max_pages_per_query"],
+            "gamma_retries_per_page": defaults["gamma_retries_per_page"],
+            "gamma_workers": defaults["gamma_workers"],
+        },
+        "safety": {
+            "bankroll_plan_fraction": defaults["bankroll_plan_fraction"],
+            "bankroll_plan_pct": defaults["bankroll_plan_fraction"] * 100.0,
+        },
+        "warnings": warnings,
     }

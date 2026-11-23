@@ -28,7 +28,10 @@ from arb_invariants import is_pm_bookmaker_pair
 from opportunity import normalize_scanner_snapshot
 from pm_fees import fetch_fee_schedule, fee_per_share
 from runtime_settings import (
+    DEFAULT_RUNTIME_SETTINGS,
+    RUNTIME_LIMIT_DEFAULTS,
     normalize_runtime_settings,
+    runtime_limits_payload,
     settings_limits_payload,
     validate_setting,
 )
@@ -55,8 +58,8 @@ CONFIG_FILE = HERE / "config.json"
 GAMMA = "https://gamma-api.polymarket.com"
 CLOB = "https://clob.polymarket.com"
 FIRST_SEEN_TTL = 300.0
-DATA_STALE_SEC = 10.0
-SAFE_FORK_THRESHOLD = 0.45
+DATA_STALE_SEC = RUNTIME_LIMIT_DEFAULTS["dashboard_source_stale_sec"]
+SAFE_FORK_THRESHOLD = DEFAULT_RUNTIME_SETTINGS["safe_fork_threshold"]
 ALLOWED_ORIGINS = {"http://127.0.0.1:8080", "http://localhost:8080"}
 
 _clients: Set[WebSocket] = set()
@@ -223,6 +226,10 @@ def _runtime_config_payload():
     cfg["active_runtime_settings"] = (
         status.get("runtime_settings", {}) if running else {}
     )
+    cfg["runtime_limits"] = (
+        status.get("runtime_limits", cfg.get("runtime_limits", {}))
+        if running else cfg.get("runtime_limits", {})
+    )
     cfg["config_warnings"] = (
         status.get("config_warnings", cfg.get("config_warnings", []))
         if running else cfg.get("config_warnings", [])
@@ -273,6 +280,8 @@ def _load_config():
     settings, config_warnings, _legacy_migrated = normalize_runtime_settings(
         normalized_source
     )
+    runtime_limits = runtime_limits_payload()
+    config_warnings.extend(runtime_limits.get("warnings", []))
 
     sec = cfg.get("secondary_bk")
     if not isinstance(sec, dict):
@@ -300,6 +309,7 @@ def _load_config():
         "secondary_bk": sec,
         "config_warnings": config_warnings,
         "config_limits": settings_limits_payload(),
+        "runtime_limits": runtime_limits,
     }
 
 _load_hidden()
@@ -834,7 +844,9 @@ async def api_config_save(payload: dict):
         _save_json(CONFIG_FILE, cfg)
         result_config = _runtime_config_payload()
         if normalization_warnings:
-            result_config["config_warnings"] = normalization_warnings
+            result_config["config_warnings"] = list(
+                result_config.get("config_warnings", [])
+            ) + normalization_warnings
         return {"ok": True, "config": result_config}
     except Exception as e:
         return JSONResponse({"ok": False, "err": str(e)}, status_code=500)

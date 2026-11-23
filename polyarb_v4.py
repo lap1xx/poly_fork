@@ -37,9 +37,11 @@ from pm_fees import (
 )
 from runtime_settings import (
     DEFAULT_RUNTIME_SETTINGS,
+    RUNTIME_LIMIT_DEFAULTS,
     argparse_type as runtime_argparse_type,
     normalize_runtime_settings,
     resolve_setting,
+    runtime_limits_payload,
 )
 if sys.platform == "win32":
     os.system("")
@@ -91,18 +93,18 @@ WS_URL = WSS + "ws-subscriptions-clob" + DOT + "polymarket" + DOT + "com" + "/ws
 WS_PING_INTERVAL_SEC = 8.0
 MAX_STAKE_REFINEMENT_ITERATIONS = 5
 CBR_URL = HT + "www" + DOT + "cbr" + DOT + "ru" + "/scripts/XML_daily.asp"
-BANKROLL_PLAN_LIMIT = 0.40
+BANKROLL_PLAN_LIMIT = RUNTIME_LIMIT_DEFAULTS["bankroll_plan_fraction"]
 PINNED_SIGNAL_TTL_SEC = 300.0
 PINNED_SIGNAL_MIN_ROI = 0.05
 
 TIMEOUT = 15.0
 PM_CATALOG_TIMEOUT = (3.0, 5.0)
-PM_CATALOG_WORKERS = 7
+PM_CATALOG_WORKERS = RUNTIME_LIMIT_DEFAULTS["gamma_workers"]
 # Gamma currently returns at most 100 events per page and omits next_cursor
 # on terminal short pages, so use the observed page size as the safe boundary.
-PM_CATALOG_PAGE_LIMIT = 100
-PM_CATALOG_MAX_PAGES = 50
-PM_CATALOG_MAX_RETRIES = 3
+PM_CATALOG_PAGE_LIMIT = RUNTIME_LIMIT_DEFAULTS["gamma_page_limit"]
+PM_CATALOG_MAX_PAGES = RUNTIME_LIMIT_DEFAULTS["gamma_max_pages_per_query"]
+PM_CATALOG_MAX_RETRIES = RUNTIME_LIMIT_DEFAULTS["gamma_retries_per_page"]
 PM_CATALOG_RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
 PM_CATALOG_RETRY_BACKOFF_SEC = 0.25
 _PM_CATALOG_DIAGNOSTICS_LOCK = threading.Lock()
@@ -877,7 +879,7 @@ class Feed(threading.Thread):
             return
 
 
-BOOK_TTL = 30.0
+BOOK_TTL = RUNTIME_LIMIT_DEFAULTS["pm_book_ttl_sec"]
 SIGNAL_DROP_HISTORY_TTL_SEC = 300.0
 MAX_RECENT_SIGNAL_DROPS = 10
 
@@ -1001,7 +1003,7 @@ _PM_REFRESH_INFLIGHT = set()
 _PM_REFRESH_COOLDOWN = {}
 _PM_REFRESH_DIAGNOSTICS = {}
 _FRESH_MIN_INTERVAL = 20.0
-_STALE_THRESHOLD = 15.0
+_STALE_THRESHOLD = RUNTIME_LIMIT_DEFAULTS["pm_book_stale_diagnostic_sec"]
 
 
 def _fresh_pm_book(token_id, timeout=6.0):
@@ -2195,7 +2197,9 @@ def main():
         print("[!] --live is deprecated and ignored; event phase requires source evidence")
 
     cfg = load_cfg()
-    for warning in CONFIG_WARNINGS:
+    runtime_limits = runtime_limits_payload()
+    startup_warnings = list(CONFIG_WARNINGS) + list(runtime_limits.get("warnings", []))
+    for warning in startup_warnings:
         print("[!] Настройки: " + warning)
     bk  = load_bk()
     init_db()
@@ -2273,7 +2277,8 @@ def main():
                 "alert_gap_sec": alert_gap,
                 "sources": dict(runtime_setting_sources),
             },
-            "config_warnings": list(CONFIG_WARNINGS),
+            "runtime_limits": runtime_limits,
+            "config_warnings": list(CONFIG_WARNINGS) + list(runtime_limits.get("warnings", [])),
         })
 
     # ---------- BK bridge: 1win primary; BetBoom is a fallback ----------
@@ -2428,6 +2433,8 @@ def main():
         "pinned_signal_snapshots": [],
         "currency": "USDT",
         "min_roi_pct": round(min_roi * 100, 3),
+        "runtime_limits": runtime_limits,
+        "config_warnings": list(CONFIG_WARNINGS) + list(runtime_limits.get("warnings", [])),
     }
     _write_scan_status(last_scan_status)
 
@@ -3018,7 +3025,8 @@ def main():
                     "alert_gap_sec": alert_gap,
                     "sources": dict(runtime_setting_sources),
                 },
-                "config_warnings": list(CONFIG_WARNINGS),
+                "runtime_limits": runtime_limits,
+                "config_warnings": list(CONFIG_WARNINGS) + list(runtime_limits.get("warnings", [])),
             }
             if _now - last_status_write >= 1.0:
                 _write_scan_status(last_scan_status)
