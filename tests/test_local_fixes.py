@@ -1018,6 +1018,28 @@ class CalculationTests(unittest.TestCase):
                 bets[0]["pm_refined_avg_ask"],
             )
             self.assertEqual(serialized[0]["pm_target_shares"], 40.0)
+            refined_shares = bets[0]["pm_refined_shares"]
+            self.assertGreater(refined_shares, 20.0)
+            expected_vwap = (
+                20.0 * 0.50 + (refined_shares - 20.0) * 0.55
+            ) / refined_shares
+            expected_pm_multiplier = 1.0 / (
+                expected_vwap * (1.0 + polyarb_v4.PM_FEE_PCT)
+            )
+            inverse_sum = 1.0 / bets[0]["o"] + 1.0 / 3.0
+            expected_roi = 1.0 / inverse_sum - 1.0
+            expected_payout = 40.0 / inverse_sum
+            self.assertAlmostEqual(bets[0]["pm_refined_avg_ask"], expected_vwap, places=8)
+            self.assertLessEqual(
+                abs(bets[0]["o"] - expected_pm_multiplier) / expected_pm_multiplier,
+                0.0005,
+            )
+            self.assertAlmostEqual(refined["stakes"][0], 40.0 / bets[0]["o"] / inverse_sum, places=8)
+            self.assertAlmostEqual(refined["stakes"][1], 40.0 / 3.0 / inverse_sum, places=8)
+            self.assertAlmostEqual(refined["payout"], expected_payout, places=8)
+            self.assertAlmostEqual(refined["profit"], expected_payout - 40.0, places=8)
+            self.assertAlmostEqual(refined["roi"], expected_roi, places=10)
+            self.assertAlmostEqual(refined["roi"], refined["profit"] / 40.0, places=10)
         finally:
             with polyarb_v4.LOCK:
                 if old is None:

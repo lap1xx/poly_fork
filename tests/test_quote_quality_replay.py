@@ -246,6 +246,30 @@ class QuoteQualityReplayTests(unittest.TestCase):
         self.assertIsNotNone(without_fee)
         self.assertLess(with_fee["roi"], without_fee["roi"])
 
+    def test_captured_pm_quote_uses_fee_adjusted_multiplier_and_consistent_calculation(self):
+        bets, result = self._replay_pair("100 Thieves")
+        self.assertIsNotNone(result)
+        pm_leg = bets[0]
+        bookmaker_leg = bets[1]
+        captured_ask = self.pm_books["100 Thieves"]["asks"][0][0]
+        expected_pm_multiplier = 1.0 / (
+            captured_ask * (1.0 + polyarb_v4.PM_FEE_PCT)
+        )
+        expected_inverse_sum = (
+            1.0 / expected_pm_multiplier + 1.0 / bookmaker_leg["o"]
+        )
+        expected_roi = 1.0 / expected_inverse_sum - 1.0
+        expected_payout = self.fixture["planned_stake_usdt"] / expected_inverse_sum
+
+        self.assertAlmostEqual(pm_leg["pm_refined_avg_ask"], captured_ask, places=8)
+        self.assertAlmostEqual(pm_leg["o"], expected_pm_multiplier, places=8)
+        self.assertAlmostEqual(result["roi"], expected_roi, places=10)
+        self.assertAlmostEqual(result["payout"], expected_payout, places=8)
+        self.assertAlmostEqual(result["profit"], expected_payout - result["bank"], places=8)
+        self.assertAlmostEqual(result["roi"], result["profit"] / result["bank"], places=10)
+        self.assertAlmostEqual(sum(result["stakes"]), self.fixture["planned_stake_usdt"], places=8)
+        self.assertAlmostEqual(pm_leg["pm_refined_stake_usd"], result["stakes"][0], places=2)
+
     def test_insufficient_total_ask_depth_rejects_refinement_and_is_diagnosable(self):
         pm_book = self.pm_books["100 Thieves"]
         token = pm_book["token_id"]
