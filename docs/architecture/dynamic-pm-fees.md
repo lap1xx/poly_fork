@@ -2,7 +2,7 @@
 
 ## Источник и границы модели
 
-Сканер получает параметры taker fee для конкретного рынка из CLOB API `GET /markets/{condition_id}`. Источник `feeSchedule` содержит коэффициент `rate` и показатель `exponent`; `feesEnabled: false` означает рынок без комиссии. Данные кэшируются в общем модуле `pm_fees.py` на 300 секунд. Если schedule отсутствует, некорректен или недоступен, кандидат не рассчитывается как достоверная возможность: фиксированная ставка 4% не подставляется.
+Сканер получает параметры taker fee для конкретного рынка из CLOB API `GET /clob-markets/{condition_id}`. В текущем ответе параметры кривой находятся в `fd`: `r` — ставка, `e` — показатель степени, `to` — признак комиссии только для taker. Общий модуль `pm_fees.py` нормализует их в `rate` и `exponent`; данные кэшируются на 300 секунд. Для совместимости также поддерживается прежняя форма `feeSchedule`. Если параметры отсутствуют, некорректны или недоступны, кандидат не рассчитывается как достоверная возможность: фиксированная ставка 4% не подставляется.
 
 Для непрерывной оценки комиссии на уровне цены `p` применяется опубликованная кривая:
 
@@ -19,6 +19,6 @@ fee_per_share = rate * (p * (1 - p)) ** exponent
 ## Официальные источники
 
 - [Комиссии Polymarket](https://docs.polymarket.com/trading/fees) — зависимость комиссии от цены и числа долей, fee-free рынки и метод расчёта.
-- [CLOB API: Market Info](https://docs.polymarket.com/api-reference/markets/get-clob-market-info) — endpoint `GET /markets/{condition_id}` и поля market info.
+- [CLOB API: Market Info](https://docs.polymarket.com/api-reference/markets/get-clob-market-info) — endpoint `GET /clob-markets/{condition_id}` и схема `fd.r`, `fd.e`, `fd.to`.
 - [Миграция на CLOB API v2](https://docs.polymarket.com/v2-migration) — изменения торгового API и комиссионных параметров.
 - [Changelog: prediction market fees](https://docs.polymarket.com/changelog/predictions) — изменения комиссионной модели.

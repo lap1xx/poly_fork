@@ -20,6 +20,15 @@ def normalize_fee_schedule(payload):
     if not isinstance(payload, dict):
         return None
     schedule = payload.get("feeSchedule")
+    if not isinstance(schedule, dict):
+        # Current CLOB market-info response uses compact FeeDetails keys.
+        details = payload.get("fd")
+        if isinstance(details, dict):
+            schedule = {
+                "rate": details.get("r"),
+                "exponent": details.get("e"),
+                "takerOnly": details.get("to"),
+            }
     enabled = payload.get("feesEnabled")
     if enabled is not None and not isinstance(enabled, bool):
         return None
@@ -62,7 +71,7 @@ def fetch_fee_schedule(condition_id, *, now=None, force=False):
             return dict(cached["schedule"])
     try:
         response = requests.get(
-            CLOB_API + "/markets/" + quote(condition_id, safe=""),
+            CLOB_API + "/clob-markets/" + quote(condition_id, safe=""),
             timeout=PM_FEE_API_TIMEOUT,
         )
         response.raise_for_status()

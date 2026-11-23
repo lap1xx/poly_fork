@@ -17,10 +17,23 @@ class PMFeeScheduleTests(unittest.TestCase):
     def test_normalizes_enabled_market_fee_curve(self):
         self.assertEqual(
             pm_fees.normalize_fee_schedule({
-                "feesEnabled": True,
-                "feeSchedule": {"rate": "0.05", "exponent": "1", "takerOnly": True},
+                "fd": {"r": "0.05", "e": "1", "to": True},
             }),
             {"fees_enabled": True, "rate": 0.05, "exponent": 1.0,
+             "source": "clob_market_info"},
+        )
+
+    def test_normalizes_legacy_fee_schedule_and_zero_fee_curve(self):
+        self.assertEqual(
+            pm_fees.normalize_fee_schedule({
+                "feesEnabled": True,
+                "feeSchedule": {"rate": "0.05", "exponent": "1"},
+            })["rate"],
+            0.05,
+        )
+        self.assertEqual(
+            pm_fees.normalize_fee_schedule({"fd": {"r": 0, "e": 1, "to": True}}),
+            {"fees_enabled": False, "rate": 0.0, "exponent": 1.0,
              "source": "clob_market_info"},
         )
 
@@ -42,9 +55,9 @@ class PMFeeScheduleTests(unittest.TestCase):
     def test_invalid_or_conflicting_schedule_is_rejected(self):
         invalid = [
             {},
-            {"feesEnabled": True, "feeSchedule": {"rate": "bad", "exponent": 1}},
-            {"feesEnabled": True, "feeSchedule": {"rate": -0.1, "exponent": 1}},
-            {"feesEnabled": True, "feeSchedule": {"rate": 0.05, "exponent": 0}},
+            {"fd": {"r": "bad", "e": 1, "to": True}},
+            {"fd": {"r": -0.1, "e": 1, "to": True}},
+            {"fd": {"r": 0.05, "e": 0, "to": True}},
             {"feesEnabled": False, "feeSchedule": {"rate": 0.05, "exponent": 1}},
         ]
         for payload in invalid:
@@ -54,8 +67,7 @@ class PMFeeScheduleTests(unittest.TestCase):
     def test_fetches_market_info_and_uses_ttl_cache(self):
         response = Mock()
         response.json.return_value = {
-            "feesEnabled": True,
-            "feeSchedule": {"rate": 0.07, "exponent": 2},
+            "fd": {"r": 0.07, "e": 2, "to": True},
         }
         with patch.object(pm_fees.requests, "get", return_value=response) as get:
             first = polyarb_v4.fetch_pm_fee_schedule("condition-id", now=100.0)
@@ -63,7 +75,7 @@ class PMFeeScheduleTests(unittest.TestCase):
         self.assertEqual(first["rate"], 0.07)
         self.assertEqual(second["exponent"], 2.0)
         get.assert_called_once_with(
-            polyarb_v4.CLOB + "/markets/condition-id",
+            polyarb_v4.CLOB + "/clob-markets/condition-id",
             timeout=pm_fees.PM_FEE_API_TIMEOUT,
         )
         response.raise_for_status.assert_called_once()
@@ -71,13 +83,11 @@ class PMFeeScheduleTests(unittest.TestCase):
     def test_expired_cache_refetches_and_api_failure_is_not_cached(self):
         first_response = Mock()
         first_response.json.return_value = {
-            "feesEnabled": True,
-            "feeSchedule": {"rate": 0.05, "exponent": 1},
+            "fd": {"r": 0.05, "e": 1, "to": True},
         }
         second_response = Mock()
         second_response.json.return_value = {
-            "feesEnabled": True,
-            "feeSchedule": {"rate": 0.04, "exponent": 1},
+            "fd": {"r": 0.04, "e": 1, "to": True},
         }
         with patch.object(
             pm_fees.requests, "get",
