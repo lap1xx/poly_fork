@@ -269,6 +269,38 @@ class OneWinFeedTests(unittest.TestCase):
         self.assertEqual(health["fresh_open_quotes"], 1)
         self.assertEqual(health["stale_open_quotes"], 1)
 
+    def test_valid_price_message_uses_local_receipt_time_not_provider_timestamp(self):
+        self.stream.bind(self.slug, ["Team Alpha", "Team Bravo"])
+        self.stream._connected.set()
+        base = {
+            "matchId": 12345,
+            "isBaseOddsGroups": True,
+            "oddsGroups": [{
+                "id": "map3-winner", "name": "Map 3. Winner", "isBase": True,
+                "oddsList": [
+                    {"id": 11, "name": "Team Alpha", "cf": 1.91, "status": 1},
+                    {"id": 12, "name": "Team Bravo", "cf": 2.07, "status": 1},
+                ],
+            }],
+        }
+        repeated_price = {
+            "matchId": 12345,
+            "oddsGroups": [{
+                "id": "map3-winner", "name": "Map 3. Winner",
+                "oddsList": [{
+                    "id": 11, "name": "Team Alpha", "cf": 1.91,
+                    "status": 1, "timestamp": 1,
+                }],
+            }],
+        }
+        with patch.object(self.ow.time, "time", side_effect=[1000.0, 1010.0, 1012.0]):
+            self.stream._on_match_odds(base, snapshot=True)
+            self.stream._on_match_odds(repeated_price)
+            quote = self.stream.live_bc(self.slug)["Team Alpha"]
+
+        self.assertEqual(quote["o"], 1.91)
+        self.assertAlmostEqual(quote["age_sec"], 2.0)
+
     def test_ambiguous_duplicate_market_groups_fail_closed(self):
         self.stream.bind(self.slug, ["Team Alpha", "Team Bravo"])
         self.stream._connected.set()
