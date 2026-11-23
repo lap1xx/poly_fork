@@ -73,6 +73,10 @@ class OpportunityContractReplayTests(unittest.TestCase):
                             "o": 1.0 / (ask * 1.04),
                             "c": 0.0,
                             "s": 0.0,
+                            "pm_fee_enabled": True,
+                            "pm_fee_rate": 0.05,
+                            "pm_fee_exponent": 1.0,
+                            "pm_fee_source": "clob_market_info",
                             "pm_best_ask": ask,
                             "pm_avg_ask": ask,
                             "pm_book_age_sec": pm_age,
@@ -102,6 +106,11 @@ class OpportunityContractReplayTests(unittest.TestCase):
         self.assertEqual(opportunity["market"]["slug"], self.fixture["market_slug"])
         self.assertEqual(opportunity["calculation"]["roi_fraction"], 0.04)
         self.assertEqual(opportunity["calculation"]["currency"], "USDT")
+        self.assertEqual(
+            opportunity["calculation"]["pm_fee_schedule"],
+            {"enabled": True, "rate": 0.05, "exponent": 1.0,
+             "source": "clob_market_info"},
+        )
         self.assertEqual(
             [leg["source_kind"] for leg in opportunity["legs"]],
             ["prediction_market", "bookmaker"],
@@ -172,6 +181,15 @@ class OpportunityContractReplayTests(unittest.TestCase):
                 result = normalize_scanner_snapshot(snapshot)
                 self.assertEqual(result["opportunities"], [])
                 self.assertIn("must be < 1", result["rejected"][0]["reason"])
+
+    def test_missing_per_market_fee_schedule_is_rejected_instead_of_using_default(self):
+        snapshot = self.make_snapshot()
+        pm = snapshot["arbs"][self.fixture["market_slug"]]["bets"][0]
+        for key in ("pm_fee_enabled", "pm_fee_rate", "pm_fee_exponent", "pm_fee_source"):
+            pm.pop(key)
+        result = normalize_scanner_snapshot(snapshot)
+        self.assertEqual(result["opportunities"], [])
+        self.assertIn("trusted CLOB data", result["rejected"][0]["reason"])
 
     def test_refined_pm_quote_and_provider_links_are_attached_to_their_legs(self):
         snapshot = self.make_snapshot()

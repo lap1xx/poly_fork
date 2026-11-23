@@ -597,13 +597,18 @@ class PMBookRecoveryTests(unittest.TestCase):
                     "bids": [(0.48, 200.0)], "asks": [(0.50, 200.0)],
                     "ts": now, "last_change": now,
                 }
-        market = {"o": ["Yes", "No"], "t": self.tokens[:2]}
+        market = {"o": ["Yes", "No"], "t": self.tokens[:2],
+                  "condition_id": "test-condition"}
         with patch.object(polyarb_v4, "_maybe_refresh_stale", return_value=False):
-            pairs = polyarb_v4.build_arb_candidates(
-                market,
-                {"Yes": {"o": 2.0}, "No": {"o": 2.0}},
-                0.0,
-            )
+            with patch.object(polyarb_v4, "fetch_pm_fee_schedule", return_value={
+                "fees_enabled": True, "rate": 0.05, "exponent": 1.0,
+                "source": "clob_market_info",
+            }):
+                pairs = polyarb_v4.build_arb_candidates(
+                    market,
+                    {"Yes": {"o": 2.0}, "No": {"o": 2.0}},
+                    0.0,
+                )
         self.assertEqual(len(pairs), 2)
         self.assertTrue(all(pair[0]["pm_verified"] is False for pair in pairs))
         self.assertTrue(all(polyarb_v4._is_pm_bookmaker_pair(pair) for pair in pairs))
@@ -619,7 +624,8 @@ class PMBookRecoveryTests(unittest.TestCase):
             self.assertNotEqual(pm_leg["outcome"], bookmaker_leg["outcome"])
 
     def test_candidate_builder_rejects_polymarket_as_the_bookmaker_source(self):
-        market = {"o": ["Yes", "No"], "t": self.tokens[:2]}
+        market = {"o": ["Yes", "No"], "t": self.tokens[:2],
+                  "condition_id": "test-condition"}
         now = time.time()
         with polyarb_v4.LOCK:
             for token in self.tokens[:2]:
@@ -694,8 +700,13 @@ class PMBookRecoveryTests(unittest.TestCase):
 
     def test_no_ask_market_row_contains_market_outcome_and_book_state(self):
         details = []
-        market = {"slug": "event-winner", "o": ["Yes", "No"], "t": self.tokens[:2]}
-        with patch.object(polyarb_v4, "_maybe_refresh_stale", return_value=False):
+        market = {"slug": "event-winner", "o": ["Yes", "No"],
+                  "t": self.tokens[:2], "condition_id": "test-condition"}
+        with patch.object(polyarb_v4, "_maybe_refresh_stale", return_value=False), \
+             patch.object(polyarb_v4, "fetch_pm_fee_schedule", return_value={
+                 "fees_enabled": True, "rate": 0.05, "exponent": 1.0,
+                 "source": "clob_market_info",
+             }):
             pairs = polyarb_v4.build_arb_candidates(
                 market, {"Yes": {"o": 2.0}}, 0.0,
                 diagnostics={}, pm_diagnostics=details,
@@ -958,7 +969,8 @@ class CalculationTests(unittest.TestCase):
             polyarb_v4.BOOKS[token] = book
         try:
             base = [
-                {"source": "Polymarket", "token": token, "o": 2.0, "c": 0.0, "s": 0.0},
+                {"source": "Polymarket", "token": token, "o": 2.0, "c": 0.0, "s": 0.0,
+                 "pm_fee_rate": 0.05, "pm_fee_exponent": 1.0},
                 {"source": "Book", "o": 2.2, "c": 0.0, "s": 0.0},
             ]
             outputs = []
@@ -968,7 +980,7 @@ class CalculationTests(unittest.TestCase):
                 refined = polyarb_v4.refine_stakes(bets, initial, rate)
                 self.assertIsNotNone(refined)
                 outputs.append(bets[0]["o"])
-            expected = (1.0 / 0.50) / (1.0 + polyarb_v4.PM_FEE_PCT)
+            expected = 1.0 / (0.50 + polyarb_v4.pm_fee_per_share(0.50, 0.05, 1.0))
             self.assertAlmostEqual(outputs[0], expected, places=8)
             self.assertAlmostEqual(outputs[1], expected, places=8)
         finally:
@@ -995,8 +1007,11 @@ class CalculationTests(unittest.TestCase):
             bets = [
                 {
                     "source": "Polymarket", "token": token,
-                    "o": (1.0 / initial_avg) / (1.0 + polyarb_v4.PM_FEE_PCT),
+                    "o": 1.0 / (initial_avg + polyarb_v4.pm_fee_per_share(
+                        initial_avg, 0.05, 1.0
+                    )),
                     "c": 0.0, "s": 0.0,
+                    "pm_fee_rate": 0.05, "pm_fee_exponent": 1.0,
                     "pm_best_ask": 0.50, "pm_avg_ask": initial_avg,
                     "pm_target_usd": 20.0, "pm_target_shares": 40.0,
                 },
@@ -1023,8 +1038,10 @@ class CalculationTests(unittest.TestCase):
             expected_vwap = (
                 20.0 * 0.50 + (refined_shares - 20.0) * 0.55
             ) / refined_shares
-            expected_pm_multiplier = 1.0 / (
-                expected_vwap * (1.0 + polyarb_v4.PM_FEE_PCT)
+            expected_pm_multiplier = (
+                polyarb_v4.walk_book_with_fee(
+                    token, bets[0]["pm_refined_stake_usd"], 0.05, 1.0
+                )["effective_multiplier"]
             )
             inverse_sum = 1.0 / bets[0]["o"] + 1.0 / 3.0
             expected_roi = 1.0 / inverse_sum - 1.0
@@ -1071,18 +1088,23 @@ class CalculationTests(unittest.TestCase):
     def test_refine_rejects_nonconverged_allocation_at_iteration_limit(self):
         bets = [
             {"source": "Polymarket", "token": "unit-test-nonconverged",
-             "o": 2.0, "c": 0.0, "s": 0.0},
+             "o": 2.0, "c": 0.0, "s": 0.0,
+             "pm_fee_rate": 0.0, "pm_fee_exponent": 1.0},
             {"source": "Book", "o": 2.2, "c": 0.0, "s": 0.0},
         ]
         initial = polyarb_v4.compute(bets, 100.0)
-        changing_quotes = [0.50, 0.51, 0.52, 0.53, 0.54]
+        changing_quotes = [0.49, 0.51, 0.52, 0.53, 0.54]
         with patch.object(polyarb_v4, "best_ask", return_value=0.50), patch.object(
-            polyarb_v4, "walk_book", side_effect=changing_quotes
-        ) as walk_book:
+            polyarb_v4, "walk_book_with_fee",
+            side_effect=[{
+                "avg_price": price, "shares": 1.0, "fee": 0.0,
+                "total_cost": price, "effective_multiplier": 1.0 / price,
+            } for price in changing_quotes],
+        ) as fee_walk:
             refined = polyarb_v4.refine_stakes(bets, initial, 1.0)
 
         self.assertIsNone(refined)
-        self.assertEqual(walk_book.call_count,
+        self.assertEqual(fee_walk.call_count,
                          polyarb_v4.MAX_STAKE_REFINEMENT_ITERATIONS)
 
     def test_feed_token_set_updates_without_starting_network(self):

@@ -2,9 +2,9 @@
 """
 check_pm.py - Polymarket depth checker.
 
-Показывает реальную глубину PM-стакана для одного или нескольких слагов:
+Показывает read-only глубину PM-стакана для одного или нескольких слагов:
   best ask/bid, spread, средняя цена для ставок $20/$50/$100/$200,
-  кэф с учётом 4% PM-комиссии.
+  эффективный коэффициент с feeSchedule конкретного рынка.
 
 USAGE
     python check_pm.py cs2-mw-yaw-2026-09-26-game1
@@ -18,10 +18,10 @@ import os
 import sys
 import urllib.parse
 import urllib.request
+from pm_fees import fetch_fee_schedule, fee_per_share
 
 GAMMA = "https://gamma-api.polymarket.com"
 CLOB = "https://clob.polymarket.com"
-PM_FEE = 0.04
 BET_SIZES_USD = [20, 50, 100, 200, 500]
 
 def _get(url, params=None, timeout=15):
@@ -46,6 +46,7 @@ def fetch_market(slug):
         return None, f"parse error: {e}"
     return {
         "slug": m.get("slug"),
+        "condition_id": m.get("conditionId"),
         "q": m.get("question", ""),
         "outcomes": outcomes,
         "tokens": tokens,
@@ -85,35 +86,37 @@ def fetch_book(token_id):
     asks.sort(key=lambda z: z[0])
     return {"bids": bids, "asks": asks}, None
 
-def walk(levels, target_usd):
-    """Returns (avg_price, filled_usd, fully_filled) or (None, 0, False)."""
+def walk(levels, target_usd, schedule):
+    """Returns gross avg price, fee, effective odds, and fill status."""
     rem = target_usd
-    total = 0.0
-    spent = 0.0
+    shares = gross_cost = fee_total = 0.0
     for p, s in levels:
-        lvl_usd = p * s
-        take = min(rem, lvl_usd)
+        fee_ps = fee_per_share(p, schedule["rate"], schedule["exponent"])
+        if fee_ps is None:
+            return None
+        take = min(s, rem / (p + fee_ps))
         if take <= 0:
             continue
-        total += take / p
-        spent += take
-        rem -= take
-        if rem <= 1e-6:
+        shares += take
+        gross_cost += take * p
+        fee_total += take * fee_ps
+        rem -= take * (p + fee_ps)
+        if rem <= max(1e-8, target_usd * 1e-10):
             break
-    if total <= 0:
-        return None, 0.0, False
-    avg = spent / total
-    return avg, spent, rem <= 1e-6
+    if shares <= 0:
+        return None
+    total_cost = gross_cost + fee_total
+    return {
+        "avg_price": gross_cost / shares,
+        "fee": fee_total,
+        "odds_eff": shares / total_cost,
+        "filled": rem <= max(1e-8, target_usd * 1e-10),
+    }
 
 def fmt_odds(p):
     if not p or p <= 0:
         return "-"
     return f"{(1.0 / p):.4f}"
-
-def fmt_odds_fee(p):
-    if not p or p <= 0:
-        return "-"
-    return f"{(1.0 / p) / (1.0 + PM_FEE):.4f}"
 
 def check_slug(slug):
     print()
@@ -124,6 +127,12 @@ def check_slug(slug):
     if err:
         print(f"  [!] {err}")
         return
+    schedule = fetch_fee_schedule(m.get("condition_id"))
+    if schedule is None:
+        print("  [!] fee schedule unavailable from CLOB; fee-adjusted odds omitted")
+        return
+    print(f"  CLOB fee schedule: enabled={schedule['fees_enabled']} "
+          f"rate={schedule['rate']:g}, exponent={schedule['exponent']:g}")
     print(f"  {m['q'][:74]}")
     print(f"  closed={m['closed']}  accepting={m['accepting']}  "
           f"volume={m.get('volume')}  liquidity={m.get('liquidity')}")
@@ -154,16 +163,17 @@ def check_slug(slug):
         print(f"      bid depth: {len(bids)} levels, "
               f"total ${sum(p * s for p, s in bids):.0f}")
         print()
-        print(f"      {'size $':>8}  {'avg price':>10}  {'odds':>9}  "
-              f"{'odds -fee':>10}  {'filled':>8}")
+        print(f"      {'budget $':>8}  {'avg price':>10}  {'odds':>9}  "
+              f"{'odds -fee':>10}  {'fee est.':>9}  {'filled':>8}")
         for usd in BET_SIZES_USD:
-            avg, spent, full = walk(asks, usd)
-            if avg is None:
+            quote = walk(asks, usd, schedule)
+            if quote is None:
                 print(f"      {usd:>8}  {'-- no asks --':>10}")
                 continue
-            flag = "" if full else "  !partial"
-            print(f"      {usd:>8}  {avg:>10.4f}  {fmt_odds(avg):>9}  "
-                  f"{fmt_odds_fee(avg):>10}  {spent:>7.0f}{flag}")
+            flag = "" if quote["filled"] else "  !partial"
+            print(f"      {usd:>8}  {quote['avg_price']:>10.4f}  "
+                  f"{fmt_odds(quote['avg_price']):>9}  "
+                  f"{quote['odds_eff']:>10.4f}  {quote['fee']:>9.4f}  {flag}")
         print()
 
 def last_slugs_from_jsonl(path, n=3):

@@ -24,7 +24,7 @@ const state = {
   audioCtx: null,
   soundEnabled: localStorage.getItem('poly_arb_sound') !== 'off',
   config: {
-    rate: 1, bank: 100, currency: 'USDT', pm_fee_pct: 0.04,
+    rate: 1, bank: 100, currency: 'USDT',
     safe_fork_threshold: 0.45, min_roi_pct: 3,
     enabled_bk_sources: ['1win'], available_bk_sources: ['1win', 'BetBoom'],
   },
@@ -104,6 +104,35 @@ function fmtOdds(n) { return (Number(n) || 0).toFixed(3); }
 function fmtPct(n, sign = true) {
   const v = (Number(n) || 0) * 100;
   return (sign && v >= 0 ? '+' : '') + v.toFixed(2) + '%';
+}
+function normalizePmFeeSchedule(schedule) {
+  const enabled = schedule?.enabled ?? schedule?.fees_enabled;
+  if (!schedule || typeof enabled !== 'boolean'
+      || schedule.source !== 'clob_market_info') return null;
+  const rate = Number(schedule.rate);
+  const exponent = Number(schedule.exponent);
+  if (!Number.isFinite(rate) || rate < 0 || rate > 1
+      || !Number.isFinite(exponent) || exponent <= 0 || exponent > 10
+      || (!enabled && rate !== 0)) return null;
+  return { enabled, rate, exponent, source: schedule.source };
+}
+function getPmFeeSchedule(pmLeg) {
+  if (!pmLeg) return null;
+  return normalizePmFeeSchedule({
+    enabled: pmLeg.pm_fee_enabled,
+    rate: pmLeg.pm_fee_rate,
+    exponent: pmLeg.pm_fee_exponent,
+    source: pmLeg.pm_fee_source,
+  });
+}
+function pmFeePerShare(price, schedule) {
+  if (!schedule || !Number.isFinite(price) || price <= 0 || price >= 1) return null;
+  return schedule.enabled
+    ? schedule.rate * Math.pow(price * (1 - price), schedule.exponent) : 0;
+}
+function pmEffectiveOdds(price, schedule) {
+  const fee = pmFeePerShare(price, schedule);
+  return fee === null ? null : 1 / (price + fee);
 }
 function setLiveQuoteValue(element, value, scope) {
   if (!element) return;
@@ -1301,12 +1330,13 @@ function updateCalcHint() {
   const bkSt = parseFloat(document.getElementById('calc-bk-stake').value || '0');
   const pmP = parseFloat(document.getElementById('calc-pm-price').value || '0') / 100;
   const pmSt = parseFloat(document.getElementById('calc-pm-stake').value || '0');
-  const FEE = state.config.pm_fee_pct ?? 0.04;
-
-  const pmO = pmP > 0 ? (1 / pmP) / (1 + FEE) : 0;
+  const active = getActive();
+  const pmLeg = (active?.bets || []).find(leg => leg?.source === 'Polymarket');
+  const feeSchedule = getPmFeeSchedule(pmLeg);
+  const pmO = pmP > 0 ? pmEffectiveOdds(pmP, feeSchedule) : 0;
   const bank = bkSt + pmSt;
   const payBK = bkSt * bkO;
-  const payPM = pmSt * pmO;
+  const payPM = pmSt * (pmO || 0);
   const minPay = Math.min(payBK, payPM);
   const profit = minPay - bank;
   const roi = bank > 0 ? profit / bank : 0;
@@ -1315,6 +1345,11 @@ function updateCalcHint() {
   if (!(bkO > 1 && bkSt > 0 && pmP > 0 && pmP < 1 && pmSt > 0)) {
     hint.textContent = 'Укажи обе суммы в USDT, кэф БК и цену PM';
     hint.style.color = 'var(--dim)';
+    return;
+  }
+  if (pmO === null) {
+    hint.textContent = 'Расчёт PM недоступен: нет проверенного fee schedule этого рынка из CLOB API.';
+    hint.style.color = 'var(--red)';
     return;
   }
   const cap = getPlanCap();
@@ -1485,7 +1520,6 @@ async function openConfig() {
     const bankInput = document.getElementById('risk-total-bank');
     if (bankInput) bankInput.value = Number(j.bank || 100).toFixed(2);
     document.getElementById('cfg-bank').value = j.bank || 100;
-    document.getElementById('cfg-fee').value = ((j.pm_fee_pct ?? 0.04) * 100).toFixed(1);
     document.getElementById('cfg-safe').value = (j.safe_fork_threshold || 0.45);
     syncRuntimeControlsFromStatus(state.scanStatus);
   } catch (e) {}
@@ -1496,7 +1530,6 @@ async function saveConfig() {
   const payload = {
     bank: parseFloat(document.getElementById('cfg-bank').value || '100'),
     currency: 'USDT',
-    pm_fee_pct: parseFloat(document.getElementById('cfg-fee').value || '4') / 100,
     safe_fork_threshold: parseFloat(document.getElementById('cfg-safe').value || '0.45'),
   };
   if (await postRuntimeConfig(payload, 'Настройки сохранены')) {
@@ -1573,11 +1606,12 @@ function recalcEditor() {
   const bbSt = parseFloat(document.getElementById('ed-bb-stake').value || '0');
   const pmPrice = parseFloat(document.getElementById('ed-pm-price').value || '0') / 100;
   const pmUsd = parseFloat(document.getElementById('ed-pm-amount').value || '0');
-  const FEE = state.config.pm_fee_pct ?? 0.04;
-  const pmO = pmPrice > 0 ? (1 / pmPrice) / (1 + FEE) : 0;
+  const pmLeg = (a.bets || []).find(leg => leg?.source === 'Polymarket');
+  const feeSchedule = getPmFeeSchedule(pmLeg);
+  const pmO = pmPrice > 0 ? pmEffectiveOdds(pmPrice, feeSchedule) : 0;
   const bank = bbSt + pmUsd;
   const pay1 = bbSt * bbO;
-  const pay2 = pmUsd * pmO;
+  const pay2 = pmUsd * (pmO || 0);
   const minPay = Math.min(pay1, pay2);
   const profit = minPay - bank;
   const roi = bank > 0 ? profit / bank : 0;
@@ -1585,17 +1619,23 @@ function recalcEditor() {
   document.getElementById('ed-p1').textContent = (pay1 - bank >= 0 ? '+' : '') + fmtMoney(pay1 - bank);
   document.getElementById('ed-p2').textContent = (pay2 - bank >= 0 ? '+' : '') + fmtMoney(pay2 - bank);
   const roiEl = document.getElementById('ed-roi');
-  roiEl.textContent = fmtPct(roi);
-  roiEl.style.color = roi >= 0 ? 'var(--green)' : 'var(--red)';
+  const feeValid = pmO !== null;
+  roiEl.textContent = feeValid ? fmtPct(roi) : '—';
+  roiEl.style.color = feeValid ? (roi >= 0 ? 'var(--green)' : 'var(--red)') : 'var(--red)';
+  if (!feeValid) document.getElementById('ed-p1').textContent = 'Нет schedule комиссии CLOB';
   a._calc = {
     bb_odds: bbO, bb_stake_usdt: bbSt,
     pm_price: pmPrice, pm_amount_usdt: pmUsd, rate: 1.0,
-    bank, payout: minPay, profit, roi,
+    bank, payout: minPay, profit, roi, fee_valid: feeValid,
   };
 }
 
 async function saveTrade() {
   const a = state.editing  ; if (!a || !a._calc) return;
+  if (!a._calc.fee_valid) {
+    toast('Сделка не сохранена: нет проверенного fee schedule рынка', true);
+    return;
+  }
   const payload = {
     slug: a.slug, q: a.q, sport: a.sport, market_type: a.market_type,
     bank: a._calc.bank, profit: a._calc.profit, roi: a._calc.roi,
@@ -1638,15 +1678,29 @@ async function checkPM() {
   try {
     const r = await fetch('/api/pm_book/' + encodeURIComponent(a.slug) + '?size_usd=' + sizeUsd);
     const j = await r.json();
-    if (!j.ok) { body.innerHTML = '<div class="pm-check-err">' + escapeHtml(j.err || 'unknown') + '</div>'; return; }
+    if (!j.ok) {
+      const errText = j.err === 'fee_schedule_unavailable'
+        ? 'Нет проверенного расписания комиссии для этого рынка в CLOB API.'
+        : (j.err || 'Ошибка получения данных');
+      body.innerHTML = '<div class="pm-check-err">' + escapeHtml(errText) + '</div>';
+      return;
+    }
     const pmOutcome = document.getElementById('ed-pm-outcome').value;
     let book = j.books.find(b => (b.outcome || '').trim() === pmOutcome.trim());
     if (!book || !book.best_ask) { body.innerHTML = '<div class="pm-check-err">PM \u0441\u0442\u0430\u043A\u0430\u043D \u043F\u0443\u0441\u0442</div>'; return; }
     const ba = book.best_ask;
     const pmPrice = parseFloat(document.getElementById('ed-pm-price').value || '0') / 100;
-    const FEE = state.config.pm_fee_pct ?? 0.04;
-    const curOdds = pmPrice > 0 ? (1 / pmPrice) / (1 + FEE) : 0;
-    const liveOdds = (1 / ba) / (1 + FEE);
+    const schedule = normalizePmFeeSchedule(j.fee_schedule);
+    if (!schedule) {
+      body.innerHTML = '<div class="pm-check-err">CLOB вернул неполный или невалидный fee schedule</div>';
+      return;
+    }
+    const curOdds = pmEffectiveOdds(pmPrice, schedule);
+    const liveOdds = pmEffectiveOdds(ba, schedule);
+    if (curOdds === null || liveOdds === null) {
+      body.innerHTML = '<div class="pm-check-err">Нет проверенного fee schedule рынка</div>';
+      return;
+    }
     const diffPct = curOdds > 0 ? ((liveOdds - curOdds) / curOdds * 100) : 0;
     let verdict, cls;
     if (Math.abs(diffPct) < 1.0) { verdict = 'PM \u0441\u043E\u043E\u0442\u0432\u0435\u0442\u0441\u0442\u0432\u0443\u0435\u0442 \u0440\u0435\u0434\u0430\u043A\u0442\u043E\u0440\u0443'; cls = 'ok'; }
@@ -1660,7 +1714,7 @@ async function checkPM() {
           '<tr><td>' + escapeHtml(b.outcome || '') + '</td>' +
               '<td>' + (b.best_bid ? b.best_bid.toFixed(4) : '\u2014') + '</td>' +
               '<td>' + (b.best_ask ? b.best_ask.toFixed(4) : '\u2014') + '</td>' +
-              '<td>k=' + (b.best_ask ? ((1 / b.best_ask) / (1 + FEE)).toFixed(4) : '\u2014') + '</td>' +
+              '<td>k=' + (b.best_ask ? pmEffectiveOdds(b.best_ask, schedule).toFixed(4) : '\u2014') + '</td>' +
               '<td>' + Number(b.ask_depth_usd || 0).toFixed(2) + ' USDT</td></tr>'
         ).join('') + '</tbody>' +
       '</table>';

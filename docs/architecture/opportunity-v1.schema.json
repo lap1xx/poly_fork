@@ -131,13 +131,25 @@
     "calculation": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["roi_fraction", "total_stake", "projected_profit", "currency", "fee_fraction", "model_version"],
+      "required": ["roi_fraction", "total_stake", "projected_profit", "currency", "fee_fraction", "pm_fee_schedule", "model_version"],
       "properties": {
         "roi_fraction": {"type": "number", "description": "Dimensionless projected return fraction, not percentage: 0.04 means 4%; intended to equal projected_profit divided by total_stake under the declared calculation model."},
         "total_stake": {"type": "number", "minimum": 0, "description": "Sum of legs[].stake in calculation.currency for this opportunity; not the user's account-wide bankroll or stake limit."},
         "projected_profit": {"type": "number", "description": "Pre-execution modelled net profit in calculation.currency; not realized P&L and not a guarantee of fills or returns."},
         "currency": {"enum": ["USDT", "USD", "RUB"]},
-        "fee_fraction": {"type": "number", "minimum": 0, "maximum": 1},
+        "fee_fraction": {"type": "number", "minimum": 0, "maximum": 1, "description": "Compatibility alias for the market's feeSchedule.rate coefficient when enabled; not the effective percentage of stake paid as fees. Use pm_fee_schedule with price and exponent for fee estimates."},
+        "pm_fee_schedule": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "rate", "exponent", "source"],
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "rate": {"type": "number", "minimum": 0, "maximum": 1},
+            "exponent": {"type": "number", "exclusiveMinimum": 0, "maximum": 10},
+            "source": {"const": "clob_market_info"}
+          },
+          "description": "Per-market CLOB fee curve; estimated fee per share is rate * (p * (1-p)) ** exponent for taker fills."
+        },
         "model_version": {"type": "string", "minLength": 1, "maxLength": 80}
       }
     }

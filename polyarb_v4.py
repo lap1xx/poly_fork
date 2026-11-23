@@ -31,6 +31,10 @@ from event_dispatch import (
     resolve_dirty_slugs,
 )
 from event_phase import classify_event_phase
+from pm_fees import (
+    fetch_fee_schedule as fetch_pm_fee_schedule,
+    fee_per_share as pm_fee_per_share,
+)
 if sys.platform == "win32":
     os.system("")
 
@@ -76,9 +80,9 @@ DOT = chr(46)
 HT = "https" + COLON + SLASH + SLASH
 WSS = "wss" + COLON + SLASH + SLASH
 GAMMA = HT + "gamma-api" + DOT + "polymarket" + DOT + "com"
+CLOB = HT + "clob" + DOT + "polymarket" + DOT + "com"
 WS_URL = WSS + "ws-subscriptions-clob" + DOT + "polymarket" + DOT + "com" + "/ws/market"
 WS_PING_INTERVAL_SEC = 8.0
-PM_FEE_PCT = 0.04
 MAX_STAKE_REFINEMENT_ITERATIONS = 5
 CBR_URL = HT + "www" + DOT + "cbr" + DOT + "ru" + "/scripts/XML_daily.asp"
 BANKROLL_PLAN_LIMIT = 0.40
@@ -912,6 +916,64 @@ def walk_book(aid, target):
     return total / target
 
 
+def walk_book_with_fee(aid, target_cost, rate, exponent):
+    """Walk asks by total cash cost, including per-market taker fees.
+
+    The CLOB formula is shares * rate * (p * (1-p)) ** exponent. Rounding and
+    minimum-fee behavior are left as execution-time uncertainty; this is a
+    continuous, read-only estimate for scanner ranking.
+    """
+    try:
+        target_cost = float(target_cost)
+        rate = float(rate)
+        exponent = float(exponent)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if (not all(math.isfinite(x) for x in (target_cost, rate, exponent))
+            or target_cost <= 0.0 or rate < 0.0 or exponent <= 0.0):
+        return None
+    with LOCK:
+        book = BOOKS.get(aid)
+        if not book:
+            return None
+        ts = book.get("ts", 0.0)
+        if ts <= 0 or (time.time() - ts) > BOOK_TTL:
+            return None
+        levels = list(book.get("asks") or [])
+    remaining_cost = target_cost
+    shares = gross_cost = fee_total = 0.0
+    for price, available_shares in levels:
+        try:
+            price, available_shares = float(price), float(available_shares)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if not (0.0 < price < 1.0) or available_shares <= 0.0:
+            continue
+        fee_ps = pm_fee_per_share(price, rate, exponent)
+        if fee_ps is None:
+            return None
+        cash_per_share = price + fee_ps
+        take = min(available_shares, remaining_cost / cash_per_share)
+        if take <= 0.0:
+            continue
+        gross_cost += take * price
+        fee_total += take * fee_ps
+        shares += take
+        remaining_cost -= take * cash_per_share
+        if remaining_cost <= max(1e-8, target_cost * 1e-10):
+            break
+    if shares <= 0.0 or remaining_cost > max(1e-8, target_cost * 1e-10):
+        return None
+    total_cost = gross_cost + fee_total
+    return {
+        "avg_price": gross_cost / shares,
+        "shares": shares,
+        "fee": fee_total,
+        "total_cost": total_cost,
+        "effective_multiplier": shares / total_cost,
+    }
+
+
 def pm_age_sec(aid):
     with LOCK:
         b = BOOKS.get(aid)
@@ -1231,10 +1293,18 @@ def refine_stakes(bets, result, rate):
             ba = best_ask(b.get("token", ""))
             if ba <= 0:
                 return None
-            shares = stake_usdt / ba
-            avg = walk_book(b.get("token", ""), shares)
-            if not avg or avg <= 0:
+            try:
+                fee_rate = float(b["pm_fee_rate"])
+                fee_exponent = float(b["pm_fee_exponent"])
+            except (KeyError, TypeError, ValueError, OverflowError):
                 return None
+            depth_quote = walk_book_with_fee(
+                b.get("token", ""), stake_usdt, fee_rate, fee_exponent
+            )
+            if not depth_quote:
+                return None
+            avg = depth_quote["avg_price"]
+            shares = depth_quote["shares"]
             # Preserve the initial candidate-sizing probe fields, but publish
             # the depth price/size used by this stake-refinement iteration.
             b["pm_refined_avg_ask"] = float(avg)
@@ -1242,7 +1312,8 @@ def refine_stakes(bets, result, rate):
             b["pm_refined_stake_usd"] = float(stake_usdt)
             # Both legs are denominated in USDT; a PM share costs its ask in
             # USDT-equivalent and pays one USDT per winning share.
-            new_o = (1.0 / avg) / (1.0 + PM_FEE_PCT)
+            b["pm_fee_estimated_usd"] = depth_quote["fee"]
+            new_o = depth_quote["effective_multiplier"]
             if abs(new_o - b["o"]) / b["o"] > 0.0005:
                 b["o"] = new_o
                 changed = True
@@ -1273,6 +1344,7 @@ def fetch_market(slug):
         phase = classify_event_phase(m)
         return {
             "slug": m["slug"],
+            "condition_id": m.get("conditionId"),
             "q": m.get("question", ""),
             "o": json.loads(m["outcomes"]),
             "t": json.loads(m["clobTokenIds"]),
@@ -1577,7 +1649,8 @@ def fetch_live_pm_markets(with_status=False):
                     start = (market.get("eventStartTime") or event.get("startTime") or "")
                     phase = classify_event_phase(market, event)
                     out[slug] = {
-                        "slug": slug, "q": market.get("question", ""),
+                        "slug": slug, "condition_id": market.get("conditionId"),
+                        "q": market.get("question", ""),
                         "o": outcomes, "t": tokens, "start": start,
                         "phase": phase,
                         "_phase_classified": True,
@@ -1786,6 +1859,13 @@ def build_arb_candidates(m, live_bc, slip, bank=0.0, rate=0.0,
         note("invalid_market_or_no_quotes")
         return []
 
+    fee_schedule = fetch_pm_fee_schedule(m.get("condition_id"))
+    if fee_schedule is None:
+        note("pm_fee_unavailable")
+        return []
+    pm_fee_rate = fee_schedule["rate"]
+    pm_fee_exponent = fee_schedule["exponent"]
+
     usd_target = 50.0
     try:
         if bank and bank > 0:
@@ -1811,11 +1891,13 @@ def build_arb_candidates(m, live_bc, slip, bank=0.0, rate=0.0,
                 row.update(pm_book_diagnostic(pm_t[i]))
                 pm_diagnostics.append(row)
             return []
-        shares = usd_target / ba
-        avg = walk_book(pm_t[i], shares)
-        if not avg or avg <= 0:
+        depth_quote = walk_book_with_fee(
+            pm_t[i], usd_target, pm_fee_rate, pm_fee_exponent
+        )
+        if not depth_quote:
             note("pm_depth_short")
             return []
+        avg = depth_quote["avg_price"]
         if avg > ba * 1.05:
             note("pm_impact_rejected")
             return []
@@ -1823,17 +1905,22 @@ def build_arb_candidates(m, live_bc, slip, bank=0.0, rate=0.0,
         pm_legs.append({
             "source": "Polymarket",
             "outcome": oc,
-            "o": (1.0 / avg) / (1.0 + PM_FEE_PCT),
+            "o": depth_quote["effective_multiplier"],
             "c": 0.0,
             "s": slip,
             "token": pm_t[i],
+            "pm_fee_enabled": fee_schedule["fees_enabled"],
+            "pm_fee_rate": pm_fee_rate,
+            "pm_fee_exponent": pm_fee_exponent,
+            "pm_fee_source": fee_schedule["source"],
+            "pm_fee_estimated_usd": depth_quote["fee"],
             "pm_best_ask": ba,
             "pm_best_bid": best_bid(pm_t[i]),
             "pm_avg_ask": avg,
             "pm_age": pm_book_age,
             "pm_book_age_sec": pm_book_age,
             "pm_target_usd": usd_target,
-            "pm_target_shares": shares,
+            "pm_target_shares": depth_quote["shares"],
             "pm_verified": pm_refresh_attempted(pm_t[i]),
         })
 
@@ -1998,6 +2085,11 @@ def _serialize_candidate_bets(bets):
             "o": float(bet.get("o") or 0),
             "c": float(bet.get("c") or 0),
             "s": float(bet.get("s") or 0),
+            "pm_fee_enabled": bet.get("pm_fee_enabled"),
+            "pm_fee_rate": bet.get("pm_fee_rate"),
+            "pm_fee_exponent": bet.get("pm_fee_exponent"),
+            "pm_fee_source": bet.get("pm_fee_source"),
+            "pm_fee_estimated_usd": bet.get("pm_fee_estimated_usd"),
             "pm_age": bet.get("pm_age"),
             "pm_best_ask": bet.get("pm_best_ask"),
             "pm_best_bid": bet.get("pm_best_bid"),

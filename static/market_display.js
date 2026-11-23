@@ -103,6 +103,7 @@
       if (isPm && String(legacyLeg.token || '') !== String(leg.token_id)) return null;
       const quoteAgeSec = leg.age_ms / 1000;
       const effectiveOdds = isPm ? legacyLeg.o : leg.price;
+      const pmFeeSchedule = opportunity.calculation.pm_fee_schedule;
       if (typeof effectiveOdds !== 'number' || !Number.isFinite(effectiveOdds)) return null;
 
       displayLegs.push({
@@ -114,6 +115,10 @@
         pm_avg_ask: isPm ? leg.price : undefined,
         pm_book_age_sec: isPm ? quoteAgeSec : undefined,
         pm_age: isPm ? quoteAgeSec : undefined,
+        pm_fee_enabled: isPm && pmFeeSchedule ? pmFeeSchedule.enabled : undefined,
+        pm_fee_rate: isPm && pmFeeSchedule ? pmFeeSchedule.rate : undefined,
+        pm_fee_exponent: isPm && pmFeeSchedule ? pmFeeSchedule.exponent : undefined,
+        pm_fee_source: isPm && pmFeeSchedule ? pmFeeSchedule.source : undefined,
         odds_age_sec: isPm ? undefined : quoteAgeSec,
         event_url: typeof leg.event_url === 'string' ? leg.event_url : undefined,
       });

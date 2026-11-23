@@ -120,7 +120,7 @@ def _load_config():
         "rate": rate,
         "bank": bank,
         "poll": poll,
-        "pm_fee_pct": float(cfg.get("pm_fee_pct", PM_FEE) or PM_FEE),
+        # Комиссия Polymarket загружается для каждого рынка из CLOB feeSchedule.
         "safe_fork_threshold": float(
             cfg.get("safe_fork_threshold", SAFE_FORK_THRESHOLD) or SAFE_FORK_THRESHOLD
         ),

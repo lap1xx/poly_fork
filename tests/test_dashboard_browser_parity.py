@@ -70,6 +70,10 @@ def make_ui_snapshot_pair(action_link_mode: str = "v1") -> dict:
                 "pm_book_age_sec": 7.2,
                 "c": 0.0,
                 "s": 0.0,
+                "pm_fee_enabled": True,
+                "pm_fee_rate": 0.05,
+                "pm_fee_exponent": 1.0,
+                "pm_fee_source": "clob_market_info",
             },
             {
                 "source": "1win",

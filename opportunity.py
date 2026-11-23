@@ -19,11 +19,6 @@ DEFAULT_MAX_AGE_SECONDS = {
     "prediction_market": 30.0,
     "bookmaker": 30.0,
 }
-# The current scanner model applies a 4% PM fee when it builds effective odds.
-# Keep this explicit until the scanner publishes the fee used per calculation.
-DEFAULT_PM_FEE_FRACTION = 0.04
-
-
 class OpportunityNormalizationError(ValueError):
     """Raised when a legacy scanner candidate cannot form a valid domain row."""
 
@@ -85,7 +80,6 @@ def normalize_scanner_arb(
     *,
     now_epoch: float | None = None,
     max_age_seconds: Mapping[str, float] | None = None,
-    pm_fee_fraction: float = DEFAULT_PM_FEE_FRACTION,
 ) -> dict[str, Any]:
     """Convert one current `polyarb_v4` candidate to the normalized domain model.
 
@@ -122,6 +116,18 @@ def normalize_scanner_arb(
     bookmaker_index = 1 - pm_index
     raw_pm = bets[pm_index]
     raw_bookmaker = bets[bookmaker_index]
+    fee_enabled = raw_pm.get("pm_fee_enabled")
+    fee_source = raw_pm.get("pm_fee_source")
+    if not isinstance(fee_enabled, bool) or fee_source != "clob_market_info":
+        raise OpportunityNormalizationError("pm_fee_schedule: missing trusted CLOB data")
+    fee_rate = _finite_number(raw_pm.get("pm_fee_rate"), "pm_fee_rate", minimum=0.0)
+    fee_exponent = _finite_number(
+        raw_pm.get("pm_fee_exponent"), "pm_fee_exponent", minimum=0.0
+    )
+    if fee_rate > 1.0 or fee_exponent <= 0.0 or fee_exponent > 10.0:
+        raise OpportunityNormalizationError("pm_fee_schedule: parameters out of range")
+    if not fee_enabled and fee_rate != 0.0:
+        raise OpportunityNormalizationError("pm_fee_schedule: disabled schedule has nonzero rate")
     declared_bookmaker = str(arb.get("bk_source") or "").strip().casefold()
     actual_bookmaker = str(raw_bookmaker.get("source") or "").strip().casefold()
     if declared_bookmaker and declared_bookmaker != actual_bookmaker:
@@ -272,10 +278,7 @@ def normalize_scanner_arb(
     roi = _finite_number(arb.get("roi"), "roi")
     total_stake = sum(leg["stake"] for leg in normalized_legs)
     profit = _finite_number(arb.get("profit"), "profit")
-    fee = _finite_number(arb.get("pm_fee_fraction", pm_fee_fraction),
-                         "pm_fee_fraction", minimum=0.0)
-    if fee > 1.0:
-        raise OpportunityNormalizationError("pm_fee_fraction: must be <= 1")
+    fee = fee_rate if fee_enabled else 0.0
 
     confidence = None
     binding = arb.get("bk_binding")
@@ -320,6 +323,12 @@ def normalize_scanner_arb(
             "projected_profit": profit,
             "currency": currency,
             "fee_fraction": fee,
+            "pm_fee_schedule": {
+                "enabled": fee_enabled,
+                "rate": fee_rate,
+                "exponent": fee_exponent,
+                "source": fee_source,
+            },
             "model_version": "polyarb_v4-effective-odds",
         },
         "diagnostics": [],

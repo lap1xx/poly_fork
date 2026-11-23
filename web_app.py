@@ -26,6 +26,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from arb_invariants import is_pm_bookmaker_pair
 from opportunity import normalize_scanner_snapshot
+from pm_fees import fetch_fee_schedule, fee_per_share
 
 try:
     import price_history
@@ -48,7 +49,6 @@ CONFIG_FILE = HERE / "config.json"
 
 GAMMA = "https://gamma-api.polymarket.com"
 CLOB = "https://clob.polymarket.com"
-PM_FEE = 0.04
 FIRST_SEEN_TTL = 300.0
 DATA_STALE_SEC = 10.0
 SAFE_FORK_THRESHOLD = 0.45
@@ -268,9 +268,6 @@ def _load_config():
         sec.setdefault("name", "1win")
         sec.setdefault("color", "#ff5a5a")
 
-    pm_fee_pct = _finite_number(cfg.get("pm_fee_pct", PM_FEE), 0.0, 1.0)
-    if pm_fee_pct is None:
-        pm_fee_pct = PM_FEE
     safe_threshold = _finite_number(
         cfg.get("safe_fork_threshold", SAFE_FORK_THRESHOLD), 0.01, 0.99
     )
@@ -293,7 +290,6 @@ def _load_config():
         "bank": bank,
         "currency": "USDT",
         "poll": poll,
-        "pm_fee_pct": pm_fee_pct,
         "safe_fork_threshold": safe_threshold,
         "min_roi_pct": min_roi_pct,
         "roi_revision": roi_revision,
@@ -769,9 +765,9 @@ async def api_config_save(payload: dict):
         cfg = _load_json(CONFIG_FILE, {}) or {}
         if not isinstance(cfg, dict):
             cfg = {}
+        cfg.pop("pm_fee_pct", None)
         limits = {
             "bank": (1.0, 1_000_000_000.0),
-            "pm_fee_pct": (0.0, 1.0),
             "safe_fork_threshold": (0.01, 0.99),
             "min_roi_pct": (0.0, 100.0),
         }
@@ -1042,6 +1038,38 @@ async def api_price_history(slug: str, max_points: int = 120):
 async def api_pm_url(slug: str):
     return {"url": f"https://polymarket.com/event/{slug}"}
 
+
+def _walk_pm_asks_with_fee(asks, cash_budget, schedule):
+    """Estimate shares purchasable for a cash budget using a market fee curve."""
+    remaining = float(cash_budget)
+    gross_cost = fee_total = shares = 0.0
+    for price, available in asks:
+        fee_ps = fee_per_share(price, schedule["rate"], schedule["exponent"])
+        if fee_ps is None:
+            return None
+        cash_per_share = price + fee_ps
+        take = min(available, remaining / cash_per_share)
+        if take <= 0:
+            continue
+        shares += take
+        gross_cost += take * price
+        fee_total += take * fee_ps
+        remaining -= take * cash_per_share
+        if remaining <= max(1e-8, cash_budget * 1e-10):
+            break
+    if shares <= 0:
+        return None
+    total_cost = gross_cost + fee_total
+    return {
+        "avg_price": gross_cost / shares,
+        "shares": shares,
+        "fee": fee_total,
+        "total_cost": total_cost,
+        "odds_eff": shares / total_cost,
+        "full": remaining <= max(1e-8, cash_budget * 1e-10),
+    }
+
+
 @app.get("/api/pm_book/{slug}")
 async def api_pm_book(slug: str, size_usd: float = 50.0, force: int = 0):
     size_usd = _finite_number(size_usd, 1.0, 100_000.0)
@@ -1052,8 +1080,18 @@ async def api_pm_book(slug: str, size_usd: float = 50.0, force: int = 0):
         if not m or not isinstance(m, list) or not m:
             return {"ok": False, "err": "market not found"}
         mk = m[0]
-        token_ids = json.loads(mk.get("clobTokenIds", "[]"))
-        outcomes = json.loads(mk.get("outcomes", "[]"))
+        token_ids = mk.get("clobTokenIds", "[]")
+        outcomes = mk.get("outcomes", "[]")
+        token_ids = json.loads(token_ids) if isinstance(token_ids, str) else token_ids
+        outcomes = json.loads(outcomes) if isinstance(outcomes, str) else outcomes
+        condition_id = str(mk.get("conditionId") or "").strip()
+        if not condition_id:
+            return {"ok": False, "err": "fee_schedule_unavailable"}
+        fee_schedule = fetch_fee_schedule(condition_id, force=bool(force))
+        if fee_schedule is None:
+            return {"ok": False, "err": "fee_schedule_unavailable"}
+        if not isinstance(token_ids, list) or not isinstance(outcomes, list):
+            return {"ok": False, "err": "invalid_market_metadata"}
     except Exception as e:
         return {"ok": False, "err": f"gamma: {e}"}
 
@@ -1074,14 +1112,14 @@ async def api_pm_book(slug: str, size_usd: float = 50.0, force: int = 0):
         for x in (b.get("bids") or []):
             try:
                 p, s = float(x["price"]), float(x["size"])
-                if p > 0 and s > 0:
+                if math.isfinite(p) and math.isfinite(s) and 0 < p < 1 and s > 0:
                     bids.append((p, s))
             except Exception:
                 pass
         for x in (b.get("asks") or []):
             try:
                 p, s = float(x["price"]), float(x["size"])
-                if p > 0 and s > 0:
+                if math.isfinite(p) and math.isfinite(s) and 0 < p < 1 and s > 0:
                     asks.append((p, s))
             except Exception:
                 pass
@@ -1090,49 +1128,22 @@ async def api_pm_book(slug: str, size_usd: float = 50.0, force: int = 0):
 
         best_bid = bids[0][0] if bids else None
         best_ask = asks[0][0] if asks else None
-        ask_depth_usd = sum(p * s for p, s in asks)
-
-        avg_price = None
-        avg_full = False
-        rem = size_usd
-        spent = 0.0
-        shares = 0.0
-        for p, s in asks:
-            lvl_usd = p * s
-            take = min(rem, lvl_usd)
-            if take <= 0:
-                continue
-            shares += take / p
-            spent += take
-            rem -= take
-            if rem <= 1e-6:
-                break
-        if shares > 0:
-            avg_price = spent / shares
-            avg_full = rem <= 1e-6
+        ask_depth_usd = sum(
+            (p + (fee_per_share(p, fee_schedule["rate"], fee_schedule["exponent"]) or 0.0)) * s
+            for p, s in asks
+        )
+        quote = _walk_pm_asks_with_fee(asks, size_usd, fee_schedule)
 
         sizes_rows = []
         for sz in (10, 20, 50, 100, 200):
-            rem2 = sz
-            spent2 = 0.0
-            sh2 = 0.0
-            for p, s in asks:
-                lvl_usd = p * s
-                take = min(rem2, lvl_usd)
-                if take <= 0:
-                    continue
-                sh2 += take / p
-                spent2 += take
-                rem2 -= take
-                if rem2 <= 1e-6:
-                    break
-            if sh2 > 0:
-                ap = spent2 / sh2
+            quote2 = _walk_pm_asks_with_fee(asks, sz, fee_schedule)
+            if quote2:
                 sizes_rows.append({
                     "size": sz,
-                    "avg_price": round(ap, 4),
-                    "odds_eff": round((1 / ap) / (1 + PM_FEE), 4),
-                    "full": rem2 <= 1e-6,
+                    "avg_price": round(quote2["avg_price"], 4),
+                    "odds_eff": round(quote2["odds_eff"], 4),
+                    "fee_estimate": round(quote2["fee"], 6),
+                    "full": quote2["full"],
                 })
             else:
                 sizes_rows.append({"size": sz, "avg_price": None, "odds_eff": None, "full": False})
@@ -1146,13 +1157,15 @@ async def api_pm_book(slug: str, size_usd: float = 50.0, force: int = 0):
             "asks": [{"price": p, "size": s} for p, s in asks[:10]],
             "sizes": sizes_rows,
             "avg_for_size": (
-                {"avg_price": round(avg_price, 4),
-                 "odds_eff": round((1 / avg_price) / (1 + PM_FEE), 4),
-                 "full": avg_full}
-                if avg_price else None
+                {"avg_price": round(quote["avg_price"], 4),
+                 "odds_eff": round(quote["odds_eff"], 4),
+                 "fee_estimate": round(quote["fee"], 6),
+                 "shares": round(quote["shares"], 6),
+                 "full": quote["full"]}
+                if quote else None
             ),
         })
-    return {"ok": True, "books": books}
+    return {"ok": True, "fee_schedule": fee_schedule, "books": books}
 
 @app.post("/api/shutdown")
 async def api_shutdown():

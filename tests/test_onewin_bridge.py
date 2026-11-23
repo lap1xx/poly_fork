@@ -179,6 +179,9 @@ class OneWinFeedTests(unittest.TestCase):
                     "token": "pm-team-alpha", "o": 1 / (0.4 * 1.04),
                     "pm_best_ask": 0.4, "pm_avg_ask": 0.4,
                     "pm_book_age_sec": 1.0,
+                    "pm_fee_enabled": True, "pm_fee_rate": 0.05,
+                    "pm_fee_exponent": 1.0,
+                    "pm_fee_source": "clob_market_info",
                 },
                 {
                     "source": "1win", "outcome": "Team Bravo",

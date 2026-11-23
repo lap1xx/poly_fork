@@ -45,7 +45,7 @@ class QuoteQualityReplayTests(unittest.TestCase):
             for token in self.tokens:
                 polyarb_v4.BOOKS.pop(token, None)
 
-    def _replay_pair(self, pm_outcome):
+    def _replay_pair(self, pm_outcome, fee_rate=0.05, fee_exponent=1.0):
         pm_book = self.pm_books[pm_outcome]
         bookmaker_outcome = next(
             outcome for outcome in self.onewin_quotes if outcome != pm_outcome
@@ -58,6 +58,10 @@ class QuoteQualityReplayTests(unittest.TestCase):
                 "o": 1.0 / pm_book["asks"][0][0],
                 "c": 0.0,
                 "s": 0.0,
+                "pm_fee_enabled": fee_rate > 0.0,
+                "pm_fee_rate": fee_rate,
+                "pm_fee_exponent": fee_exponent,
+                "pm_fee_source": "clob_market_info",
             },
             {
                 "source": "1win",
@@ -157,10 +161,15 @@ class QuoteQualityReplayTests(unittest.TestCase):
             "q": self.fixture["question"],
             "o": list(self.pm_books),
             "t": self.tokens,
+            "condition_id": "replay-market-condition",
         }
         with patch.object(onewin_bridge, "ODDS_MAX_AGE_SECONDS", 30.0), \
              patch.object(onewin_bridge.time, "time", return_value=self.capture_time), \
-             patch.object(polyarb_v4, "_maybe_refresh_stale", return_value=False):
+             patch.object(polyarb_v4, "_maybe_refresh_stale", return_value=False), \
+             patch.object(polyarb_v4, "fetch_pm_fee_schedule", return_value={
+                 "fees_enabled": True, "rate": 0.05, "exponent": 1.0,
+                 "source": "clob_market_info",
+             }):
             live_quotes = stream.live_bc(slug)
             pairs = polyarb_v4.build_arb_candidates(
                 market,
@@ -240,8 +249,9 @@ class QuoteQualityReplayTests(unittest.TestCase):
 
     def test_pm_fee_reduces_replayed_roi_and_is_not_hidden_by_best_ask(self):
         _bets_with_fee, with_fee = self._replay_pair("100 Thieves")
-        with patch.object(polyarb_v4, "PM_FEE_PCT", 0.0):
-            _bets_without_fee, without_fee = self._replay_pair("100 Thieves")
+        _bets_without_fee, without_fee = self._replay_pair(
+            "100 Thieves", fee_rate=0.0
+        )
         self.assertIsNotNone(with_fee)
         self.assertIsNotNone(without_fee)
         self.assertLess(with_fee["roi"], without_fee["roi"])
@@ -252,9 +262,8 @@ class QuoteQualityReplayTests(unittest.TestCase):
         pm_leg = bets[0]
         bookmaker_leg = bets[1]
         captured_ask = self.pm_books["100 Thieves"]["asks"][0][0]
-        expected_pm_multiplier = 1.0 / (
-            captured_ask * (1.0 + polyarb_v4.PM_FEE_PCT)
-        )
+        fee_per_share = polyarb_v4.pm_fee_per_share(captured_ask, 0.05, 1.0)
+        expected_pm_multiplier = 1.0 / (captured_ask + fee_per_share)
         expected_inverse_sum = (
             1.0 / expected_pm_multiplier + 1.0 / bookmaker_leg["o"]
         )

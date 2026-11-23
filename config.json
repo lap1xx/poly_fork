@@ -1,7 +1,6 @@
 {
   "bank": 2500,
   "rate": 85,
-  "pm_fee_pct": 0.04,
   "safe_fork_threshold": 0.45,
   "poll": 0.3,
   "slip": 0.0,

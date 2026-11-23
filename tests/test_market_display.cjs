@@ -59,7 +59,13 @@ const opportunityV1 = {
       event_url: 'https://f1w-7707.com/betting/match/esport/dual-read-event',
     },
   ],
-  calculation: { roi_fraction: 0.04, total_stake: 40, projected_profit: 1.6 },
+  calculation: {
+    roi_fraction: 0.04, total_stake: 40, projected_profit: 1.6,
+    pm_fee_schedule: {
+      enabled: true, rate: 0.05, exponent: 1,
+      source: 'clob_market_info',
+    },
+  },
 };
 const dualReadCard = opportunityCardDisplay(opportunityV1, legacyArb);
 assert.equal(dualReadCard.q, 'Normalized question');
@@ -71,6 +77,8 @@ assert.equal(dualReadCard.bets[0].o, 1.15); // retain legacy effective-odds sema
 assert.equal(dualReadCard.bets[0].pm_avg_ask, 0.83);
 assert.equal(dualReadCard.bets[0].pm_book_age_sec, 1.07);
 assert.equal(dualReadCard.bets[0].event_url, opportunityV1.legs[0].event_url);
+assert.equal(dualReadCard.bets[0].pm_fee_rate, 0.05);
+assert.equal(dualReadCard.bets[0].pm_fee_exponent, 1);
 assert.equal(dualReadCard.bets[1].o, 4.2);
 assert.equal(dualReadCard.bets[1].odds_age_sec, 30.01);
 assert.equal(dualReadCard.bets[1].event_url, opportunityV1.legs[1].event_url);
