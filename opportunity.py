@@ -171,6 +171,28 @@ def normalize_scanner_arb(
         outcome = str(raw.get("outcome") or "").strip()
         source = str(raw.get("source") or "").strip()
         stake = _finite_number(stakes[index], f"stakes[{index}]", minimum=0.0)
+        calculation_input_multiplier = _finite_number(
+            raw.get("o"), f"bets[{index}].o", minimum=1.0
+        )
+        commission_fraction = _finite_number(
+            raw.get("c", 0.0), f"bets[{index}].c", minimum=0.0
+        )
+        slippage_fraction = _finite_number(
+            raw.get("s", 0.0), f"bets[{index}].s", minimum=0.0
+        )
+        if calculation_input_multiplier <= 1.0:
+            raise OpportunityNormalizationError(
+                f"bets[{index}].o: calculation multiplier must be > 1"
+            )
+        if commission_fraction >= 1.0:
+            raise OpportunityNormalizationError(f"bets[{index}].c: must be < 1")
+        if slippage_fraction >= 1.0:
+            raise OpportunityNormalizationError(f"bets[{index}].s: must be < 1")
+        calculation_inputs = {
+            "calculation_input_multiplier": calculation_input_multiplier,
+            "commission_fraction": commission_fraction,
+            "slippage_fraction": slippage_fraction,
+        }
         if source_kind == "prediction_market":
             refined_price = raw.get("pm_refined_avg_ask")
             refined_shares = raw.get("pm_refined_shares")
@@ -219,6 +241,7 @@ def normalize_scanner_arb(
                 "timestamp_basis": "received_at",
                 "provider_observed_at": None,
                 "token_id": token_id,
+                **calculation_inputs,
             }
         else:
             price = _finite_number(raw.get("o"), "bookmaker.odds", minimum=1.0)
@@ -236,6 +259,7 @@ def normalize_scanner_arb(
                 "age_ms": round(age_now * 1000.0, 3),
                 "timestamp_basis": "received_at",
                 "provider_observed_at": None,
+                **calculation_inputs,
             }
         event_url_key = (
             "pm_event_url" if source_kind == "prediction_market" else "bk_event_url"

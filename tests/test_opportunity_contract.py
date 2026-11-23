@@ -148,6 +148,31 @@ class OpportunityContractReplayTests(unittest.TestCase):
         self.assertEqual(opportunity["legs"][0]["price"], 0.84)
         self.assertEqual(opportunity["legs"][0]["price_unit"], "probability")
 
+    def test_calculation_inputs_preserve_exact_legacy_eff_mult_arguments(self):
+        snapshot = self.make_snapshot()
+        candidate = snapshot["arbs"][self.fixture["market_slug"]]
+        pm, bookmaker = candidate["bets"]
+        pm["c"], pm["s"] = 0.02, 0.01
+        bookmaker["c"], bookmaker["s"] = 0.03, 0.04
+
+        result = normalize_scanner_snapshot(snapshot)
+        self.assertEqual(result["rejected"], [])
+        legs = result["opportunities"][0]["legs"]
+        for index, source in enumerate(candidate["bets"]):
+            self.assertEqual(legs[index]["calculation_input_multiplier"], source["o"])
+            self.assertEqual(legs[index]["commission_fraction"], source["c"])
+            self.assertEqual(legs[index]["slippage_fraction"], source["s"])
+        self.validator.validate(result["opportunities"][0])
+
+    def test_invalid_calculation_input_fraction_is_rejected(self):
+        for field in ("c", "s"):
+            with self.subTest(field=field):
+                snapshot = self.make_snapshot()
+                snapshot["arbs"][self.fixture["market_slug"]]["bets"][0][field] = 1.0
+                result = normalize_scanner_snapshot(snapshot)
+                self.assertEqual(result["opportunities"], [])
+                self.assertIn("must be < 1", result["rejected"][0]["reason"])
+
     def test_refined_pm_quote_and_provider_links_are_attached_to_their_legs(self):
         snapshot = self.make_snapshot()
         candidate = snapshot["arbs"][self.fixture["market_slug"]]

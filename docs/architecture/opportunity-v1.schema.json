@@ -101,6 +101,9 @@
         "age_ms": {"type": "number", "minimum": 0},
         "timestamp_basis": {"enum": ["provider", "received_at"]},
         "provider_observed_at": {"oneOf": [{"$ref": "#/$defs/dateTime"}, {"type": "null"}]},
+        "calculation_input_multiplier": {"type": "number", "exclusiveMinimum": 1, "description": "Exact legacy bets[].o input passed to eff_mult for replay. For Polymarket it is already a fee-adjusted odds-like multiplier; do not apply fee_fraction a second time."},
+        "commission_fraction": {"type": "number", "minimum": 0, "exclusiveMaximum": 1, "description": "Legacy bets[].c input passed to eff_mult; dimensionless fraction, not a currency amount."},
+        "slippage_fraction": {"type": "number", "minimum": 0, "exclusiveMaximum": 1, "description": "Legacy bets[].s input passed to eff_mult; dimensionless fraction, not stake."},
         "available_size": {"type": ["number", "null"], "minimum": 0},
         "event_url": {"type": "string", "format": "uri", "maxLength": 2048, "description": "Optional provider-native event page for this leg only. Consumers must validate HTTPS and the exact allowlisted origin for source; never reuse another leg's URL."}
       }
