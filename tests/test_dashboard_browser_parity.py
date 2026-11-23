@@ -110,12 +110,42 @@ def make_ui_snapshot_pair(action_link_mode: str = "v1") -> dict:
             leg.pop("event_url", None)
     else:
         raise ValueError(f"Unknown action link mode: {action_link_mode}")
+    runtime_limits = {
+        "freshness": {
+            "polymarket_book_ttl_sec": 30.0,
+            "polymarket_stale_diagnostic_sec": 15.0,
+            "onewin_odds_max_age_sec": 45.0,
+            "onewin_odds_age_source": "env",
+            "dashboard_source_stale_sec": 10.0,
+        },
+        "catalog": {
+            "gamma_events_per_page": 100,
+            "gamma_max_pages_per_query": 50,
+            "gamma_retries_per_page": 3,
+            "gamma_workers": 7,
+        },
+        "safety": {"bankroll_plan_fraction": 0.25, "bankroll_plan_pct": 25.0},
+        "warnings": [],
+    }
     return {
         "type": "snapshot",
         "arbs": [ui_legacy],
         "opportunities_v1": normalized,
-        "scan_status": {"state": "running", "ts": now},
-        "config": {"bank": 40.0},
+        "scan_status": {"state": "running", "ts": now, "runtime_limits": runtime_limits},
+        "config": {
+            "bank": 40.0,
+            "runtime_limits": runtime_limits,
+            "scanner_running": True,
+            "enabled_bk_sources": ["1win"],
+            "active_bk_sources": ["1win"],
+            "available_bk_sources": ["1win"],
+            "min_roi_pct": 3.0,
+            "poll": 0.3,
+            "watch_sec": 20,
+            "alert_gap": 120,
+            "safe_fork_threshold": 0.45,
+            "config_warnings": [],
+        },
     }
 
 
@@ -191,6 +221,14 @@ class DashboardBrowserParityTests(unittest.TestCase):
                         with self.subTest(action_link_mode=action_mode):
                             page = browser.new_page()
                             page.add_init_script(shim)
+                            page.route(
+                                "**/api/config",
+                                lambda route: route.fulfill(
+                                    status=200,
+                                    content_type="application/json",
+                                    body=json.dumps(snapshot["config"], ensure_ascii=False),
+                                ),
+                            )
                             page.goto(
                                 f"http://127.0.0.1:{port}/?action_mode={action_mode}",
                                 wait_until="domcontentloaded",
@@ -203,6 +241,26 @@ class DashboardBrowserParityTests(unittest.TestCase):
                             self.assertEqual(card.locator(".arb-roi").inner_text(), "+3.10%")
                             warning_tags = card.locator(".arb-tags .pm-age").all_inner_texts()
                             self.assertEqual(sum("УСТАРЕЛИ" in tag or "КОТИРОВКИ УСТАРЕЛИ" in tag for tag in warning_tags), 1)
+                            page.wait_for_function(
+                                "document.querySelector('#risk-limit-label')?.textContent === '25% на один план'"
+                            )
+                            self.assertIn("10,00 USDT", page.locator("#risk-limit").inner_text())
+                            health_text = page.locator("#scan-reasons").inner_text()
+                            self.assertIn("PM TTL 30 с", health_text)
+                            self.assertIn("1win TTL 45 с (переменная среды)", health_text)
+                            self.assertIn("Gamma 100/страницу × 50 страниц", health_text)
+                            self.assertIn("риск-план 25% банка", health_text)
+
+                            page.locator("#btn-config").click()
+                            page.wait_for_function(
+                                "document.querySelector('#cfg-runtime-limits')?.textContent.includes('PM book TTL 30 с')"
+                            )
+                            limits_text = page.locator("#cfg-runtime-limits").inner_text()
+                            self.assertIn("PM book TTL 30 с", limits_text)
+                            self.assertIn("1win TTL 45 с (переменная среды)", limits_text)
+                            self.assertIn("Gamma 100 событий/страницу", limits_text)
+                            self.assertIn("safety cap плана 25% банка", limits_text)
+                            page.locator("#modal-config .modal-actions button").first.click()
 
                             # List/card dual-read remains unchanged; detail and
                             # calculator still render the legacy-backed record.

@@ -150,10 +150,10 @@ Windows-файлы `.bat` в Linux/macOS не используются. Для B
 
 ## Проверки
 
-Из корня репозитория запусти offline-тесты:
+Из корня репозитория запусти полный тестовый набор; browser parity использует локальный backend и синтетический read-only payload:
 
 ```bash
-python -m unittest discover -s tests -v
+python -m pytest -q
 node tests/test_bankroll_plan.cjs
 node tests/test_source_filter.cjs
 node tests/test_quote_quality.cjs
