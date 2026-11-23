@@ -1046,6 +1046,23 @@ class CalculationTests(unittest.TestCase):
                 else:
                     polyarb_v4.BOOKS[token] = old
 
+    def test_refine_rejects_nonconverged_allocation_at_iteration_limit(self):
+        bets = [
+            {"source": "Polymarket", "token": "unit-test-nonconverged",
+             "o": 2.0, "c": 0.0, "s": 0.0},
+            {"source": "Book", "o": 2.2, "c": 0.0, "s": 0.0},
+        ]
+        initial = polyarb_v4.compute(bets, 100.0)
+        changing_quotes = [0.50, 0.51, 0.52, 0.53, 0.54]
+        with patch.object(polyarb_v4, "best_ask", return_value=0.50), patch.object(
+            polyarb_v4, "walk_book", side_effect=changing_quotes
+        ) as walk_book:
+            refined = polyarb_v4.refine_stakes(bets, initial, 1.0)
+
+        self.assertIsNone(refined)
+        self.assertEqual(walk_book.call_count,
+                         polyarb_v4.MAX_STAKE_REFINEMENT_ITERATIONS)
+
     def test_feed_token_set_updates_without_starting_network(self):
         feed = polyarb_v4.Feed(["a", "b"])
         self.assertTrue(feed.update_tokens(["a", "b", "c"]))

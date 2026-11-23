@@ -79,6 +79,7 @@ GAMMA = HT + "gamma-api" + DOT + "polymarket" + DOT + "com"
 WS_URL = WSS + "ws-subscriptions-clob" + DOT + "polymarket" + DOT + "com" + "/ws/market"
 WS_PING_INTERVAL_SEC = 8.0
 PM_FEE_PCT = 0.04
+MAX_STAKE_REFINEMENT_ITERATIONS = 5
 CBR_URL = HT + "www" + DOT + "cbr" + DOT + "ru" + "/scripts/XML_daily.asp"
 BANKROLL_PLAN_LIMIT = 0.40
 PINNED_SIGNAL_TTL_SEC = 300.0
@@ -1219,7 +1220,7 @@ def refine_stakes(bets, result, rate):
     bank = sum(float(x) for x in result.get("stakes", []))
     if not math.isfinite(bank) or bank <= 0:
         return None
-    for _ in range(5):
+    for _ in range(MAX_STAKE_REFINEMENT_ITERATIONS):
         changed = False
         for i, b in enumerate(bets):
             if b.get("source") != "Polymarket":
@@ -1250,6 +1251,10 @@ def refine_stakes(bets, result, rate):
         result = compute(bets, bank)
         if result is None:
             return None
+    # The last recomputed allocation has not been repriced against the PM
+    # quote it implies. Reject rather than publish mismatched quote and stakes.
+    if changed:
+        return None
     return result
 
 

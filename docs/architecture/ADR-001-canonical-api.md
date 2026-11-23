@@ -59,6 +59,6 @@
 
 ## Остаётся до расчётной/UI migration
 
-- PM refined VWAP/size теперь публикуется аддитивно и имеет multi-level-book regression; до расчётной миграции ещё определить convergence behavior и доказать совпадение последнего quote iteration с возвращённой stake allocation.
+- PM refined VWAP/size теперь публикуется аддитивно и имеет multi-level-book regression. Если после пяти итераций refinement ещё меняет implied PM price, candidate отклоняется: последняя пересчитанная stake allocation не считается подтверждённой тем quote, который она сама подразумевает. Нельзя переносить расчёт на Opportunity v1, пока replay/regression не подтвердит согласованность quote и allocation на стабилизировавшихся кандидатах.
 - Opportunity v1 теперь переносит legacy PM/bookmaker URL отдельно в соответствующую leg; сами action-кнопки остаются legacy. Перед их миграцией добавить source-bound link action tests. PM direct/fallback open paths уже используют общий exact HTTPS origin/path validator, покрытый `tests/test_provider_links.cjs`.
 - План подключения Mini App к общей модели и API; до этого она остаётся вне текущего поддерживаемого deployment target.
