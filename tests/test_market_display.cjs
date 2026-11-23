@@ -51,11 +51,12 @@ const opportunityV1 = {
     {
       source: 'Polymarket', source_kind: 'prediction_market', outcome: 'Alpha',
       price: 0.83, price_unit: 'probability', stake: 22.5, age_ms: 1070,
-      token_id: 'pm-dual-token',
+      token_id: 'pm-dual-token', event_url: 'https://polymarket.com/event/dual-read-event',
     },
     {
       source: '1win', source_kind: 'bookmaker', outcome: 'Bravo',
       price: 4.2, price_unit: 'decimal_odds', stake: 17.5, age_ms: 30010,
+      event_url: 'https://f1w-7707.com/betting/match/esport/dual-read-event',
     },
   ],
   calculation: { roi_fraction: 0.04, total_stake: 40, projected_profit: 1.6 },
@@ -69,8 +70,10 @@ assert.deepEqual(dualReadCard.stakes, [22.5, 17.5]);
 assert.equal(dualReadCard.bets[0].o, 1.15); // retain legacy effective-odds semantics
 assert.equal(dualReadCard.bets[0].pm_avg_ask, 0.83);
 assert.equal(dualReadCard.bets[0].pm_book_age_sec, 1.07);
+assert.equal(dualReadCard.bets[0].event_url, opportunityV1.legs[0].event_url);
 assert.equal(dualReadCard.bets[1].o, 4.2);
 assert.equal(dualReadCard.bets[1].odds_age_sec, 30.01);
+assert.equal(dualReadCard.bets[1].event_url, opportunityV1.legs[1].event_url);
 assert.equal(dualReadCard.source_age_sec, 30.01);
 assert.equal(dualReadCard.age_sec, 4); // UI-only metadata remains legacy sourced
 assert.equal(dualReadCard.is_streamer, true);

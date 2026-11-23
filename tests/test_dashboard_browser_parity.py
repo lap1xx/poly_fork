@@ -29,7 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 REPLAY = ROOT / "tests" / "fixtures" / "quote_quality_replay.json"
 
 
-def make_ui_snapshot_pair() -> dict:
+def make_ui_snapshot_pair(action_link_mode: str = "v1") -> dict:
     """Build a realistic legacy+v1 pair from the checked-in captured replay."""
     captured = json.loads(REPLAY.read_text(encoding="utf-8"))
     pm = captured["polymarket"]["books"][0]
@@ -97,9 +97,18 @@ def make_ui_snapshot_pair() -> dict:
         raise AssertionError(f"Replay did not normalize: {normalized['rejected']}")
     if normalized["opportunities"][0]["status"] != "stale":
         raise AssertionError("Replay fixture must exercise stale dual-read presentation")
+    ui_legacy = dict(legacy)
+    if action_link_mode == "v1":
+        ui_legacy.pop("pm_event_url")
+        ui_legacy.pop("bk_event_url")
+    elif action_link_mode == "legacy-fallback":
+        for leg in normalized["opportunities"][0]["legs"]:
+            leg.pop("event_url", None)
+    else:
+        raise ValueError(f"Unknown action link mode: {action_link_mode}")
     return {
         "type": "snapshot",
-        "arbs": [legacy],
+        "arbs": [ui_legacy],
         "opportunities_v1": normalized,
         "scan_status": {"state": "running", "ts": now},
         "config": {"bank": 40.0},
@@ -138,11 +147,16 @@ class DashboardBrowserParityTests(unittest.TestCase):
             else:
                 self.fail("dashboard server did not become ready")
 
-            snapshot = make_ui_snapshot_pair()
-            snapshot_json = json.dumps(snapshot, ensure_ascii=False)
+            snapshots = {
+                mode: make_ui_snapshot_pair(mode)
+                for mode in ("v1", "legacy-fallback")
+            }
+            snapshots_json = json.dumps(snapshots, ensure_ascii=False)
             shim = f"""
               (() => {{
-                const message = {snapshot_json};
+                const snapshots = {snapshots_json};
+                const actionMode = new URL(location.href).searchParams.get('action_mode') || 'v1';
+                const message = snapshots[actionMode];
                 window.__openedUrls = [];
                 window.open = (url) => {{ window.__openedUrls.push(String(url)); return {{ closed: false }}; }};
                 class ReplayWebSocket {{
@@ -169,39 +183,61 @@ class DashboardBrowserParityTests(unittest.TestCase):
                     launch_options["executable_path"] = chromium
                 browser = p.chromium.launch(**launch_options)
                 try:
-                    page = browser.new_page()
-                    page.add_init_script(shim)
-                    page.goto(f"http://127.0.0.1:{port}/", wait_until="domcontentloaded")
-                    card = page.locator(".arb[data-arb-slug]").first
-                    card.wait_for(state="visible", timeout=10000)
-                    expected = snapshot["opportunities_v1"]["opportunities"][0]
-                    self.assertEqual(card.get_attribute("data-arb-slug"), expected["market"]["slug"])
-                    self.assertEqual(card.locator(".arb-title").inner_text(), expected["market"]["question"])
-                    self.assertEqual(card.locator(".arb-roi").inner_text(), "+3.10%")
-                    warning_tags = card.locator(".arb-tags .pm-age").all_inner_texts()
-                    self.assertEqual(sum("УСТАРЕЛИ" in tag or "КОТИРОВКИ УСТАРЕЛИ" in tag for tag in warning_tags), 1)
-                    expected_urls = {
-                        leg["source"]: leg["event_url"] for leg in expected["legs"]
-                    }
-                    self.assertEqual(expected_urls["Polymarket"], "https://polymarket.com/event/" + expected["market"]["slug"])
-                    self.assertEqual(expected_urls["1win"], "https://f1w-7707.com/betting/match/esport/replay-match")
+                    for action_mode, snapshot in snapshots.items():
+                        with self.subTest(action_link_mode=action_mode):
+                            page = browser.new_page()
+                            page.add_init_script(shim)
+                            page.goto(
+                                f"http://127.0.0.1:{port}/?action_mode={action_mode}",
+                                wait_until="domcontentloaded",
+                            )
+                            card = page.locator(".arb[data-arb-slug]").first
+                            card.wait_for(state="visible", timeout=10000)
+                            expected = snapshot["opportunities_v1"]["opportunities"][0]
+                            self.assertEqual(card.get_attribute("data-arb-slug"), expected["market"]["slug"])
+                            self.assertEqual(card.locator(".arb-title").inner_text(), expected["market"]["question"])
+                            self.assertEqual(card.locator(".arb-roi").inner_text(), "+3.10%")
+                            warning_tags = card.locator(".arb-tags .pm-age").all_inner_texts()
+                            self.assertEqual(sum("УСТАРЕЛИ" in tag or "КОТИРОВКИ УСТАРЕЛИ" in tag for tag in warning_tags), 1)
 
-                    # Card click opens the unchanged legacy detail/calculator path.
-                    card.click()
-                    detail_roi = page.locator("#kpi-roi")
-                    detail_roi.wait_for(state="visible", timeout=5000)
-                    self.assertEqual(detail_roi.inner_text(), "+3.10%")
-                    self.assertEqual(page.locator("#market-pm-outcome").inner_text(), expected["legs"][0]["outcome"])
-                    self.assertEqual(page.locator("#market-bk-outcome").inner_text(), expected["legs"][1]["outcome"])
+                            # List/card dual-read remains unchanged; detail and
+                            # calculator still render the legacy-backed record.
+                            card.click()
+                            detail_roi = page.locator("#kpi-roi")
+                            detail_roi.wait_for(state="visible", timeout=5000)
+                            self.assertEqual(detail_roi.inner_text(), "+3.10%")
+                            self.assertEqual(page.locator("#market-pm-outcome").inner_text(), expected["legs"][0]["outcome"])
+                            self.assertEqual(page.locator("#market-bk-outcome").inner_text(), expected["legs"][1]["outcome"])
 
-                    # Until the action migration is separately approved, buttons
-                    # remain legacy-backed; prove each opens its own v1 leg URL.
-                    page.locator("#btn-buy-pm").click()
-                    page.locator("#btn-open-bb").click()
-                    opened_urls = page.evaluate("window.__openedUrls")
-                    self.assertEqual(opened_urls, [
-                        expected_urls["Polymarket"], expected_urls["1win"]
-                    ])
+                            expected_urls = {
+                                leg["source"]: leg.get("event_url")
+                                for leg in expected["legs"]
+                            }
+                            legacy_row = snapshot["arbs"][0]
+                            for source, legacy_key in (
+                                ("Polymarket", "pm_event_url"),
+                                ("1win", "bk_event_url"),
+                            ):
+                                expected_urls[source] = (
+                                    expected_urls[source] or legacy_row.get(legacy_key)
+                                )
+                            self.assertEqual(
+                                expected_urls["Polymarket"],
+                                "https://polymarket.com/event/" + expected["market"]["slug"],
+                            )
+                            self.assertEqual(
+                                expected_urls["1win"],
+                                "https://f1w-7707.com/betting/match/esport/replay-match",
+                            )
+
+                            # v1 legs are preferred; absent per-leg URLs must
+                            # still fall back to the matching legacy root field.
+                            page.locator("#btn-buy-pm").click()
+                            page.locator("#btn-open-bb").click()
+                            self.assertEqual(page.evaluate("window.__openedUrls"), [
+                                expected_urls["Polymarket"], expected_urls["1win"]
+                            ])
+                            page.close()
                 finally:
                     browser.close()
         finally:

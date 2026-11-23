@@ -648,7 +648,7 @@ function setCardMarkup(card, selector, markup, cacheKey) {
 }
 
 function updateArbCard(card, a) {
-  // Dual-read is presentation-only: filters and the selected detail/action path stay on legacy arbs.
+  // Dual-read drives list values and validated event-link actions; other detail/calculator data remains legacy-backed.
   const legacy = a;
   const opportunity = state.opportunitiesBySlug.get(String(legacy.slug || ''));
   a = window.PolyArbMarketDisplay.opportunityCardDisplay(opportunity, legacy) || legacy;
@@ -896,6 +896,19 @@ function getActive() {
     return row ? { ...row, inactive_snapshot: true } : null;
   }
   return state.arbs.find(a => a.slug === state.activeSlug);
+}
+
+function activeOpportunityEventUrl(active, source) {
+  if (!active || active.inactive_snapshot || !state.opportunitiesBySlug
+      || !window.PolyArbMarketDisplay) return null;
+  const opportunity = state.opportunitiesBySlug.get(String(active.slug || ''));
+  const adapted = window.PolyArbMarketDisplay.opportunityCardDisplay(
+    opportunity, active,
+  );
+  if (!adapted) return null;
+  const leg = (opportunity.legs || []).find(item => item && item.source === source);
+  return leg && typeof leg.event_url === 'string' && leg.event_url.trim()
+    ? leg.event_url.trim() : null;
 }
 
 let _lastDetailRefresh = 0;
@@ -1226,7 +1239,8 @@ function renderHowMuch(a) {
   filledBtn.disabled = frozen;
   filledBtn.title = frozen ? 'Неактивный снимок не является фактической сделкой' : 'Записать исполненную вручную сделку';
   const bkBtn = document.getElementById('btn-open-bb');
-  const oneWinUrlReady = bbLeg.source === '1win' && Boolean(a.bk_event_url);
+  const oneWinUrlReady = bbLeg.source === '1win'
+    && Boolean(activeOpportunityEventUrl(a, '1win') || bbLeg.event_url || a.bk_event_url);
   const betBoomUrlReady = bbLeg.source === 'BetBoom' && Boolean(a.bb_match_id && a.bb_tournament_id);
   bkBtn.disabled = !(oneWinUrlReady || betBoomUrlReady);
   bkBtn.textContent = oneWinUrlReady ? 'ОТКРЫТЬ СОБЫТИЕ 1WIN ↗'
@@ -1657,9 +1671,11 @@ function refreshPMNow() { checkPM(); }
 function openBookmakerEvent() {
   const a = getActive(); if (!a) return;
   const bkLeg = (a.bets || []).find(leg => leg.source && leg.source !== 'Polymarket');
-  if (bkLeg?.source === '1win' && a.bk_event_url) {
+  const oneWinEventUrl = activeOpportunityEventUrl(a, '1win')
+    || bkLeg?.event_url || a.bk_event_url;
+  if (bkLeg?.source === '1win' && oneWinEventUrl) {
     try {
-      const eventUrl = new URL(a.bk_event_url, window.location.origin);
+      const eventUrl = new URL(oneWinEventUrl, window.location.origin);
       const allowedOrigin = window.POLYARB_ONEWIN_ORIGIN;
       if (eventUrl.protocol !== 'https:' || eventUrl.username || eventUrl.password
           || !allowedOrigin || eventUrl.origin !== allowedOrigin) {
@@ -1687,6 +1703,7 @@ function openBookmakerEvent() {
 }
 async function openPMUrl() {
   const a = getActive(); if (!a) return;
+  const pmLeg = (a.bets || []).find(leg => leg.source === 'Polymarket');
   const openPolymarketEvent = (value) => {
     const safeUrl = window.PolyArbProviderLinks?.polymarketEventUrl(
       value, window.location.origin,
@@ -1694,9 +1711,11 @@ async function openPMUrl() {
     if (!safeUrl) throw new Error('Небезопасная ссылка на Polymarket');
     window.open(safeUrl, '_blank', 'noopener,noreferrer');
   };
-  if (a.pm_event_url) {
+  const pmEventUrl = activeOpportunityEventUrl(a, 'Polymarket')
+    || pmLeg?.event_url || a.pm_event_url;
+  if (pmEventUrl) {
     try {
-      openPolymarketEvent(a.pm_event_url);
+      openPolymarketEvent(pmEventUrl);
     } catch (e) {
       toast('Не удалось открыть страницу события Polymarket', true);
     }

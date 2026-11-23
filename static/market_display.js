@@ -115,6 +115,7 @@
         pm_book_age_sec: isPm ? quoteAgeSec : undefined,
         pm_age: isPm ? quoteAgeSec : undefined,
         odds_age_sec: isPm ? undefined : quoteAgeSec,
+        event_url: typeof leg.event_url === 'string' ? leg.event_url : undefined,
       });
       stakes.push(leg.stake);
       if (isPm) pmAgeSec = quoteAgeSec;
