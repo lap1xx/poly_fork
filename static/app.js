@@ -691,7 +691,8 @@ function updateArbCard(card, a) {
     suspended: 'ВОЗМОЖНОСТЬ ПРИОСТАНОВЛЕНА',
     withdrawn: 'ВОЗМОЖНОСТЬ СНЯТА',
   };
-  if (opportunityStatusLabels[a.opportunity_status]) {
+  if (opportunityStatusLabels[a.opportunity_status]
+      && !(a.opportunity_status === 'stale' && a.source_state === 'stale')) {
     tags.push(`<span class="tag pm-age">${opportunityStatusLabels[a.opportunity_status]}</span>`);
   }
   setCardMarkup(card, '.arb-tags', tags.join(''), '_renderedTags');
