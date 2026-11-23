@@ -55,7 +55,9 @@ def _normalize_phase(value: Any) -> str:
 
 def _quote_age(bet: Mapping[str, Any], source_kind: str, arb: Mapping[str, Any]) -> float:
     if source_kind == "prediction_market":
-        raw = bet.get("pm_book_age_sec", bet.get("pm_age"))
+        raw = bet.get("pm_book_age_sec")
+        if raw is None:
+            raw = bet.get("pm_age")
         if raw is None:
             raw = arb.get("pm_age")
     else:
@@ -88,10 +90,10 @@ def normalize_scanner_arb(
     """Convert one current `polyarb_v4` candidate to the normalized domain model.
 
     The source scanner's `bets[].o` is an effective decimal multiplier used by
-    its ROI calculation. For the domain record, PM price uses the underlying
-    average ask (`pm_avg_ask`, falling back to `pm_best_ask`) and bookmaker
-    price uses its decimal odds (`o`). Stake values come from the aligned
-    `stakes` array, not the legacy `bets[].s` field (which is slippage).
+    its ROI calculation. For the domain record, PM price prefers the refined
+    depth average, then the initial-probe average, then top ask; bookmaker price
+    uses its decimal odds (`o`). Stake values come from the aligned `stakes`
+    array, not the legacy `bets[].s` field (which is slippage).
     """
     if not isinstance(slug, str) or not slug.strip() or len(slug) > 512:
         raise OpportunityNormalizationError("slug: invalid")

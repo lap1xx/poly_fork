@@ -190,6 +190,20 @@ class OpportunityContractReplayTests(unittest.TestCase):
         self.assertEqual(len(result["rejected"]), 1)
         self.assertIn("quote age is missing", result["rejected"][0]["reason"])
 
+    def test_pm_quote_age_prefers_non_null_leg_alias_before_root_fallback(self):
+        payload = self.make_snapshot()
+        candidate = payload["arbs"][self.fixture["market_slug"]]
+        candidate["pm_age"] = 15.0
+        pm_leg = candidate["bets"][0]
+        pm_leg["pm_book_age_sec"] = None
+        pm_leg["pm_age"] = 12.0
+
+        result = normalize_scanner_snapshot(payload)
+        self.assertEqual(result["rejected"], [])
+        self.assertAlmostEqual(
+            result["opportunities"][0]["legs"][0]["age_ms"], 12_000.0, places=2
+        )
+
     def test_bookmaker_to_bookmaker_or_same_outcome_pair_is_rejected(self):
         payload = self.make_snapshot()
         candidate = payload["arbs"][self.fixture["market_slug"]]
