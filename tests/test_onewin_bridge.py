@@ -338,6 +338,26 @@ class OneWinFeedTests(unittest.TestCase):
                 odd["receivedAt"] = time.time() - self.ow.ODDS_MAX_AGE_SECONDS - 1
         self.assertEqual(self.stream.live_bc(self.slug), {})
 
+    def test_health_reports_local_open_quote_age_percentiles(self):
+        self.stream.stakes["12345"] = {
+            "winner": {
+                "odds": {
+                    "fresh": {"cf": 1.9, "status": 1, "receivedAt": 998.0},
+                    "stale": {"cf": 2.1, "status": 1, "receivedAt": 955.0},
+                    "missing": {"cf": 2.3, "status": 1},
+                }
+            }
+        }
+        with patch.object(self.ow.time, "time", return_value=1000.0):
+            health = self.stream.snapshot_health()
+        self.assertEqual(health["fresh_open_quotes"], 1)
+        self.assertEqual(health["stale_open_quotes"], 2)
+        self.assertEqual(health["missing_receipt_timestamp_quotes"], 1)
+        self.assertEqual(health["open_quote_age_sec"], {
+            "sample_count": 2, "p50_sec": 2.0, "p95_sec": 45.0,
+            "max_sec": 45.0,
+        })
+
     def test_binding_rejects_ambiguous_duplicate_events(self):
         duplicate = dict(self.match)
         duplicate["id"] = 12346

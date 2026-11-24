@@ -546,6 +546,71 @@ def pm_book_diagnostic(token_id, now=None):
     }
 
 
+def pm_book_health(token_ids, now=None):
+    """Summarize local PM book receipt/source ages without triggering recovery."""
+    now = time.time() if now is None else float(now)
+    if isinstance(token_ids, (str, bytes)):
+        token_ids = [token_ids]
+    keys = {str(token).strip() for token in (token_ids or ())
+            if token is not None and str(token).strip()}
+    local_ages = []
+    source_ages = []
+    missing_books = 0
+    missing_timestamps = 0
+    fresh_books = 0
+    stale_books = 0
+    fresh_books_with_asks = 0
+
+    with LOCK:
+        for key in keys:
+            book = BOOKS.get(key)
+            if not isinstance(book, dict):
+                missing_books += 1
+                continue
+            try:
+                received_at = float(book.get("ts") or 0.0)
+            except (TypeError, ValueError, OverflowError):
+                received_at = 0.0
+            if not math.isfinite(received_at) or received_at <= 0.0:
+                missing_timestamps += 1
+                continue
+            age = max(0.0, now - received_at)
+            local_ages.append(age)
+            if age > BOOK_TTL:
+                stale_books += 1
+            else:
+                fresh_books += 1
+                if book.get("asks"):
+                    fresh_books_with_asks += 1
+            source_ts = _book_source_timestamp(book)
+            if source_ts is not None:
+                source_ages.append(max(0.0, now - source_ts))
+
+    def summarize(values):
+        values = sorted(value for value in values if math.isfinite(value) and value >= 0.0)
+        if not values:
+            return {"sample_count": 0, "p50_sec": None, "p95_sec": None, "max_sec": None}
+        n = len(values)
+        return {
+            "sample_count": n,
+            "p50_sec": round(values[max(0, math.ceil(0.50 * n) - 1)], 1),
+            "p95_sec": round(values[max(0, math.ceil(0.95 * n) - 1)], 1),
+            "max_sec": round(values[-1], 1),
+        }
+
+    return {
+        "token_count": len(keys),
+        "missing_books": missing_books,
+        "missing_timestamps": missing_timestamps,
+        "fresh_books": fresh_books,
+        "stale_books": stale_books,
+        "fresh_books_with_asks": fresh_books_with_asks,
+        "book_ttl_sec": BOOK_TTL,
+        "book_age_sec": summarize(local_ages),
+        "source_event_age_sec": summarize(source_ages),
+    }
+
+
 def _refresh_pm_book_worker(token_id, attempted_at, reason, fresh_fetch=None, notify_update=None):
     key = str(token_id)
     result_state = "fetch_failed"

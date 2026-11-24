@@ -775,6 +775,19 @@ class OneWinStream:
         with self.lock:
             return {slug: dict(value) for slug, value in self.match_diagnostics.items()}
 
+    @staticmethod
+    def _quote_age_summary(ages):
+        values = sorted(value for value in ages
+                        if math.isfinite(value) and value >= 0.0)
+        if not values:
+            return {"sample_count": 0, "p50_sec": None, "p95_sec": None, "max_sec": None}
+        return {
+            "sample_count": len(values),
+            "p50_sec": round(values[max(0, math.ceil(0.50 * len(values)) - 1)], 1),
+            "p95_sec": round(values[max(0, math.ceil(0.95 * len(values)) - 1)], 1),
+            "max_sec": round(values[-1], 1),
+        }
+
     def snapshot_health(self):
         now = time.time()
         with self.lock:
@@ -787,6 +800,8 @@ class OneWinStream:
             last_price_at = self._last_price_update_at
             fresh_open_quotes = 0
             stale_open_quotes = 0
+            missing_receipt_timestamp_quotes = 0
+            open_quote_ages = []
             for groups in self.stakes.values():
                 for group in groups.values():
                     for odd in (group.get("odds") or {}).values():
@@ -798,6 +813,10 @@ class OneWinStream:
                             age_sec = now - float(odd.get("receivedAt"))
                         except (TypeError, ValueError):
                             age_sec = float("inf")
+                        if math.isfinite(age_sec) and age_sec >= 0.0:
+                            open_quote_ages.append(age_sec)
+                        else:
+                            missing_receipt_timestamp_quotes += 1
                         if 0.0 <= age_sec <= ODDS_MAX_AGE_SECONDS:
                             fresh_open_quotes += 1
                         else:
@@ -812,6 +831,8 @@ class OneWinStream:
             "subscribed_matches": subscribed_matches,
             "fresh_open_quotes": fresh_open_quotes,
             "stale_open_quotes": stale_open_quotes,
+            "open_quote_age_sec": self._quote_age_summary(open_quote_ages),
+            "missing_receipt_timestamp_quotes": missing_receipt_timestamp_quotes,
             "odds_snapshots_received": snapshot_count,
             "odds_deltas_received": delta_count,
             "valid_price_updates_received": price_update_count,

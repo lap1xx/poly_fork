@@ -230,7 +230,7 @@ python tools/quality_gate_baseline.py capture --duration-seconds 900 --interval-
 python tools/quality_gate_baseline.py report --input .work/quality-baseline.jsonl --format markdown --output .work/quality-baseline.md
 ```
 
-Утилита только читает локальный `scanner_status.json`: она не запускает scanner, не обращается к Polymarket/1win и не меняет настройки. JSONL создаётся без перезаписи существующего файла; `.work/` следует держать локально и не коммитить. В отчёте commit из runtime status отделён от commit репозитория, из которого запущен collector; latency ограничена временем от локального receipt события до сборки scanner status и не является end-to-end задержкой до панели.
+Утилита только читает локальный `scanner_status.json`: она не запускает scanner, не обращается к Polymarket/1win и не меняет настройки. JSONL создаётся без перезаписи существующего файла; `.work/` игнорируется Git. В отчёте есть распределения local receipt age PM-книг и 1win котировок, доступный provider event age PM, freshness counts, catalog/feed health и latency. Commit из runtime status отделён от commit репозитория, из которого запущен collector; latency ограничена временем от локального receipt события до сборки scanner status и не является end-to-end задержкой до панели.
 
 ## Важные ограничения
 

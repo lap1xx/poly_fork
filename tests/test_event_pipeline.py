@@ -128,6 +128,45 @@ class ScannerStatusCommitTests(unittest.TestCase):
         self.assertNotIn("scanner_commit", payload)
 
 
+class PMBookHealthTests(unittest.TestCase):
+    def test_read_only_summary_reports_local_and_source_book_ages(self):
+        data = polyarb_v4._pm_market_data
+        keys = ("quality-fresh-token", "quality-stale-token", "quality-missing-token")
+        with data.LOCK:
+            previous = {key: data.BOOKS.get(key) for key in keys}
+            data.BOOKS[keys[0]] = {
+                "bids": [(0.40, 10.0)], "asks": [(0.41, 10.0)],
+                "ts": 998.0, "source_ts": 997.0,
+            }
+            data.BOOKS[keys[1]] = {
+                "bids": [(0.30, 5.0)], "asks": [],
+                "ts": 950.0, "source_ts": 945.0,
+            }
+            data.BOOKS.pop(keys[2], None)
+        try:
+            summary = data.pm_book_health(keys, now=1000.0)
+        finally:
+            with data.LOCK:
+                for key, book in previous.items():
+                    if book is None:
+                        data.BOOKS.pop(key, None)
+                    else:
+                        data.BOOKS[key] = book
+        self.assertEqual(summary["token_count"], 3)
+        self.assertEqual(summary["missing_books"], 1)
+        self.assertEqual(summary["fresh_books"], 1)
+        self.assertEqual(summary["stale_books"], 1)
+        self.assertEqual(summary["fresh_books_with_asks"], 1)
+        self.assertEqual(summary["book_age_sec"], {
+            "sample_count": 2, "p50_sec": 2.0, "p95_sec": 50.0,
+            "max_sec": 50.0,
+        })
+        self.assertEqual(summary["source_event_age_sec"], {
+            "sample_count": 2, "p50_sec": 3.0, "p95_sec": 55.0,
+            "max_sec": 55.0,
+        })
+
+
 class FeedCallbackTests(unittest.TestCase):
     def test_pm_book_callback_runs_after_book_is_committed_and_lock_released(self):
         token = "event-pipeline-test-token"

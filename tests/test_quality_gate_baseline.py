@@ -43,12 +43,34 @@ def _sample(epoch, *, connected=True, error=None, catalog_complete=True,
                 "last_odds_message_age_sec": 0.5,
                 "last_price_update_age_sec": 0.2,
                 "max_quote_age_sec": 30,
+                "open_quote_age_sec": {
+                    "sample_count": 15, "p50_sec": 0.5,
+                    "p95_sec": 2.0, "max_sec": 5.0,
+                },
+                "missing_receipt_timestamp_quotes": 0,
                 "last_error": error,
             }
         },
         "pm_catalog_complete": catalog_complete,
         "pm_catalog_retained": not catalog_complete,
         "pm_catalog_fetch": {"events": 10, "errors": []},
+        "pm_book_health": {
+            "token_count": 200,
+            "missing_books": 80,
+            "missing_timestamps": 0,
+            "fresh_books": 100,
+            "stale_books": 20,
+            "fresh_books_with_asks": 95,
+            "book_ttl_sec": 30.0,
+            "book_age_sec": {
+                "sample_count": 120, "p50_sec": 2.0,
+                "p95_sec": 34.0, "max_sec": 60.0,
+            },
+            "source_event_age_sec": {
+                "sample_count": 100, "p50_sec": 1.0,
+                "p95_sec": 20.0, "max_sec": 45.0,
+            },
+        },
         "rolling_event_to_scan_status_latency": {
             "window_sec": 900.0,
             "by_source": {"1win": {"sample_count": 5, "p50_ms": 8.0,
@@ -93,6 +115,9 @@ class QualityGateBaselineTests(unittest.TestCase):
             summary["rolling_latency_window"]["reported_p95_ms_over_capture"]["1win"]["p95"],
             25.0,
         )
+        self.assertEqual(summary["metrics"]["onewin_quote_age_p95_sec"]["p50"], 2.0)
+        self.assertEqual(summary["metrics"]["pm_book_age_p95_sec"]["p50"], 34.0)
+        self.assertEqual(summary["metrics"]["pm_source_event_age_p95_sec"]["p50"], 20.0)
         self.assertNotIn("bank_usdt", summary)
         self.assertNotIn("signals", summary)
 
@@ -103,6 +128,8 @@ class QualityGateBaselineTests(unittest.TestCase):
         self.assertNotIn("bank_usdt", sample)
         self.assertNotIn("signals", sample)
         self.assertEqual(sample["onewin_feed_health"]["fresh_open_quotes"], 15)
+        self.assertEqual(sample["onewin_feed_health"]["open_quote_age_sec"]["p95_sec"], 2.0)
+        self.assertEqual(sample["pm_book_health"]["stale_books"], 20)
 
     def test_capture_reads_local_file_once_per_new_status_and_never_overwrites(self):
         with tempfile.TemporaryDirectory() as tmp:

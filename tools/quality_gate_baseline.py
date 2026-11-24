@@ -38,6 +38,8 @@ HEALTH_FIELDS = (
     "last_odds_message_age_sec",
     "last_price_update_age_sec",
     "max_quote_age_sec",
+    "open_quote_age_sec",
+    "missing_receipt_timestamp_quotes",
     "last_error",
 )
 
@@ -104,6 +106,7 @@ def build_sample(status, sampled_at_epoch=None):
             "retained": status.get("pm_catalog_retained"),
             "fetch": _as_dict(status.get("pm_catalog_fetch")),
         },
+        "pm_book_health": _as_dict(status.get("pm_book_health")),
         "rolling_event_to_scan_status_latency": _as_dict(
             status.get("rolling_event_to_scan_status_latency")
         ),
@@ -229,6 +232,19 @@ def summarize_records(records):
         "stale_open_quotes": [],
         "last_odds_message_age_sec": [],
         "last_price_update_age_sec": [],
+        "onewin_quote_age_p50_sec": [],
+        "onewin_quote_age_p95_sec": [],
+        "onewin_quote_age_max_sec": [],
+        "missing_receipt_timestamp_quotes": [],
+        "pm_fresh_books": [],
+        "pm_stale_books": [],
+        "pm_missing_books": [],
+        "pm_book_age_p50_sec": [],
+        "pm_book_age_p95_sec": [],
+        "pm_book_age_max_sec": [],
+        "pm_source_event_age_p50_sec": [],
+        "pm_source_event_age_p95_sec": [],
+        "pm_source_event_age_max_sec": [],
     }
     connected = []
     catalog_complete = []
@@ -258,14 +274,41 @@ def summarize_records(records):
         for field in (
             "fresh_open_quotes", "stale_open_quotes",
             "last_odds_message_age_sec", "last_price_update_age_sec",
+            "missing_receipt_timestamp_quotes",
         ):
             if field in health:
                 measures[field].append(health[field])
+        onewin_age = _as_dict(health.get("open_quote_age_sec"))
+        for field, target in (
+            ("p50_sec", "onewin_quote_age_p50_sec"),
+            ("p95_sec", "onewin_quote_age_p95_sec"),
+            ("max_sec", "onewin_quote_age_max_sec"),
+        ):
+            if field in onewin_age:
+                measures[target].append(onewin_age[field])
         if isinstance(health.get("connected"), bool):
             connected.append(health["connected"])
         catalog = _as_dict(row.get("pm_catalog"))
         if isinstance(catalog.get("complete"), bool):
             catalog_complete.append(catalog["complete"])
+        pm_health = _as_dict(row.get("pm_book_health"))
+        for field, target in (
+            ("fresh_books", "pm_fresh_books"),
+            ("stale_books", "pm_stale_books"),
+            ("missing_books", "pm_missing_books"),
+        ):
+            if field in pm_health:
+                measures[target].append(pm_health[field])
+        for age_key, prefix in (
+            ("book_age_sec", "pm_book_age"),
+            ("source_event_age_sec", "pm_source_event_age"),
+        ):
+            age_summary = _as_dict(pm_health.get(age_key))
+            for field, suffix in (("p50_sec", "p50"), ("p95_sec", "p95"),
+                                  ("max_sec", "max")):
+                target = prefix + "_" + suffix + "_sec"
+                if field in age_summary:
+                    measures[target].append(age_summary[field])
         if health.get("last_error"):
             feed_error_samples += 1
         if _as_dict(row.get("scanner")).get("state") != "running":
@@ -354,7 +397,11 @@ def format_markdown(summary):
         f"- Свежие пары от bound 1win: {dist('fresh_pairs_of_bound_1win_pct', '%')}",
         f"- Открытые свежие котировки 1win: {dist('fresh_open_quotes')}",
         f"- Открытые устаревшие котировки 1win: {dist('stale_open_quotes')}",
+        f"- Возраст открытых 1win котировок: p50 {dist('onewin_quote_age_p50_sec', ' сек.')}; p95 {dist('onewin_quote_age_p95_sec', ' сек.')}; max {dist('onewin_quote_age_max_sec', ' сек.')}",
         f"- Возраст последнего price update: {dist('last_price_update_age_sec', ' сек.')}",
+        f"- PM fresh/stale/missing books: {dist('pm_fresh_books')} / {dist('pm_stale_books')} / {dist('pm_missing_books')}",
+        f"- Возраст локальных PM books: p50 {dist('pm_book_age_p50_sec', ' сек.')}; p95 {dist('pm_book_age_p95_sec', ' сек.')}; max {dist('pm_book_age_max_sec', ' сек.')}",
+        f"- Возраст PM source events: p50 {dist('pm_source_event_age_p50_sec', ' сек.')}; p95 {dist('pm_source_event_age_p95_sec', ' сек.')}; max {dist('pm_source_event_age_max_sec', ' сек.')}",
         "",
         "## Latency (receipt → сборка scanner status, не end-to-end)",
         "",

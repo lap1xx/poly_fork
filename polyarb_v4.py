@@ -1431,6 +1431,8 @@ def main():
     last_runtime_config_check = 0.0
     router_stats_cache = {}
     router_feed_health_cache = {}
+    pm_book_health_cache = {}
+    last_pm_health_refresh = 0.0
     event_latency_window = RollingEventLatency(window_sec=900.0, max_samples=4096)
     rolling_event_latency_cache = event_latency_window.snapshot()
     last_event_latency_snapshot = 0.0
@@ -1907,6 +1909,17 @@ def main():
                 router_stats_cache = router.stats(market_map.keys())
                 router_feed_health_cache = router.feed_health()
                 last_router_health_refresh = _now
+            if _now - last_pm_health_refresh >= 1.0:
+                _pm_token_ids = {
+                    str(_token)
+                    for _market in market_map.values()
+                    for _token in ((_market or {}).get("t") or [])
+                    if _token is not None and str(_token).strip()
+                }
+                pm_book_health_cache = _pm_market_data.pm_book_health(
+                    _pm_token_ids, now=_now
+                )
+                last_pm_health_refresh = _now
             matching_stats = None
             if router is not None:
                 bound_markets = int(router_stats_cache.get("bindings", 0))
@@ -1988,6 +2001,7 @@ def main():
                     "pm_no_ask_markets": len(pm_no_ask_details),
                     "by_book_state": pm_book_states,
                 },
+                "pm_book_health": pm_book_health_cache,
                 "bookmaker_feed_health": router_feed_health_cache,
                 "pm_catalog_complete": pm_catalog_complete,
                 "pm_catalog_retained": pm_catalog_retained,
