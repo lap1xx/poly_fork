@@ -97,9 +97,10 @@ class ScannerPublisher:
                     if close_reason is not None:
                         close_reason = str(close_reason)[:120]
                     print(
-                        "[!] scanner dashboard WebSocket: %s seq=%s payload_bytes=%s "
+                        "[!] scanner dashboard WebSocket: %s event_epoch=%.3f seq=%s payload_bytes=%s "
                         "close_code=%s close_reason=%s"
-                        % (error_type, payload_seq, payload_bytes, close_code, close_reason),
+                        % (error_type, time.time(), payload_seq, payload_bytes,
+                           close_code, close_reason),
                         flush=True,
                     )
                 self._last_error = error_type

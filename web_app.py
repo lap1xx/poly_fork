@@ -778,7 +778,7 @@ async def scanner_ingest_ws(ws: WebSocket):
             if _broadcast_wakeup is not None:
                 _broadcast_wakeup.set()
     except WebSocketDisconnect as exc:
-        _logger.debug("scanner ingest peer disconnected: code=%s", getattr(exc, "code", None))
+        _logger.info("scanner ingest peer disconnected: code=%s", getattr(exc, "code", None))
         pass
     except Exception:
         _logger.exception("scanner ingest handler failed")

@@ -376,6 +376,17 @@ class ScannerIngressTests(unittest.TestCase):
         self.assertIn("scanner_to_backend_ms", web_app._scanner_state["scan_status"])
         self.assertTrue(web_app._broadcast_wakeup.is_set())
 
+    def test_peer_disconnect_code_is_logged_at_info_without_sensitive_data(self):
+        ws = _FakeBrowserlessWS([], headers={"authorization": "Bearer unit-test-secret"})
+        with patch.dict(os.environ, {"POLYARB_SCANNER_WS_TOKEN": "unit-test-secret"}), \
+             self.assertLogs("web_app", level="INFO") as captured:
+            self.loop.run_until_complete(web_app.scanner_ingest_ws(ws))
+        output = "\n".join(captured.output)
+        self.assertIn("peer disconnected", output)
+        self.assertIn("code=1000", output)
+        self.assertNotIn("unit-test-secret", output)
+        self.assertNotIn("Bearer", output)
+
     def test_oversized_snapshot_logs_close_reason_without_payload_or_auth(self):
         ws = _FakeBrowserlessWS(
             ["oversized-message"], headers={"authorization": "Bearer unit-test-secret"}
@@ -771,6 +782,7 @@ class ScannerPublisherTests(unittest.TestCase):
                 publisher.close()
         log_output = captured.getvalue()
         self.assertIn("BrokenPipeError", log_output)
+        self.assertIn("event_epoch=", log_output)
         self.assertIn("payload_bytes=", log_output)
         self.assertIn("close_code=", log_output)
         self.assertNotIn("ephemeral-secret", log_output)

@@ -131,6 +131,50 @@ class EventPhaseTests(unittest.TestCase):
 
 
 class PMCatalogRefreshTests(unittest.TestCase):
+    def test_background_catalog_refresh_does_not_block_and_prevents_overlap(self):
+        entered = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        def slow_fetch():
+            calls.append(True)
+            entered.set()
+            release.wait(2.0)
+            return ({"market": {"slug": "market"}}, True)
+
+        worker = polyarb_v4.BackgroundCatalogRefresh(slow_fetch)
+        try:
+            started = time.monotonic()
+            self.assertTrue(worker.submit())
+            self.assertLess(time.monotonic() - started, 0.5)
+            self.assertTrue(entered.wait(1.0))
+            self.assertIsNone(worker.poll())
+            self.assertFalse(worker.submit())
+        finally:
+            release.set()
+
+        result = None
+        deadline = time.monotonic() + 2.0
+        while result is None and time.monotonic() < deadline:
+            result = worker.poll()
+            if result is None:
+                time.sleep(0.01)
+        self.assertEqual(result, (True, ({"market": {"slug": "market"}}, True)))
+        self.assertEqual(len(calls), 1)
+
+    def test_background_catalog_refresh_returns_only_exception_type(self):
+        worker = polyarb_v4.BackgroundCatalogRefresh(
+            lambda: (_ for _ in ()).throw(RuntimeError("sensitive request detail"))
+        )
+        self.assertTrue(worker.submit())
+        result = None
+        deadline = time.monotonic() + 2.0
+        while result is None and time.monotonic() < deadline:
+            result = worker.poll()
+            if result is None:
+                time.sleep(0.01)
+        self.assertEqual(result, (False, "RuntimeError"))
+
     class FakeResponse:
         def __init__(self, payload=None, status_code=200):
             self.payload = payload if payload is not None else {

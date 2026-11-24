@@ -1,6 +1,7 @@
 """Polymarket Gamma keyset catalog acquisition and conservative reconciliation."""
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
+from queue import Empty, Queue
 import threading
 import time
 import requests
@@ -354,6 +355,46 @@ def fetch_live_pm_markets(
             flush=True,
         )
     return (out, complete) if with_status else out
+
+
+class BackgroundCatalogRefresh:
+    """Run one bounded catalog acquisition without blocking the scanner loop."""
+
+    def __init__(self, fetch):
+        self._fetch = fetch
+        self._lock = threading.Lock()
+        self._results = Queue(maxsize=1)
+        self._running = False
+
+    def submit(self):
+        """Start one fetch; return False while a fetch/result is still pending."""
+        with self._lock:
+            if self._running or not self._results.empty():
+                return False
+            self._running = True
+            threading.Thread(
+                target=self._run,
+                name="pm-catalog-refresh",
+                daemon=True,
+            ).start()
+            return True
+
+    def _run(self):
+        try:
+            result = (True, self._fetch())
+        except Exception as exc:
+            # Do not retain/log exception text that could contain request details.
+            result = (False, type(exc).__name__)
+        self._results.put(result)
+        with self._lock:
+            self._running = False
+
+    def poll(self):
+        """Return (success, value-or-error-type), or None without waiting."""
+        try:
+            return self._results.get_nowait()
+        except Empty:
+            return None
 
 
 def reconcile_pm_market_map(current, fresh, refresh_complete):

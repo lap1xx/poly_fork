@@ -730,6 +730,7 @@ def fetch_live_pm_slugs():
 
 # Catalog fetch implementation lives in pm_catalog; keep legacy facade seams patchable.
 import pm_catalog as _pm_catalog
+BackgroundCatalogRefresh = _pm_catalog.BackgroundCatalogRefresh
 _PM_CATALOG_DIAGNOSTICS_LOCK = _pm_catalog._PM_CATALOG_DIAGNOSTICS_LOCK
 _PM_CATALOG_DIAGNOSTICS = _pm_catalog._PM_CATALOG_DIAGNOSTICS
 
@@ -1385,6 +1386,9 @@ def main():
 
     last_retry = time.time()
     last_pm_refresh = time.time()
+    catalog_refresh_worker = BackgroundCatalogRefresh(
+        lambda: fetch_live_pm_markets(with_status=True)
+    )
     scan_iteration = 0
     last_status_write = 0.0
     last_scan_status = {
@@ -1540,51 +1544,65 @@ def main():
                 newly_bound_slugs.clear()
             snapshot_changed = False
 
+            completed_catalog_refresh = catalog_refresh_worker.poll()
+            if completed_catalog_refresh is not None:
+                refresh_ok, refresh_result = completed_catalog_refresh
+                if not refresh_ok:
+                    print("[!] PM catalog refresh failed: %s" % refresh_result)
+                    pm_catalog_complete = False
+                    pm_catalog_retained = bool(market_map)
+                    last_pm_refresh = time.time()
+                    now = last_pm_refresh
+                else:
+                    fresh, refresh_complete = refresh_result
+                    previous_market_map = dict(market_map)
+                    had_previous_catalog = bool(market_map)
+                    market_map, added, removed = reconcile_pm_market_map(
+                        market_map, fresh, refresh_complete
+                    )
+                    changed_slugs = {
+                        slug for slug, market in market_map.items()
+                        if slug not in previous_market_map
+                        or previous_market_map.get(slug) != market
+                    }
+                    removed_slugs = set(previous_market_map) - set(market_map)
+                    if removed_slugs:
+                        for slug in removed_slugs:
+                            removed_snapshot = live_snap.pop(slug, None)
+                            if removed_snapshot is not None:
+                                recent_signal_drops[slug] = _make_signal_drop_diagnostic(
+                                    removed_snapshot, "market_removed", time.time(), min_roi
+                                )
+                            best_by_slug.pop(slug, None)
+                            best_by_slug_updated_at.pop(slug, None)
+                        snapshot_changed = True
+                    dirty_slugs.update(changed_slugs)
+                    pm_catalog_complete = refresh_complete
+                    pm_catalog_retained = not refresh_complete and had_previous_catalog
+                    if added or removed:
+                        print("[*] watch: +%d / -%d markets (total %d)"
+                              % (added, removed, len(market_map)))
+                    if not refresh_complete:
+                        print("[!] PM catalog refresh partial; preserving prior entries until a complete refresh")
+                    refreshed_tokens = sorted({
+                        str(token)
+                        for market in market_map.values()
+                        for token in (market.get("t") or [])
+                        if token
+                    })
+                    if refreshed_tokens != tokens and feed.update_tokens(refreshed_tokens):
+                        tokens = refreshed_tokens
+                        print("[*] PM feed resubscribe: %d tokens" % len(tokens))
+                    refresh_event_indexes()
+                    if changed_slugs:
+                        retry_bind()
+                        dirty_slugs.update(newly_bound_slugs)
+                        newly_bound_slugs.clear()
+                    last_pm_refresh = time.time()
+                    now = last_pm_refresh
+
             if args.watch and now - last_pm_refresh >= watch_sec:
-                previous_market_map = dict(market_map)
-                fresh, refresh_complete = fetch_live_pm_markets(with_status=True)
-                had_previous_catalog = bool(market_map)
-                market_map, added, removed = reconcile_pm_market_map(
-                    market_map, fresh, refresh_complete
-                )
-                changed_slugs = {
-                    slug for slug, market in market_map.items()
-                    if slug not in previous_market_map or previous_market_map.get(slug) != market
-                }
-                removed_slugs = set(previous_market_map) - set(market_map)
-                if removed_slugs:
-                    for slug in removed_slugs:
-                        removed_snapshot = live_snap.pop(slug, None)
-                        if removed_snapshot is not None:
-                            recent_signal_drops[slug] = _make_signal_drop_diagnostic(
-                                removed_snapshot, "market_removed", time.time(), min_roi
-                            )
-                        best_by_slug.pop(slug, None)
-                        best_by_slug_updated_at.pop(slug, None)
-                    snapshot_changed = True
-                dirty_slugs.update(changed_slugs)
-                pm_catalog_complete = refresh_complete
-                pm_catalog_retained = not refresh_complete and had_previous_catalog
-                if added or removed:
-                    print("[*] watch: +%d / -%d markets (total %d)"
-                          % (added, removed, len(market_map)))
-                if not refresh_complete:
-                    print("[!] PM catalog refresh partial; preserving prior entries until a complete refresh")
-                refreshed_tokens = sorted({
-                    str(token)
-                    for market in market_map.values()
-                    for token in (market.get("t") or [])
-                    if token
-                })
-                if refreshed_tokens != tokens and feed.update_tokens(refreshed_tokens):
-                    tokens = refreshed_tokens
-                    print("[*] PM feed resubscribe: %d tokens" % len(tokens))
-                refresh_event_indexes()
-                if changed_slugs:
-                    retry_bind()
-                    dirty_slugs.update(newly_bound_slugs)
-                    newly_bound_slugs.clear()
-                last_pm_refresh = time.time()
+                catalog_refresh_worker.submit()
 
             if now - last_retry >= 10:
                 retry_bind()
