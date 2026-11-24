@@ -25,6 +25,7 @@ except Exception:
 
 import requests
 from arb_invariants import is_pm_bookmaker_pair as _is_pm_bookmaker_pair
+from arb_candidates import build_arb_candidates as _build_arb_candidates
 from event_dispatch import (
     DirtyUpdateQueue,
     build_adapter_event_index,
@@ -1857,121 +1858,19 @@ def _write_match_diagnostics(router, market_map):
 def build_arb_candidates(m, live_bc, slip, bank=0.0, rate=0.0,
                          bk_source="BetBoom", diagnostics=None,
                          pm_diagnostics=None, market_slug=None):
-    def note(reason):
-        if diagnostics is not None:
-            diagnostics[reason] = diagnostics.get(reason, 0) + 1
-
-    source_label = str(bk_source or "").strip()
-    if not source_label or "polymarket" in source_label.casefold():
-        note("invalid_bookmaker_source")
-        return []
-
-    pm_o = m.get("o") or []
-    pm_t = m.get("t") or []
-    if len(pm_o) != 2 or len(pm_t) != 2 or not live_bc:
-        note("invalid_market_or_no_quotes")
-        return []
-
-    fee_schedule = fetch_pm_fee_schedule(m.get("condition_id"))
-    if fee_schedule is None:
-        note("pm_fee_unavailable")
-        return []
-    pm_fee_rate = fee_schedule["rate"]
-    pm_fee_exponent = fee_schedule["exponent"]
-
-    usd_target = 50.0
-    try:
-        if bank and bank > 0:
-            usd_target = max(20.0, min(200.0, bank * 0.5))
-    except Exception:
-        pass
-
-    pm_legs = []
-    for i, oc in enumerate(pm_o):
-        try:
-            _maybe_refresh_stale(pm_t[i])
-        except Exception:
-            pass
-        ba = best_ask(pm_t[i])
-        if ba <= 0:
-            note("pm_no_ask")
-            if pm_diagnostics is not None:
-                row = {
-                    "market_slug": str(market_slug or m.get("slug") or ""),
-                    "outcome": str(oc),
-                    "token_id": str(pm_t[i]),
-                }
-                row.update(pm_book_diagnostic(pm_t[i]))
-                pm_diagnostics.append(row)
-            return []
-        depth_quote = walk_book_with_fee(
-            pm_t[i], usd_target, pm_fee_rate, pm_fee_exponent
-        )
-        if not depth_quote:
-            note("pm_depth_short")
-            return []
-        avg = depth_quote["avg_price"]
-        if avg > ba * 1.05:
-            note("pm_impact_rejected")
-            return []
-        pm_book_age = pm_age_sec(pm_t[i])
-        pm_legs.append({
-            "source": "Polymarket",
-            "outcome": oc,
-            "o": depth_quote["effective_multiplier"],
-            "c": 0.0,
-            "s": slip,
-            "token": pm_t[i],
-            "pm_fee_enabled": fee_schedule["fees_enabled"],
-            "pm_fee_rate": pm_fee_rate,
-            "pm_fee_exponent": pm_fee_exponent,
-            "pm_fee_source": fee_schedule["source"],
-            "pm_fee_estimated_usd": depth_quote["fee"],
-            "pm_best_ask": ba,
-            "pm_best_bid": best_bid(pm_t[i]),
-            "pm_avg_ask": avg,
-            "pm_age": pm_book_age,
-            "pm_book_age_sec": pm_book_age,
-            "pm_target_usd": usd_target,
-            "pm_target_shares": depth_quote["shares"],
-            "pm_verified": pm_refresh_attempted(pm_t[i]),
-        })
-
-    bk_legs = {}
-    for oc, info in live_bc.items():
-        try:
-            o = float(info.get("o") or 0)
-        except Exception:
-            continue
-        if o <= 1.0:
-            continue
-        bk_legs[oc] = {
-            "source": source_label,
-            "outcome": oc,
-            "o": o,
-            "c": float(info.get("c", 0.0)),
-            "s": slip,
-            "odds_age_sec": info.get("age_sec"),
-        }
-
-    pairs = []
-    for i, pm_oc in enumerate(pm_o):
-        other = pm_o[1 - i]
-        bb = bk_legs.get(other)
-        if bb:
-            pair = [pm_legs[i], bb]
-            if _is_pm_bookmaker_pair(
-                pair,
-                expected_bookmaker_source=source_label,
-                require_pm_token=True,
-                require_prices=True,
-            ):
-                pairs.append(pair)
-            else:
-                note("invalid_candidate_pair")
-    if not pairs:
-        note("no_opposite_bk_market")
-    return pairs
+    """Compatibility facade; candidate construction lives in arb_candidates."""
+    return _build_arb_candidates(
+        m, live_bc, slip, bank, rate, bk_source, diagnostics,
+        pm_diagnostics, market_slug,
+        fetch_pm_fee_schedule=fetch_pm_fee_schedule,
+        maybe_refresh_stale=_maybe_refresh_stale,
+        best_ask=best_ask,
+        walk_book_with_fee=walk_book_with_fee,
+        pm_age_sec=pm_age_sec,
+        best_bid=best_bid,
+        pm_refresh_attempted=pm_refresh_attempted,
+        pm_book_diagnostic=pm_book_diagnostic,
+    )
 
 
 def _classify_signal_drop_reason(*, market_missing=False, has_fresh_bookmaker=False,

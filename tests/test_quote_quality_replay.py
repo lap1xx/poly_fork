@@ -179,6 +179,18 @@ class QuoteQualityReplayTests(unittest.TestCase):
                 bk_source="1win",
                 market_slug=slug,
             )
+            self.assertEqual(
+                [(pair[0]["outcome"], pair[1]["outcome"]) for pair in pairs],
+                [
+                    ("100 Thieves", "Chinggis Warriors"),
+                    ("Chinggis Warriors", "100 Thieves"),
+                ],
+            )
+            self.assertAlmostEqual(pairs[0][0]["pm_fee_estimated_usd"],
+                                   0.16856717897868126, places=12)
+            self.assertAlmostEqual(pairs[1][0]["pm_fee_estimated_usd"],
+                                   0.7877041306436121, places=12)
+            self.assertEqual([pair[1]["o"] for pair in pairs], [10.0, 2.0])
             bets = next(pair for pair in pairs if pair[0]["outcome"] == "100 Thieves")
             calculation = polyarb_v4.compute(
                 bets, self.fixture["planned_stake_usdt"]
