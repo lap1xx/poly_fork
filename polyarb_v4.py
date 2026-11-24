@@ -27,6 +27,7 @@ from arb_invariants import is_pm_bookmaker_pair as _is_pm_bookmaker_pair
 from arb_candidates import build_arb_candidates as _build_arb_candidates
 from event_dispatch import (
     DirtyUpdateQueue,
+    RollingEventLatency,
     build_adapter_event_index,
     build_token_slug_index,
     resolve_dirty_slugs,
@@ -1413,6 +1414,9 @@ def main():
     last_runtime_config_check = 0.0
     router_stats_cache = {}
     router_feed_health_cache = {}
+    event_latency_window = RollingEventLatency(window_sec=900.0, max_samples=4096)
+    rolling_event_latency_cache = event_latency_window.snapshot()
+    last_event_latency_snapshot = 0.0
     phase_counts_cache = {"live": 0, "prematch": 0, "unknown": 0}
     last_pm_diag_write = 0.0
 
@@ -1869,6 +1873,15 @@ def main():
             batch_best_candidate_roi = best_candidate_roi
             batch_best_candidate_slug = best_candidate_slug
             _now = time.time()
+            _observed_at = time.monotonic()
+            for _source, _event_at in source_event_at_by_source.items():
+                event_latency_window.add(
+                    _source, max(0.0, _now - _event_at) * 1000.0,
+                    observed_at=_observed_at,
+                )
+            if _observed_at - last_event_latency_snapshot >= 1.0:
+                rolling_event_latency_cache = event_latency_window.snapshot(_observed_at)
+                last_event_latency_snapshot = _observed_at
             pm_book_states = {}
             for _detail in pm_no_ask_details:
                 _state = _detail.get("book_state", "unknown")
@@ -1940,6 +1953,7 @@ def main():
                     source: round(max(0.0, _now - event_at) * 1000, 1)
                     for source, event_at in source_event_at_by_source.items()
                 },
+                "rolling_event_to_scan_status_latency": rolling_event_latency_cache,
                 "enabled_bk_sources": (
                     (["1win"] if router is not None and router.use_onewin else [])
                     + (["BetBoom"] if (router.use_bb if router is not None else BB_ENABLED) else [])

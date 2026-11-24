@@ -15,6 +15,7 @@ import polyarb_v4
 import web_app
 from event_dispatch import (
     DirtyUpdateQueue,
+    RollingEventLatency,
     build_adapter_event_index,
     build_token_slug_index,
     resolve_dirty_slugs,
@@ -75,6 +76,42 @@ class DirtyUpdateQueueTests(unittest.TestCase):
             {"market-a", "market-b", "market-c"},
         )
         self.assertEqual(resolve_dirty_slugs([("unknown", "501", 1)], {}, index), set())
+
+
+class RollingEventLatencyTests(unittest.TestCase):
+    def test_snapshot_reports_nearest_rank_percentiles_per_source(self):
+        metrics = RollingEventLatency(window_sec=900, max_samples=10)
+        self.assertTrue(metrics.add("pm", 10, observed_at=100))
+        self.assertTrue(metrics.add("pm", 20, observed_at=101))
+        self.assertTrue(metrics.add("1win", 100, observed_at=102))
+
+        snapshot = metrics.snapshot(now=102)
+        self.assertEqual(snapshot["window_sec"], 900)
+        self.assertEqual(snapshot["sample_span_sec"], 2.0)
+        self.assertEqual(snapshot["overall"], {
+            "sample_count": 3, "p50_ms": 20.0, "p95_ms": 100.0,
+            "max_ms": 100.0,
+        })
+        self.assertEqual(snapshot["by_source"]["pm"]["p95_ms"], 20.0)
+        self.assertEqual(snapshot["by_source"]["1win"]["sample_count"], 1)
+
+    def test_samples_expire_and_capacity_is_bounded(self):
+        metrics = RollingEventLatency(window_sec=5, max_samples=2)
+        metrics.add("pm", 1, observed_at=10)
+        metrics.add("pm", 2, observed_at=11)
+        metrics.add("pm", 3, observed_at=12)
+        snapshot = metrics.snapshot(now=12)
+        self.assertEqual(snapshot["overall"]["sample_count"], 2)
+        self.assertEqual(snapshot["overall"]["p50_ms"], 2.0)
+        self.assertEqual(snapshot["max_samples"], 2)
+        self.assertEqual(metrics.snapshot(now=18)["overall"]["sample_count"], 0)
+
+    def test_invalid_samples_are_ignored(self):
+        metrics = RollingEventLatency()
+        self.assertFalse(metrics.add("", 1))
+        self.assertFalse(metrics.add("pm", float("nan")))
+        self.assertFalse(metrics.add("pm", -1))
+        self.assertEqual(metrics.snapshot()["overall"]["sample_count"], 0)
 
 
 class FeedCallbackTests(unittest.TestCase):
