@@ -31,6 +31,7 @@
       </div>
       <div class="feed-indicator" role="status"><span class="feed-dot" id="feed-dot" aria-hidden="true"></span><span id="feed-status">Ожидание соединения</span></div>
       <button class="header-action" id="btn-daily" type="button">Итоги дня</button>
+      <button class="header-action tools-toggle" id="btn-tools-toggle" type="button" aria-expanded="false" aria-controls="col-calc" aria-label="Показать инструменты">ИНСТРУМЕНТЫ <span aria-hidden="true">⌗</span></button>
       <button class="icon-btn" id="st-sound" title="Звук" aria-label="Звук">🔊</button>
       <button class="icon-btn" id="btn-config" title="Настройки" aria-label="Настройки">⚙</button>
       <button class="icon-btn danger" id="btn-shutdown" title="Закрыть веб-панель" aria-label="Закрыть веб-панель">⏻</button>
@@ -38,7 +39,7 @@
   </header>
 
   <!-- ============ 3-COLUMN GRID ============ -->
-  <main class="grid">
+  <main class="grid tools-collapsed">
 
     <!-- ============ COL 1: ARBS LIST ============ -->
     <aside class="col-list">
@@ -218,7 +219,7 @@
     </section>
 
     <!-- ============ COL 3: CALCULATOR ============ -->
-    <aside class="col-calc">
+    <aside class="col-calc" id="col-calc">
       <div class="calc-heading"><div><div class="eyebrow">ДОПОЛНИТЕЛЬНО</div><div class="calc-head">Инструменты</div></div><span class="calc-symbol" aria-hidden="true">⌗</span></div>
       <p class="calc-intro">В активной вилке суммы и коэффициенты уже показаны по каждой ноге. Ручной расчёт — только для сценария «что если».</p>
 

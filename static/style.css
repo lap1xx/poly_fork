@@ -889,3 +889,15 @@ button:disabled:hover{border-color:var(--line);color:var(--txt);background:var(-
   .kpi{padding:9px}
   .hm-info{grid-template-columns:1fr}
 }
+
+
+/* Keep optional utilities out of the live workspace until requested. */
+.tools-toggle{font-size:10px;padding:8px 10px}
+.tools-toggle span{margin-left:4px;color:var(--green);font:700 13px var(--mono)}
+.grid.tools-collapsed .col-calc{display:none!important}
+@media(min-width:1201px){
+  .grid.tools-collapsed{grid-template-columns:270px minmax(0,1fr)}
+}
+@media(max-width:900px){
+  .tools-toggle{font-size:9px;padding:7px 8px}
+}

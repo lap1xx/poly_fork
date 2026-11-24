@@ -261,6 +261,22 @@ class DashboardBrowserParityTests(unittest.TestCase):
                             self.assertEqual(card.locator(".arb-roi").inner_text(), "+3.10%")
                             self.assertEqual(card.locator(".tag.phase-prematch").inner_text(), "ПРЕМАТЧ")
                             self.assertLess(card.evaluate("e => e.getBoundingClientRect().height"), 115)
+                            tools_toggle = page.locator("#btn-tools-toggle")
+                            self.assertEqual(tools_toggle.get_attribute("aria-expanded"), "false")
+                            self.assertFalse(page.locator("#col-calc").is_visible())
+                            detail_width_collapsed = page.locator("#col-detail").evaluate(
+                                "e => e.getBoundingClientRect().width"
+                            )
+                            tools_toggle.click()
+                            self.assertEqual(tools_toggle.get_attribute("aria-expanded"), "true")
+                            self.assertTrue(page.locator("#col-calc").is_visible())
+                            detail_width_expanded = page.locator("#col-detail").evaluate(
+                                "e => e.getBoundingClientRect().width"
+                            )
+                            self.assertGreater(detail_width_collapsed, detail_width_expanded)
+                            tools_toggle.click()
+                            self.assertEqual(tools_toggle.get_attribute("aria-expanded"), "false")
+                            self.assertFalse(page.locator("#col-calc").is_visible())
                             warning_tags = card.locator(".arb-tags .pm-age").all_inner_texts()
                             self.assertEqual(sum("УСТАРЕЛИ" in tag or "КОТИРОВКИ УСТАРЕЛИ" in tag for tag in warning_tags), 1)
                             page.wait_for_function(

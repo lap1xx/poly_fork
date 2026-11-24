@@ -2102,6 +2102,27 @@ function init() {
     });
   }
 
+  const grid = document.querySelector('.grid');
+  const toolsToggle = document.getElementById('btn-tools-toggle');
+  const toolsPanel = document.getElementById('col-calc');
+  if (grid && toolsToggle && toolsPanel) {
+    const savedToolsCollapsed = localStorage.getItem('poly_arb_tools_collapsed');
+    const setToolsCollapsed = collapsed => {
+      grid.classList.toggle('tools-collapsed', collapsed);
+      toolsToggle.setAttribute('aria-expanded', String(!collapsed));
+      toolsToggle.setAttribute('aria-label', collapsed ? 'Показать инструменты' : 'Скрыть инструменты');
+      toolsToggle.innerHTML = collapsed
+        ? 'ИНСТРУМЕНТЫ <span aria-hidden="true">⌗</span>'
+        : 'СКРЫТЬ ИНСТРУМЕНТЫ <span aria-hidden="true">⌃</span>';
+    };
+    setToolsCollapsed(savedToolsCollapsed === null ? true : savedToolsCollapsed !== 'false');
+    toolsToggle.addEventListener('click', () => {
+      const collapsed = !grid.classList.contains('tools-collapsed');
+      setToolsCollapsed(collapsed);
+      localStorage.setItem('poly_arb_tools_collapsed', String(collapsed));
+    });
+  }
+
   const soundBtn = document.getElementById('st-sound');
   if (soundBtn) soundBtn.addEventListener('click', toggleSound);
   updateSoundBtn();
