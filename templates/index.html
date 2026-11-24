@@ -58,16 +58,18 @@
       <section class="scan-health" id="scan-health" aria-live="polite">
         <div class="scan-health-top">
           <div><div class="eyebrow" id="scan-health-mode">ОЖИДАНИЕ СКАНЕРА</div><b id="scan-health-label">Ожидание сканера</b></div>
-          <span class="scan-health-time" id="scan-health-time">—</span>
+          <div class="scan-health-tools"><span class="scan-health-time" id="scan-health-time">—</span><button class="scan-details-toggle" id="btn-scan-details" type="button" aria-expanded="false" aria-controls="scan-health-details">ДЕТАЛИ <span aria-hidden="true">⌄</span></button></div>
         </div>
-        <div class="scan-health-kpis">
-          <div><b id="scan-checked">—</b><span id="scan-checked-label">в пакете / каталог</span></div>
-          <div><b id="scan-quotes">—</b><span>с котировкой в пакете</span></div>
-          <div><b id="scan-signals">—</b><span>сигналов</span></div>
+        <div class="scan-health-details" id="scan-health-details" hidden>
+          <div class="scan-health-kpis">
+            <div><b id="scan-checked">—</b><span id="scan-checked-label">в пакете / каталог</span></div>
+            <div><b id="scan-quotes">—</b><span>с котировкой в пакете</span></div>
+            <div><b id="scan-signals">—</b><span>сигналов</span></div>
+          </div>
+          <div class="scan-phase-line">LIVE <b id="scan-live">—</b> · ПРЕМАТЧ <b id="scan-prematch">—</b> · НЕИЗВ. <b id="scan-unknown">—</b></div>
+          <div class="scan-reasons" id="scan-reasons">Здесь будут причины отсева сигналов.</div>
+          <div class="scan-drop hidden" id="scan-signal-drop" aria-live="polite"></div>
         </div>
-        <div class="scan-phase-line">LIVE <b id="scan-live">—</b> · ПРЕМАТЧ <b id="scan-prematch">—</b> · НЕИЗВ. <b id="scan-unknown">—</b></div>
-        <div class="scan-reasons" id="scan-reasons">Здесь будут причины отсева сигналов.</div>
-        <div class="scan-drop hidden" id="scan-signal-drop" aria-live="polite"></div>
       </section>
       <div class="list-caption"><span>НАЙДЕННЫЕ ВИЛКИ · СНИМКИ ВНИЗУ</span><span>ПО ROI ↓</span></div>
       <div class="arbs-list" id="arbs-list">

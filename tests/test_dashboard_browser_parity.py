@@ -267,11 +267,27 @@ class DashboardBrowserParityTests(unittest.TestCase):
                                 "document.querySelector('#risk-limit-label')?.textContent === '25% на один план'"
                             )
                             self.assertIn("10,00 USDT", page.locator("#risk-limit").inner_text())
+                            scan_toggle = page.locator("#btn-scan-details")
+                            self.assertEqual(scan_toggle.get_attribute("aria-expanded"), "false")
+                            self.assertFalse(page.locator("#scan-health-details").is_visible())
+                            collapsed_health_height = page.locator("#scan-health").evaluate(
+                                "e => e.getBoundingClientRect().height"
+                            )
+                            scan_toggle.click()
+                            self.assertEqual(scan_toggle.get_attribute("aria-expanded"), "true")
+                            self.assertTrue(page.locator("#scan-health-details").is_visible())
+                            expanded_health_height = page.locator("#scan-health").evaluate(
+                                "e => e.getBoundingClientRect().height"
+                            )
+                            self.assertGreater(expanded_health_height, collapsed_health_height)
                             health_text = page.locator("#scan-reasons").inner_text()
                             self.assertIn("PM TTL 30 с", health_text)
                             self.assertIn("1win TTL 45 с (переменная среды)", health_text)
                             self.assertIn("Gamma 100/страницу × 50 страниц", health_text)
                             self.assertIn("риск-план 25% банка", health_text)
+                            scan_toggle.click()
+                            self.assertEqual(scan_toggle.get_attribute("aria-expanded"), "false")
+                            self.assertFalse(page.locator("#scan-health-details").is_visible())
 
                             page.locator("#btn-config").click()
                             page.wait_for_function(

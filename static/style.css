@@ -799,6 +799,14 @@ button:disabled:hover{border-color:var(--line);color:var(--txt);background:var(-
 .chk.minroi{padding-top:6px}
 .bk-settings-btn{padding:6px 8px}
 .scan-health{margin-top:7px;padding:8px 9px;border-radius:8px}
+.scan-health-top{align-items:center;min-height:29px}
+.scan-health-tools{display:flex;align-items:center;gap:7px;flex:none}
+.scan-details-toggle{display:inline-flex;align-items:center;gap:3px;padding:4px 5px;border:1px solid #304253;border-radius:5px;
+  background:#0b1722;color:#aebfc9;font-size:8px;font-weight:800;letter-spacing:.05em;white-space:nowrap}
+.scan-details-toggle:hover{border-color:var(--green);color:var(--green)}
+.scan-details-toggle span{font:700 11px var(--mono);color:var(--green)}
+.scan-health-details[hidden]{display:none!important}
+.scan-health-details:not([hidden]){padding-top:5px}
 .scan-health-kpis{margin:7px 0 5px}
 .scan-health-kpis>div{padding:4px 5px}
 .scan-phase-line{padding:4px 1px}
@@ -873,6 +881,8 @@ button:disabled:hover{border-color:var(--line);color:var(--txt);background:var(-
   .grid{gap:12px;padding:12px 10px 20px}
   .col-list{gap:0}
   .scan-reasons{-webkit-line-clamp:3}
+  .scan-health-tools{gap:4px}
+  .scan-health-time{font-size:8px}
   .arbs-list{max-height:300px}
   .det-title{font-size:17px}
   .kpi-row{gap:6px}

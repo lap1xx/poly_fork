@@ -2089,6 +2089,19 @@ function init() {
   const bkSettingsBtn = document.getElementById('btn-bk-settings');
   if (bkSettingsBtn) bkSettingsBtn.addEventListener('click', openBkModal);
 
+  const scanDetailsToggle = document.getElementById('btn-scan-details');
+  const scanDetails = document.getElementById('scan-health-details');
+  if (scanDetailsToggle && scanDetails) {
+    scanDetailsToggle.addEventListener('click', () => {
+      const expanded = scanDetailsToggle.getAttribute('aria-expanded') !== 'true';
+      scanDetailsToggle.setAttribute('aria-expanded', String(expanded));
+      scanDetails.hidden = !expanded;
+      scanDetailsToggle.innerHTML = expanded
+        ? 'СВЕРНУТЬ <span aria-hidden="true">⌃</span>'
+        : 'ДЕТАЛИ <span aria-hidden="true">⌄</span>';
+    });
+  }
+
   const soundBtn = document.getElementById('st-sound');
   if (soundBtn) soundBtn.addEventListener('click', toggleSound);
   updateSoundBtn();
