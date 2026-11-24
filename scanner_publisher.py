@@ -44,9 +44,25 @@ class ScannerPublisher:
         if self._thread.is_alive():
             self._thread.join(timeout=max(0.0, float(timeout)))
 
+    def _drain_server_frames(self, ws, reader_stop, disconnected):
+        """Read control frames so websocket-client can answer server pings."""
+        try:
+            while not reader_stop.is_set():
+                frame = ws.recv()
+                if frame is None:
+                    break
+        except Exception:
+            pass
+        finally:
+            if not reader_stop.is_set():
+                disconnected.set()
+                self._wake.set()
+
     def _run(self):
         while not self._stop.is_set():
             ws = None
+            reader = None
+            reader_stop = None
             payload_bytes = None
             payload_seq = self._seq
             try:
@@ -55,6 +71,18 @@ class ScannerPublisher:
                     timeout=3.0,
                     header=["Authorization: Bearer " + self.token],
                 )
+                # The connection timeout above protects the handshake. Keep the
+                # receive thread open so websocket-client processes server pings.
+                ws.settimeout(None)
+                reader_stop = threading.Event()
+                disconnected = threading.Event()
+                reader = threading.Thread(
+                    target=self._drain_server_frames,
+                    args=(ws, reader_stop, disconnected),
+                    name="scanner-dashboard-ws-reader",
+                    daemon=True,
+                )
+                reader.start()
                 self._connected.set()
                 self._last_error = None
                 if self._verbose:
@@ -63,9 +91,13 @@ class ScannerPublisher:
                 # arrives between a dropped socket and the next connection.
                 self._wake.set()
                 while not self._stop.is_set():
+                    if disconnected.is_set():
+                        raise ConnectionError("scanner WebSocket peer disconnected")
                     if not self._wake.wait(1.0):
                         continue
                     self._wake.clear()
+                    if disconnected.is_set():
+                        raise ConnectionError("scanner WebSocket peer disconnected")
                     with self._lock:
                         state = self._latest
                         arbs = dict(state["arbs"])
@@ -108,8 +140,12 @@ class ScannerPublisher:
                     self._stop.wait(self._reconnect_seconds)
             finally:
                 self._connected.clear()
+                if reader_stop is not None:
+                    reader_stop.set()
                 if ws is not None:
                     try:
                         ws.close()
                     except Exception:
                         pass
+                if reader is not None and reader.is_alive():
+                    reader.join(timeout=0.2)

@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from contextlib import redirect_stdout
@@ -694,13 +695,23 @@ class ScannerPublisherTests(unittest.TestCase):
         def __init__(self):
             self.sent = []
             self.lock = __import__("threading").Lock()
+            self.recv_started = threading.Event()
+            self.closed = threading.Event()
+
+        def settimeout(self, _timeout):
+            pass
 
         def send(self, text):
             with self.lock:
                 self.sent.append(text)
 
+        def recv(self):
+            self.recv_started.set()
+            self.closed.wait(5.0)
+            return None
+
         def close(self):
-            pass
+            self.closed.set()
 
     class WebsocketModule:
         def __init__(self):
@@ -719,6 +730,7 @@ class ScannerPublisherTests(unittest.TestCase):
         )
         try:
             publisher.publish({"slug": {"roi": 0.1}}, {"cycle": 4})
+            self.assertTrue(module.socket.recv_started.wait(1.0))
             deadline = time.time() + 2
             payload = None
             while time.time() < deadline:
