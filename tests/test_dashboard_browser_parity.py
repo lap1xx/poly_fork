@@ -259,6 +259,8 @@ class DashboardBrowserParityTests(unittest.TestCase):
                             self.assertEqual(card.get_attribute("data-arb-slug"), expected["market"]["slug"])
                             self.assertEqual(card.locator(".arb-title").inner_text(), expected["market"]["question"])
                             self.assertEqual(card.locator(".arb-roi").inner_text(), "+3.10%")
+                            self.assertEqual(card.locator(".tag.phase-prematch").inner_text(), "ПРЕМАТЧ")
+                            self.assertLess(card.evaluate("e => e.getBoundingClientRect().height"), 115)
                             warning_tags = card.locator(".arb-tags .pm-age").all_inner_texts()
                             self.assertEqual(sum("УСТАРЕЛИ" in tag or "КОТИРОВКИ УСТАРЕЛИ" in tag for tag in warning_tags), 1)
                             page.wait_for_function(
@@ -288,6 +290,10 @@ class DashboardBrowserParityTests(unittest.TestCase):
                             detail_roi = page.locator("#kpi-roi")
                             detail_roi.wait_for(state="visible", timeout=5000)
                             self.assertEqual(detail_roi.inner_text(), "+3.10%")
+                            chart_height = page.locator(".price-chart").evaluate(
+                                "e => parseFloat(getComputedStyle(e).height)"
+                            )
+                            self.assertLessEqual(chart_height, 110)
                             self.assertEqual(page.locator("#market-pm-outcome").inner_text(), expected["legs"][0]["outcome"])
                             self.assertEqual(page.locator("#market-bk-outcome").inner_text(), expected["legs"][1]["outcome"])
 
