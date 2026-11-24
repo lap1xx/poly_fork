@@ -110,6 +110,16 @@ def build_sample(status, sampled_at_epoch=None):
         "rolling_event_to_scan_status_latency": _as_dict(
             status.get("rolling_event_to_scan_status_latency")
         ),
+        "event_queue_wait_ms_by_source": _as_dict(
+            status.get("event_queue_wait_ms_by_source")
+        ),
+        "rolling_event_queue_wait_latency": _as_dict(
+            status.get("rolling_event_queue_wait_latency")
+        ),
+        "rolling_dispatch_processing_latency": _as_dict(
+            status.get("rolling_dispatch_processing_latency")
+        ),
+        "pending_updates_after_drain": status.get("pending_updates_after_drain"),
         "runtime_limits": _as_dict(status.get("runtime_limits")),
         "enabled_bk_sources": status.get("enabled_bk_sources", []),
     }
@@ -251,6 +261,8 @@ def summarize_records(records):
     feed_error_samples = 0
     non_running_samples = 0
     latency_p95 = {}
+    queue_wait_latency_p95 = {}
+    dispatch_processing_p95 = {}
 
     for row in samples:
         matching = _as_dict(row.get("matching_stats"))
@@ -318,6 +330,14 @@ def summarize_records(records):
             p95 = _as_dict(stats).get("p95_ms")
             if _finite_number(p95) is not None:
                 latency_p95.setdefault(source, []).append(p95)
+        for field, destination in (
+            ("rolling_event_queue_wait_latency", queue_wait_latency_p95),
+            ("rolling_dispatch_processing_latency", dispatch_processing_p95),
+        ):
+            for source, stats in _as_dict(_as_dict(row.get(field)).get("by_source")).items():
+                p95 = _as_dict(stats).get("p95_ms")
+                if _finite_number(p95) is not None:
+                    destination.setdefault(source, []).append(p95)
 
     latest = samples[-1]
     latest_latency = _as_dict(latest.get("rolling_event_to_scan_status_latency"))
@@ -343,6 +363,14 @@ def summarize_records(records):
             "latest": latest_latency,
             "reported_p95_ms_over_capture": {
                 source: _distribution(values) for source, values in sorted(latency_p95.items())
+            },
+            "reported_queue_wait_p95_ms_over_capture": {
+                source: _distribution(values)
+                for source, values in sorted(queue_wait_latency_p95.items())
+            },
+            "reported_dispatch_processing_p95_ms_over_capture": {
+                source: _distribution(values)
+                for source, values in sorted(dispatch_processing_p95.items())
             },
         },
         "latest_runtime_limits": _as_dict(latest.get("runtime_limits")),
@@ -403,7 +431,7 @@ def format_markdown(summary):
         f"- Возраст локальных PM books: p50 {dist('pm_book_age_p50_sec', ' сек.')}; p95 {dist('pm_book_age_p95_sec', ' сек.')}; max {dist('pm_book_age_max_sec', ' сек.')}",
         f"- Возраст PM source events: p50 {dist('pm_source_event_age_p50_sec', ' сек.')}; p95 {dist('pm_source_event_age_p95_sec', ' сек.')}; max {dist('pm_source_event_age_max_sec', ' сек.')}",
         "",
-        "## Latency (receipt → сборка scanner status, не end-to-end)",
+        "## Latency (локальная scanner-диагностика, не end-to-end)",
         "",
     ]
     latency = summary["rolling_latency_window"]
@@ -412,6 +440,17 @@ def format_markdown(summary):
         lines.append(f"- {source}: распределение сообщаемого p95: {stats}")
     if not latency.get("reported_p95_ms_over_capture"):
         lines.append("- Нет latency samples.")
+    lines.extend(["", "### Разделение очереди и обработки", ""])
+    for label, key in (
+        ("Queue wait p95", "reported_queue_wait_p95_ms_over_capture"),
+        ("Dispatcher processing p95", "reported_dispatch_processing_p95_ms_over_capture"),
+    ):
+        rows = latency.get(key) or {}
+        if rows:
+            for source, stats in sorted(rows.items()):
+                lines.append(f"- {label}, {source}: {stats}")
+        else:
+            lines.append(f"- {label}: нет данных в этом capture.")
     return "\n".join(lines) + "\n"
 
 

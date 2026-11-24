@@ -47,6 +47,8 @@ class ScannerPublisher:
     def _run(self):
         while not self._stop.is_set():
             ws = None
+            payload_bytes = None
+            payload_seq = self._seq
             try:
                 ws = self._websocket.create_connection(
                     self.url,
@@ -69,6 +71,7 @@ class ScannerPublisher:
                         arbs = dict(state["arbs"])
                         status = dict(state["scan_status"])
                     self._seq += 1
+                    payload_seq = self._seq
                     payload = {
                         "type": "scanner.snapshot",
                         "schema_version": 1,
@@ -79,13 +82,26 @@ class ScannerPublisher:
                         "arbs": arbs,
                         "scan_status": status,
                     }
-                    ws.send(json.dumps(payload, ensure_ascii=False, allow_nan=False))
+                    serialized = json.dumps(payload, ensure_ascii=False, allow_nan=False)
+                    payload_bytes = len(serialized.encode("utf-8"))
+                    ws.send(serialized)
             except Exception as exc:
                 was_connected = self._connected.is_set()
                 self._connected.clear()
                 error_type = type(exc).__name__
                 if self._verbose and (was_connected or error_type != self._last_error):
-                    print("[!] scanner dashboard WebSocket: %s" % error_type, flush=True)
+                    close_code = getattr(ws, "close_status_code", None)
+                    close_reason = getattr(ws, "close_reason", None)
+                    if isinstance(close_reason, bytes):
+                        close_reason = close_reason.decode("utf-8", errors="replace")
+                    if close_reason is not None:
+                        close_reason = str(close_reason)[:120]
+                    print(
+                        "[!] scanner dashboard WebSocket: %s seq=%s payload_bytes=%s "
+                        "close_code=%s close_reason=%s"
+                        % (error_type, payload_seq, payload_bytes, close_code, close_reason),
+                        flush=True,
+                    )
                 self._last_error = error_type
                 if not self._stop.is_set():
                     self._stop.wait(self._reconnect_seconds)

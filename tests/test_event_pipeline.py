@@ -1,11 +1,13 @@
 import asyncio
 import importlib
+import io
 import json
 import os
 import sys
 import tempfile
 import time
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -374,6 +376,20 @@ class ScannerIngressTests(unittest.TestCase):
         self.assertIn("scanner_to_backend_ms", web_app._scanner_state["scan_status"])
         self.assertTrue(web_app._broadcast_wakeup.is_set())
 
+    def test_oversized_snapshot_logs_close_reason_without_payload_or_auth(self):
+        ws = _FakeBrowserlessWS(
+            ["oversized-message"], headers={"authorization": "Bearer unit-test-secret"}
+        )
+        with patch.dict(os.environ, {"POLYARB_SCANNER_WS_TOKEN": "unit-test-secret"}), \
+             patch.object(web_app, "SCANNER_WS_MAX_BYTES", 4), \
+             self.assertLogs("web_app", level="WARNING") as captured:
+            self.loop.run_until_complete(web_app.scanner_ingest_ws(ws))
+        self.assertEqual(ws.closed, 1009)
+        output = "\n".join(captured.output)
+        self.assertIn("reason=message_too_large", output)
+        self.assertNotIn("unit-test-secret", output)
+        self.assertNotIn("oversized-message", output)
+
     def test_ingress_drops_bookmaker_vs_bookmaker_candidates(self):
         payload = self._payload()
         payload["arbs"]["event-slug"]["bets"] = [
@@ -717,7 +733,7 @@ class ScannerPublisherTests(unittest.TestCase):
     def test_publisher_replays_latest_snapshot_after_socket_drop(self):
         class DropOnceSocket(self.Socket):
             def send(self, text):
-                raise OSError("simulated disconnect")
+                raise BrokenPipeError("simulated disconnect")
 
         class ReconnectingModule:
             def __init__(self):
@@ -731,26 +747,33 @@ class ScannerPublisherTests(unittest.TestCase):
                 return self.good_socket
 
         module = ReconnectingModule()
-        publisher = ScannerPublisher(
-            "ws://127.0.0.1:8080/ws/scanner", "ephemeral-secret",
-            websocket_module=module, reconnect_seconds=0.01,
-        )
-        try:
-            publisher.publish({"slug": {"roi": 0.2}}, {"cycle": 8})
-            deadline = time.time() + 2
-            payload = None
-            while time.time() < deadline:
-                with module.good_socket.lock:
-                    messages = list(module.good_socket.sent)
-                if messages:
-                    payload = json.loads(messages[-1])
-                    break
-                time.sleep(0.01)
-            self.assertGreaterEqual(module.calls, 2)
-            self.assertIsNotNone(payload)
-            self.assertEqual(payload["arbs"]["slug"]["roi"], 0.2)
-        finally:
-            publisher.close()
+        captured = io.StringIO()
+        with redirect_stdout(captured):
+            publisher = ScannerPublisher(
+                "ws://127.0.0.1:8080/ws/scanner", "ephemeral-secret",
+                websocket_module=module, reconnect_seconds=0.01, verbose=True,
+            )
+            try:
+                publisher.publish({"slug": {"roi": 0.2}}, {"cycle": 8})
+                deadline = time.time() + 2
+                payload = None
+                while time.time() < deadline:
+                    with module.good_socket.lock:
+                        messages = list(module.good_socket.sent)
+                    if messages:
+                        payload = json.loads(messages[-1])
+                        break
+                    time.sleep(0.01)
+                self.assertGreaterEqual(module.calls, 2)
+                self.assertIsNotNone(payload)
+                self.assertEqual(payload["arbs"]["slug"]["roi"], 0.2)
+            finally:
+                publisher.close()
+        log_output = captured.getvalue()
+        self.assertIn("BrokenPipeError", log_output)
+        self.assertIn("payload_bytes=", log_output)
+        self.assertIn("close_code=", log_output)
+        self.assertNotIn("ephemeral-secret", log_output)
 
 
 class SignalDropDiagnosticsTests(unittest.TestCase):

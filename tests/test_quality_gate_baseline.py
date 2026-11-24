@@ -13,7 +13,8 @@ from tools.quality_gate_baseline import (
 
 
 def _sample(epoch, *, connected=True, error=None, catalog_complete=True,
-            pm_markets=100, matched=50, bound=40, fresh=20, latency_p95=12.0):
+            pm_markets=100, matched=50, bound=40, fresh=20, latency_p95=12.0,
+            queue_wait_p95=4.0, processing_p95=7.0):
     return build_sample({
         "state": "running",
         "scanner_commit": "runtime-commit",
@@ -76,6 +77,18 @@ def _sample(epoch, *, connected=True, error=None, catalog_complete=True,
             "by_source": {"1win": {"sample_count": 5, "p50_ms": 8.0,
                                      "p95_ms": latency_p95, "max_ms": 20.0}},
         },
+        "event_queue_wait_ms_by_source": {"1win": 3.0},
+        "rolling_event_queue_wait_latency": {
+            "window_sec": 900.0,
+            "by_source": {"1win": {"sample_count": 5, "p50_ms": 2.0,
+                                     "p95_ms": queue_wait_p95, "max_ms": 6.0}},
+        },
+        "rolling_dispatch_processing_latency": {
+            "window_sec": 900.0,
+            "by_source": {"1win": {"sample_count": 5, "p50_ms": 5.0,
+                                     "p95_ms": processing_p95, "max_ms": 9.0}},
+        },
+        "pending_updates_after_drain": 2,
         "runtime_limits": {"freshness": {"onewin_odds_max_age_sec": 30.0}},
         "enabled_bk_sources": ["1win"],
         "signals": 99,
@@ -87,10 +100,10 @@ class QualityGateBaselineTests(unittest.TestCase):
     def test_summary_calculates_coverage_freshness_and_health_shares(self):
         samples = [
             _sample(1000, pm_markets=100, matched=50, bound=40, fresh=20,
-                    latency_p95=12.0),
+                    latency_p95=12.0, queue_wait_p95=4.0, processing_p95=7.0),
             _sample(1010, connected=False, error="socket reset", catalog_complete=False,
                     pm_markets=120, matched=60, bound=50, fresh=25,
-                    latency_p95=25.0),
+                    latency_p95=25.0, queue_wait_p95=10.0, processing_p95=15.0),
         ]
         records = [
             {"kind": "capture_metadata", "project_commit": "abc123",
@@ -115,6 +128,14 @@ class QualityGateBaselineTests(unittest.TestCase):
             summary["rolling_latency_window"]["reported_p95_ms_over_capture"]["1win"]["p95"],
             25.0,
         )
+        self.assertEqual(
+            summary["rolling_latency_window"]["reported_queue_wait_p95_ms_over_capture"]["1win"]["p50"],
+            4.0,
+        )
+        self.assertEqual(
+            summary["rolling_latency_window"]["reported_dispatch_processing_p95_ms_over_capture"]["1win"]["p95"],
+            15.0,
+        )
         self.assertEqual(summary["metrics"]["onewin_quote_age_p95_sec"]["p50"], 2.0)
         self.assertEqual(summary["metrics"]["pm_book_age_p95_sec"]["p50"], 34.0)
         self.assertEqual(summary["metrics"]["pm_source_event_age_p95_sec"]["p50"], 20.0)
@@ -130,6 +151,8 @@ class QualityGateBaselineTests(unittest.TestCase):
         self.assertEqual(sample["onewin_feed_health"]["fresh_open_quotes"], 15)
         self.assertEqual(sample["onewin_feed_health"]["open_quote_age_sec"]["p95_sec"], 2.0)
         self.assertEqual(sample["pm_book_health"]["stale_books"], 20)
+        self.assertEqual(sample["event_queue_wait_ms_by_source"]["1win"], 3.0)
+        self.assertEqual(sample["pending_updates_after_drain"], 2)
 
     def test_capture_reads_local_file_once_per_new_status_and_never_overwrites(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -161,6 +184,8 @@ class QualityGateBaselineTests(unittest.TestCase):
         text = format_markdown(summary)
         self.assertIn("не end-to-end", text)
         self.assertIn("Открытые свежие котировки 1win", text)
+        self.assertIn("Queue wait p95", text)
+        self.assertIn("Dispatcher processing p95", text)
 
     def test_summary_requires_at_least_one_sample(self):
         with self.assertRaisesRegex(ValueError, "no scanner status samples"):

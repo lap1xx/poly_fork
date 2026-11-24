@@ -1435,6 +1435,10 @@ def main():
     last_pm_health_refresh = 0.0
     event_latency_window = RollingEventLatency(window_sec=900.0, max_samples=4096)
     rolling_event_latency_cache = event_latency_window.snapshot()
+    event_queue_wait_window = RollingEventLatency(window_sec=900.0, max_samples=4096)
+    rolling_event_queue_wait_cache = event_queue_wait_window.snapshot()
+    dispatch_processing_window = RollingEventLatency(window_sec=900.0, max_samples=4096)
+    rolling_dispatch_processing_cache = dispatch_processing_window.snapshot()
     last_event_latency_snapshot = 0.0
     phase_counts_cache = {"live": 0, "prematch": 0, "unknown": 0}
     last_pm_diag_write = 0.0
@@ -1502,6 +1506,9 @@ def main():
                 except (TypeError, ValueError):
                     pass
             source_events = update_queue.drain(timeout=min(0.1, max(0.01, poll)))
+            dispatch_started_at = time.time()
+            dispatch_started_monotonic = time.monotonic()
+            pending_updates_after_drain = len(update_queue)
             dirty_slugs = resolve_dirty_slugs(
                 source_events, token_index, adapter_event_index
             )
@@ -1516,6 +1523,13 @@ def main():
                 source = str(event[0])
                 source_event_at_by_source[source] = min(
                     source_event_at_by_source.get(source, event[2]), event[2]
+                )
+            event_queue_wait_by_source_ms = {}
+            for _source, _event_at in source_event_at_by_source.items():
+                _queue_wait_ms = max(0.0, dispatch_started_at - _event_at) * 1000.0
+                event_queue_wait_by_source_ms[_source] = round(_queue_wait_ms, 1)
+                event_queue_wait_window.add(
+                    _source, _queue_wait_ms, observed_at=dispatch_started_monotonic
                 )
             if initial_dirty:
                 dirty_slugs.update(initial_dirty)
@@ -1898,8 +1912,14 @@ def main():
                     _source, max(0.0, _now - _event_at) * 1000.0,
                     observed_at=_observed_at,
                 )
+                dispatch_processing_window.add(
+                    _source, max(0.0, _observed_at - dispatch_started_monotonic) * 1000.0,
+                    observed_at=_observed_at,
+                )
             if _observed_at - last_event_latency_snapshot >= 1.0:
                 rolling_event_latency_cache = event_latency_window.snapshot(_observed_at)
+                rolling_event_queue_wait_cache = event_queue_wait_window.snapshot(_observed_at)
+                rolling_dispatch_processing_cache = dispatch_processing_window.snapshot(_observed_at)
                 last_event_latency_snapshot = _observed_at
             pm_book_states = {}
             for _detail in pm_no_ask_details:
@@ -1976,6 +1996,7 @@ def main():
                 "processed_markets": len(dirty_slugs),
                 "source_updates": len(source_events),
                 "pending_updates": len(update_queue),
+                "pending_updates_after_drain": pending_updates_after_drain,
                 "event_received_at": source_event_at,
                 "event_to_snapshot_ms": round(max(0.0, _now - source_event_at) * 1000, 1)
                 if source_event_at is not None else None,
@@ -1984,6 +2005,9 @@ def main():
                     for source, event_at in source_event_at_by_source.items()
                 },
                 "rolling_event_to_scan_status_latency": rolling_event_latency_cache,
+                "event_queue_wait_ms_by_source": event_queue_wait_by_source_ms,
+                "rolling_event_queue_wait_latency": rolling_event_queue_wait_cache,
+                "rolling_dispatch_processing_latency": rolling_dispatch_processing_cache,
                 "enabled_bk_sources": (
                     (["1win"] if router is not None and router.use_onewin else [])
                     + (["BetBoom"] if (router.use_bb if router is not None else BB_ENABLED) else [])

@@ -10,6 +10,7 @@ import hmac
 import io
 import ipaddress
 import json
+import logging
 import math
 import os
 import pathlib
@@ -61,6 +62,7 @@ FIRST_SEEN_TTL = 300.0
 DATA_STALE_SEC = RUNTIME_LIMIT_DEFAULTS["dashboard_source_stale_sec"]
 SAFE_FORK_THRESHOLD = DEFAULT_RUNTIME_SETTINGS["safe_fork_threshold"]
 ALLOWED_ORIGINS = {"http://127.0.0.1:8080", "http://localhost:8080"}
+_logger = logging.getLogger(__name__)
 
 _clients: Set[WebSocket] = set()
 _hidden: Set[str] = set()
@@ -687,8 +689,15 @@ async def scanner_ingest_ws(ws: WebSocket):
     authorized = bool(expected) and hmac.compare_digest(
         authorization, "Bearer " + expected
     )
-    if (not authorized or not is_loopback
-            or (origin is not None and origin not in ALLOWED_ORIGINS)):
+    reject_reason = None
+    if not authorized:
+        reject_reason = "unauthorized"
+    elif not is_loopback:
+        reject_reason = "non_loopback_client"
+    elif origin is not None and origin not in ALLOWED_ORIGINS:
+        reject_reason = "disallowed_origin"
+    if reject_reason:
+        _logger.warning("scanner ingest rejected: reason=%s close_code=1008", reject_reason)
         await ws.close(code=1008)
         return
 
@@ -697,14 +706,20 @@ async def scanner_ingest_ws(ws: WebSocket):
         while True:
             raw_message = await ws.receive_text()
             if len(raw_message.encode("utf-8")) > SCANNER_WS_MAX_BYTES:
+                _logger.warning(
+                    "scanner ingest closed: reason=message_too_large bytes=%s limit=%s close_code=1009",
+                    len(raw_message.encode("utf-8")), SCANNER_WS_MAX_BYTES,
+                )
                 await ws.close(code=1009)
                 return
             try:
                 payload = json.loads(raw_message, parse_constant=_reject_json_constant)
             except (TypeError, ValueError):
+                _logger.warning("scanner ingest closed: reason=invalid_json close_code=1003")
                 await ws.close(code=1003)
                 return
             if not isinstance(payload, dict):
+                _logger.warning("scanner ingest closed: reason=non_object_payload close_code=1003")
                 await ws.close(code=1003)
                 return
             session_id = payload.get("session_id")
@@ -723,6 +738,7 @@ async def scanner_ingest_ws(ws: WebSocket):
                     or abs(time.time() - float(sent_at)) > 60.0
                     or not isinstance(arbs, dict) or len(arbs) > 5000
                     or not isinstance(scan_status, dict)):
+                _logger.warning("scanner ingest closed: reason=invalid_snapshot_envelope close_code=1008")
                 await ws.close(code=1008)
                 return
             valid_arbs = {}
@@ -737,6 +753,7 @@ async def scanner_ingest_ws(ws: WebSocket):
                     continue
                 valid_arbs[slug] = arb
             if valid_arbs is None:
+                _logger.warning("scanner ingest closed: reason=invalid_arb_container close_code=1008")
                 await ws.close(code=1008)
                 return
             if session_id != _scanner_session_id:
@@ -760,9 +777,11 @@ async def scanner_ingest_ws(ws: WebSocket):
             }
             if _broadcast_wakeup is not None:
                 _broadcast_wakeup.set()
-    except WebSocketDisconnect:
+    except WebSocketDisconnect as exc:
+        _logger.debug("scanner ingest peer disconnected: code=%s", getattr(exc, "code", None))
         pass
     except Exception:
+        _logger.exception("scanner ingest handler failed")
         pass
 
 @app.get("/api/config")
