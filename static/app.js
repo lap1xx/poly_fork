@@ -582,7 +582,14 @@ function renderScanStatus() {
   if (status.update_mode === 'event') {
     const timings = [];
     if (status.event_to_snapshot_ms != null && Number.isFinite(Number(status.event_to_snapshot_ms))) {
-      timings.push(`feed→расчёт ${Number(status.event_to_snapshot_ms).toFixed(1)} мс`);
+      timings.push(`очередь→снимок ${Number(status.event_to_snapshot_ms).toFixed(1)} мс`);
+    }
+    const sourceTimings = status.source_event_to_snapshot_ms || {};
+    for (const source of ['1win']) {
+      const value = Number(sourceTimings[source]);
+      if (Number.isFinite(value)) {
+        timings.push(`1win callback→снимок ${value.toFixed(1)} мс`);
+      }
     }
     if (status.scanner_to_backend_ms != null && Number.isFinite(Number(status.scanner_to_backend_ms))) {
       timings.push(`сканер→сервер ${Number(status.scanner_to_backend_ms).toFixed(1)} мс`);
@@ -746,9 +753,7 @@ function updateArbCard(card, a) {
   setCardText(card, '.arb-roi', fmtPct(a.roi));
   setCardText(card, '.arb-age', fmtAgo(a.age_sec));
 
-  const tags = [`<span class="tag ${escapeHtml(sportClass(a.sport))}">${escapeHtml(a.sport || '')}</span>`];
-  tags.push(`<span class="tag phase-${phase}">${phaseLabels[phase]}</span>`);
-  if (a.is_streamer) tags.push('<span class="tag streamer">СТРИМЕР</span>');
+  const tags = [`<span class="tag phase-${phase}">${phaseLabels[phase]}</span>`];
   const pmAge = pmLeg.pm_age || a.pm_age;
   if (pmAge && pmAge > 60) tags.push(`<span class="tag pm-age">PM ${Math.floor(pmAge)}с</span>`);
   const sourceAge = a.source_age_sec == null ? NaN : Number(a.source_age_sec);
@@ -775,9 +780,15 @@ function updateArbCard(card, a) {
   const chips = `<span class="bk-chip ${bkClass}">${escapeHtml(bbLeg.source || 'БК')}</span>` +
     '<span class="bk-chip pm">Polymarket</span>';
   setCardMarkup(card, '.arb-bks', chips, '_renderedBooks');
-  const stakes = Array.isArray(a.stakes) ? a.stakes : [];
-  const legRows = legs.map((leg, i) => renderArbLegRow(leg, stakes[i])).filter(Boolean).join('');
-  setCardMarkup(card, '.arb-stakes', legRows, '_renderedStakes');
+  const pmAsk = Number(pmLeg.pm_best_ask || a.pm_best_ask || 0);
+  const pmAskText = pmAsk > 0 && pmAsk < 1 ? `${(pmAsk * 100).toFixed(1)}¢` : '—';
+  const pmOdds = Number(pmLeg.o || 0);
+  const bkOdds = Number(bbLeg.o || 0);
+  const quickValues = `<span class="arb-quick-value pm">PM ${pmAskText}` +
+    `${pmOdds > 0 ? ` · эфф. ${fmtOdds(pmOdds)}×` : ''}</span>` +
+    `<span class="arb-quick-value bookmaker">${escapeHtml(bbLeg.source || 'БК')} ` +
+    `${bkOdds > 0 ? `${fmtOdds(bkOdds)}×` : '—'}</span>`;
+  setCardMarkup(card, '.arb-stakes', quickValues, '_renderedStakes');
 }
 
 function pinnedSnapshotId(row) {
@@ -984,15 +995,14 @@ function activeOpportunityEventUrl(active, source) {
     ? leg.event_url.trim() : null;
 }
 
-let _lastDetailRefresh = 0;
 function refreshDetailThrottled() {
-  const now = Date.now();
-  if (now - _lastDetailRefresh < 3000) return;
-  _lastDetailRefresh = now;
-  refreshDetail();
+  // Apply every scanner snapshot immediately; REST book/chart refreshes are
+  // deliberately not coupled to this live quote render.
+  refreshDetail({ loadRemote: false });
 }
 
-function refreshDetail() {
+function refreshDetail(options = {}) {
+  const loadRemote = options.loadRemote !== false;
   const a = getActive();
   if (!a) { closeDetail(); return; }
   const frozen = Boolean(a.inactive_snapshot);
@@ -1066,27 +1076,38 @@ function refreshDetail() {
   } else {
     document.getElementById('pm-book-title').textContent = 'СТАКАН POLYMARKET';
     document.getElementById('chart-title').textContent = 'ИСТОРИЯ ЦЕНЫ';
-    loadPmBook(a.slug);
-    loadPriceChart(a.slug);
+    if (loadRemote) {
+      loadPmBook(a.slug);
+      loadPriceChart(a.slug);
+    }
   }
 }
 
 /* ============= PM BOOK ============= */
 async function loadPmBook(slug) {
-  const requestId = state.bookRequestId = (state.bookRequestId || 0) + 1;
-  const tbody = document.getElementById('pm-book-body');
-  const foot = document.getElementById('pm-book-foot');
-  tbody.innerHTML = '<tr><td colspan="3" class="empty-cell">Загрузка…</td></tr>';
-  foot.textContent = '—';
   const enteredUsd = parseFloat(document.getElementById('hm-pm-stake')?.value || '0');
   const requestedUsd = Number.isFinite(enteredUsd) && enteredUsd >= 1 && enteredUsd <= 100000
     ? enteredUsd : 50;
+  if (!state.bookInFlightKeys) state.bookInFlightKeys = new Set();
+  const requestKey = `${slug}:${requestedUsd.toFixed(2)}`;
+  if (state.bookInFlightKeys.has(requestKey)) return;
+  state.bookInFlightKeys.add(requestKey);
+  const requestId = state.bookRequestId = (state.bookRequestId || 0) + 1;
+  const tbody = document.getElementById('pm-book-body');
+  const foot = document.getElementById('pm-book-foot');
+  if (!pmBookCache[slug]) {
+    tbody.innerHTML = '<tr><td colspan="3" class="empty-cell">Загрузка…</td></tr>';
+    foot.textContent = 'Получение REST-стакана…';
+  }
   try {
     const r = await fetch(`/api/pm_book/${encodeURIComponent(slug)}?size_usd=${requestedUsd}`);
     const j = await r.json();
     if (requestId !== state.bookRequestId || state.activeSlug !== slug) return;
     if (!j.ok || !j.books || !j.books.length) {
-      tbody.innerHTML = '<tr><td colspan="3" class="empty-cell">Стакан недоступен</td></tr>';
+      if (!pmBookCache[slug]) tbody.innerHTML = '<tr><td colspan="3" class="empty-cell">Стакан недоступен</td></tr>';
+      foot.textContent = pmBookCache[slug]
+        ? 'REST не обновился · показаны предыдущие данные'
+        : 'Стакан недоступен';
       return;
     }
     const a = getActive();
@@ -1105,6 +1126,8 @@ async function loadPmBook(slug) {
       ask_depth_usd: book.ask_depth_usd,
       avg_for_size: book.avg_for_size,
       requested_usd: requestedUsd,
+      fetched_at: Date.now(),
+      fetch_ms: Number(j.fetch_ms),
     };
     renderHowMuch(a);
 
@@ -1137,14 +1160,20 @@ async function loadPmBook(slug) {
     const totalLevels = (book.asks || []).length;
     let footTxt = 'показано ' + Math.min(totalLevels, 7) + ' уровней · глубина ask ' + Number(totalUsd).toFixed(2) + ' USDT';
     if (book.avg_for_size && !book.avg_for_size.full) footTxt += ' · недостаточно для ' + requestedUsd.toFixed(2) + ' USDT';
+    if (Number.isFinite(Number(j.fetch_ms))) footTxt += ` · API ${Number(j.fetch_ms).toFixed(0)} мс`;
     foot.textContent = footTxt;
     const avg = book.avg_for_size;
     document.getElementById('hm-avg').textContent = avg && avg.avg_price
       ? (avg.avg_price * 100).toFixed(1) + '¢ · ' + requestedUsd.toFixed(2) + ' USDT' + (avg.full ? '' : ' · неполный объём') : '—';
   } catch (e) {
     if (requestId === state.bookRequestId && state.activeSlug === slug) {
-      tbody.innerHTML = '<tr><td colspan="3" class="empty-cell">Ошибка сети</td></tr>';
+      if (!pmBookCache[slug]) tbody.innerHTML = '<tr><td colspan="3" class="empty-cell">Ошибка сети</td></tr>';
+      foot.textContent = pmBookCache[slug]
+        ? 'Ошибка обновления REST · показаны предыдущие данные'
+        : 'Ошибка сети';
     }
+  } finally {
+    state.bookInFlightKeys.delete(requestKey);
   }
 }
 
@@ -1273,7 +1302,7 @@ function renderHowMuch(a) {
   // лучшее ask из стакана, а не среднее по $50
   const cachedBook = !frozen && pmBookCache[state.activeSlug]?.outcome === pmLeg.outcome
     ? pmBookCache[state.activeSlug] : null;
-  const pmBestAsk = Number(cachedBook?.best_ask || pmLeg.pm_best_ask || a.pm_best_ask || 0);
+  const pmBestAsk = Number(pmLeg.pm_best_ask || a.pm_best_ask || cachedBook?.best_ask || 0);
   const pmPriceLabel = document.getElementById('hm-pm-price-label');
   if (pmPriceLabel) pmPriceLabel.textContent = frozen ? 'ASK В СНИМКЕ' : 'ЦЕНА ДОЛИ · ASK';
   const pmPriceText = pmBestAsk > 0 && pmBestAsk < 1 ? (pmBestAsk * 100).toFixed(1) + '¢' : '—';
@@ -1363,7 +1392,7 @@ function syncCalcFromDetail(pmLeg, bbLeg, pmStakeUsdt, bbStake) {
   const a = getActive();
   const cachedAsk = pmBookCache[state.activeSlug]?.outcome === pmLeg.outcome
     ? pmBookCache[state.activeSlug].best_ask : null;
-  const rawAsk = Number(cachedAsk || pmLeg.pm_best_ask || (a && a.pm_best_ask));
+  const rawAsk = Number(pmLeg.pm_best_ask || (a && a.pm_best_ask) || cachedAsk);
   document.getElementById('calc-pm-price').value = rawAsk > 0 && rawAsk < 1 ? (rawAsk * 100).toFixed(1) : '0';
   document.getElementById('calc-pm-stake').value = pmStakeUsdt.toFixed(2);
   updateCalcHint();
@@ -2124,8 +2153,11 @@ function init() {
   document.addEventListener('click', () => ensureAudioCtx(), { once: true });
 
   setInterval(() => {
-    if (state.activeSlug) { loadPriceChart(state.activeSlug); loadPmBook(state.activeSlug); }
-  }, 10000);
+    if (state.activeSlug) loadPmBook(state.activeSlug);
+  }, 5000);
+  setInterval(() => {
+    if (state.activeSlug) loadPriceChart(state.activeSlug);
+  }, 30000);
   setInterval(checkWsFreshness, 5000);
   document.addEventListener('visibilitychange', checkWsFreshness);
   setInterval(loadDaily, 30000);

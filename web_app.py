@@ -1105,11 +1105,12 @@ def _walk_pm_asks_with_fee(asks, cash_budget, schedule):
 
 @app.get("/api/pm_book/{slug}")
 async def api_pm_book(slug: str, size_usd: float = 50.0, force: int = 0):
+    request_started = time.perf_counter()
     size_usd = _finite_number(size_usd, 1.0, 100_000.0)
     if size_usd is None or not slug or len(slug) > 300:
         return JSONResponse({"ok": False, "err": "invalid request"}, status_code=422)
     try:
-        m = _http_get(f"{GAMMA}/markets", {"slug": slug})
+        m = await asyncio.to_thread(_http_get, f"{GAMMA}/markets", {"slug": slug})
         if not m or not isinstance(m, list) or not m:
             return {"ok": False, "err": "market not found"}
         mk = m[0]
@@ -1120,7 +1121,9 @@ async def api_pm_book(slug: str, size_usd: float = 50.0, force: int = 0):
         condition_id = str(mk.get("conditionId") or "").strip()
         if not condition_id:
             return {"ok": False, "err": "fee_schedule_unavailable"}
-        fee_schedule = fetch_fee_schedule(condition_id, force=bool(force))
+        fee_schedule = await asyncio.to_thread(
+            fetch_fee_schedule, condition_id, force=bool(force)
+        )
         if fee_schedule is None:
             return {"ok": False, "err": "fee_schedule_unavailable"}
         if not isinstance(token_ids, list) or not isinstance(outcomes, list):
@@ -1129,15 +1132,21 @@ async def api_pm_book(slug: str, size_usd: float = 50.0, force: int = 0):
         return {"ok": False, "err": f"gamma: {e}"}
 
     books = []
-    for i, tid in enumerate(token_ids[:2]):
+    book_token_ids = token_ids[:2]
+    book_results = await asyncio.gather(
+        *(
+            asyncio.to_thread(_http_get, f"{CLOB}/book", {"token_id": tid})
+            for tid in book_token_ids
+        ),
+        return_exceptions=True,
+    )
+    for i, (tid, b) in enumerate(zip(book_token_ids, book_results)):
         outcome = outcomes[i] if i < len(outcomes) else f"out{i}"
-        try:
-            b = _http_get(f"{CLOB}/book", {"token_id": tid})
-        except Exception as e:
+        if isinstance(b, Exception):
             books.append({
                 "outcome": outcome, "best_bid": None, "best_ask": None,
                 "ask_depth_usd": 0, "bids": [], "asks": [],
-                "sizes": [], "avg_for_size": None, "err": str(e),
+                "sizes": [], "avg_for_size": None, "err": str(b),
             })
             continue
 
@@ -1198,7 +1207,12 @@ async def api_pm_book(slug: str, size_usd: float = 50.0, force: int = 0):
                 if quote else None
             ),
         })
-    return {"ok": True, "fee_schedule": fee_schedule, "books": books}
+    return {
+        "ok": True,
+        "fee_schedule": fee_schedule,
+        "books": books,
+        "fetch_ms": round((time.perf_counter() - request_started) * 1000.0, 1),
+    }
 
 @app.post("/api/shutdown")
 async def api_shutdown():

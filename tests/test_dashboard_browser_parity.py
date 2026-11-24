@@ -192,11 +192,13 @@ class DashboardBrowserParityTests(unittest.TestCase):
                 const actionMode = new URL(location.href).searchParams.get('action_mode') || 'v1';
                 const message = snapshots[actionMode];
                 window.__openedUrls = [];
+                window.__restCalls = {{book: 0, chart: 0}};
                 window.open = (url) => {{ window.__openedUrls.push(String(url)); return {{ closed: false }}; }};
                 class ReplayWebSocket {{
                   static CONNECTING = 0; static OPEN = 1; static CLOSING = 2; static CLOSED = 3;
                   constructor(url) {{
                     this.url = url; this.readyState = 0;
+                    if (String(url).endsWith('/ws')) window.__replaySocket = this;
                     setTimeout(() => {{
                       this.readyState = 1;
                       if (this.onopen) this.onopen({{target: this}});
@@ -221,6 +223,24 @@ class DashboardBrowserParityTests(unittest.TestCase):
                         with self.subTest(action_link_mode=action_mode):
                             page = browser.new_page()
                             page.add_init_script(shim)
+                            rest_call_counts = {"book": 0, "chart": 0}
+
+                            def mock_book(route):
+                                rest_call_counts["book"] += 1
+                                route.fulfill(
+                                    status=200, content_type="application/json",
+                                    body=json.dumps({"ok": False, "err": "test fixture"}),
+                                )
+
+                            def mock_chart(route):
+                                rest_call_counts["chart"] += 1
+                                route.fulfill(
+                                    status=200, content_type="application/json",
+                                    body=json.dumps({"points": []}),
+                                )
+
+                            page.route("**/api/pm_book/**", mock_book)
+                            page.route("**/api/price_history/**", mock_chart)
                             page.route(
                                 "**/api/config",
                                 lambda route: route.fulfill(
@@ -270,6 +290,20 @@ class DashboardBrowserParityTests(unittest.TestCase):
                             self.assertEqual(detail_roi.inner_text(), "+3.10%")
                             self.assertEqual(page.locator("#market-pm-outcome").inner_text(), expected["legs"][0]["outcome"])
                             self.assertEqual(page.locator("#market-bk-outcome").inner_text(), expected["legs"][1]["outcome"])
+
+                            page.wait_for_timeout(150)
+                            rest_calls_before_live_update = dict(rest_call_counts)
+                            updated_snapshot = json.loads(json.dumps(snapshot))
+                            updated_snapshot["arbs"][0]["roi"] = 0.042
+                            page.evaluate(
+                                "payload => window.__replaySocket.onmessage({data: JSON.stringify(payload)})",
+                                updated_snapshot,
+                            )
+                            page.wait_for_function(
+                                "document.querySelector('#kpi-roi')?.textContent === '+4.20%'",
+                                timeout=1000,
+                            )
+                            self.assertEqual(rest_call_counts, rest_calls_before_live_update)
 
                             expected_urls = {
                                 leg["source"]: leg.get("event_url")

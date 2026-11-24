@@ -2537,6 +2537,14 @@ def main():
                 (event[2] for event in source_events if len(event) > 2),
                 default=None,
             )
+            source_event_at_by_source = {}
+            for event in source_events:
+                if len(event) < 3:
+                    continue
+                source = str(event[0])
+                source_event_at_by_source[source] = min(
+                    source_event_at_by_source.get(source, event[2]), event[2]
+                )
             if initial_dirty:
                 dirty_slugs.update(initial_dirty)
                 initial_dirty.clear()
@@ -2979,6 +2987,10 @@ def main():
                 "event_received_at": source_event_at,
                 "event_to_snapshot_ms": round(max(0.0, _now - source_event_at) * 1000, 1)
                 if source_event_at is not None else None,
+                "source_event_to_snapshot_ms": {
+                    source: round(max(0.0, _now - event_at) * 1000, 1)
+                    for source, event_at in source_event_at_by_source.items()
+                },
                 "enabled_bk_sources": (
                     (["1win"] if router is not None and router.use_onewin else [])
                     + (["BetBoom"] if (router.use_bb if router is not None else BB_ENABLED) else [])

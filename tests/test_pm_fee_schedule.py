@@ -1,4 +1,5 @@
 import asyncio
+import threading
 import unittest
 from unittest.mock import Mock, patch
 
@@ -157,10 +158,38 @@ class PMFeeScheduleTests(unittest.TestCase):
             response = asyncio.run(web_app.api_pm_book("test-market", size_usd=1.025))
         self.assertTrue(response["ok"])
         self.assertEqual(response["fee_schedule"], schedule)
+        self.assertGreaterEqual(response["fetch_ms"], 0)
         quote = response["books"][0]["avg_for_size"]
         self.assertAlmostEqual(quote["shares"], 2.0)
         self.assertAlmostEqual(quote["fee_estimate"], 0.025)
         self.assertAlmostEqual(quote["odds_eff"], 2 / 1.025, places=4)
+
+    def test_web_book_fetches_outcomes_concurrently(self):
+        market = {
+            "conditionId": "condition-id",
+            "clobTokenIds": '["token-a", "token-b"]',
+            "outcomes": '["A", "B"]',
+        }
+        book = {"bids": [], "asks": [{"price": "0.5", "size": "100"}]}
+        schedule = {
+            "fees_enabled": True, "rate": 0.05, "exponent": 1.0,
+            "source": "clob_market_info",
+        }
+        both_books_started = threading.Barrier(2)
+
+        def fake_http_get(url, params=None):
+            if url == f"{web_app.GAMMA}/markets":
+                return [market]
+            if url == f"{web_app.CLOB}/book":
+                both_books_started.wait(timeout=2)
+                return book
+            raise AssertionError(f"unexpected URL: {url}")
+
+        with patch.object(web_app, "_http_get", side_effect=fake_http_get), \
+             patch.object(web_app, "fetch_fee_schedule", return_value=schedule):
+            response = asyncio.run(web_app.api_pm_book("test-market", size_usd=20))
+        self.assertTrue(response["ok"])
+        self.assertEqual(len(response["books"]), 2)
 
     def test_web_book_endpoint_fails_closed_without_schedule(self):
         market = {
