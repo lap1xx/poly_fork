@@ -8,12 +8,17 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import bk_router
 import polyarb_v4
 import web_app
-from event_dispatch import DirtyUpdateQueue, build_token_slug_index, resolve_dirty_slugs
+from event_dispatch import (
+    DirtyUpdateQueue,
+    build_adapter_event_index,
+    build_token_slug_index,
+    resolve_dirty_slugs,
+)
 from scanner_publisher import ScannerPublisher
 
 
@@ -46,6 +51,30 @@ class DirtyUpdateQueueTests(unittest.TestCase):
         second = queue.drain(timeout=0)
         self.assertEqual(first[0][:2], second[0][:2])
         self.assertGreaterEqual(second[0][2], first[0][2])
+
+    def test_adapter_events_are_coalesced_and_isolated_by_adapter_id(self):
+        queue = DirtyUpdateQueue()
+        monotonic_now = time.monotonic()
+        wall_now = time.time()
+        self.assertTrue(queue.put_adapter_event("1win", 501, monotonic_now - 0.25))
+        self.assertFalse(queue.put_adapter_event("1win", "501", monotonic_now - 0.1))
+        self.assertTrue(queue.put_adapter_event("synthetic", 501, monotonic_now - 0.2))
+        events = queue.drain(timeout=0)
+        self.assertEqual([event[:2] for event in events],
+                         [("1win", "501"), ("synthetic", "501")])
+        self.assertAlmostEqual(events[0][2], wall_now - 0.25, delta=0.1)
+        self.assertAlmostEqual(events[1][2], wall_now - 0.2, delta=0.1)
+
+        index = build_adapter_event_index({
+            "1win": {501: {"market-a", "market-b"}},
+            "synthetic": {501: {"market-c"}},
+            "pm": {"501": {"must-not-index"}},
+        })
+        self.assertEqual(
+            resolve_dirty_slugs(events, {}, index),
+            {"market-a", "market-b", "market-c"},
+        )
+        self.assertEqual(resolve_dirty_slugs([("unknown", "501", 1)], {}, index), set())
 
 
 class FeedCallbackTests(unittest.TestCase):
@@ -144,6 +173,31 @@ class FeedCallbackTests(unittest.TestCase):
         self.assertEqual(current["bindings"], 2)
         self.assertEqual(current["bound_1win"], 1)
         self.assertEqual(current["bound_betboom"], 1)
+
+    def test_router_generic_event_index_keys_provider_and_event(self):
+        router = bk_router.BKRouter(use_bb=False, use_onewin=False)
+        router.bindings.update({
+            "pm-one": ("1win", {"match_id": 501}),
+            "pm-two": ("1win", {"match_id": "501"}),
+            "pm-three": ("BetBoom", {"match_id": 501}),
+            "pm-four": ("1win", {"provider_event_id": 502}),
+        })
+        self.assertEqual(router.adapter_event_index(), {
+            ("1win", "501"): {"pm-one", "pm-two"},
+            ("BetBoom", "501"): {"pm-three"},
+        })
+
+    def test_router_installs_normalized_callback_without_changing_onewin_facade(self):
+        router = bk_router.BKRouter(use_bb=False, use_onewin=False)
+        stream = SimpleNamespace(set_odds_update_callback=Mock())
+        router._onewin_stream = stream
+        received = []
+        router.set_adapter_update_callback(lambda *args: received.append(args))
+        callback = stream.set_odds_update_callback.call_args.args[0]
+        callback(501)
+        self.assertEqual(len(received), 1)
+        self.assertEqual(received[0][:2], ("1win", "501"))
+        self.assertIsInstance(received[0][2], float)
 
 
 class _FakeBrowserlessWS:

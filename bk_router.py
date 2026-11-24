@@ -82,6 +82,7 @@ class BKRouter:
         self._onewin_retry_after = {}
         self._onewin_ready = None
         self._odds_update_callback = None
+        self._adapter_update_callback = None
         self._onewin_stream = None
         self._lock = threading.RLock()
         self._started = False
@@ -118,6 +119,11 @@ class BKRouter:
         if self._started:
             if old_onewin and not new_onewin:
                 try:
+                    if self._onewin_stream is not None:
+                        self._onewin_stream.set_odds_update_callback(None)
+                except Exception:
+                    pass
+                try:
                     _ow.stop_global_stream()
                 except Exception:
                     pass
@@ -130,10 +136,7 @@ class BKRouter:
             if new_onewin and not old_onewin:
                 try:
                     self._onewin_stream = _ow.get_global_stream(verbose=False)
-                    if self._odds_update_callback is not None:
-                        self._onewin_stream.set_odds_update_callback(
-                            self._odds_update_callback
-                        )
+                    self._install_onewin_callback(self._onewin_stream)
                 except Exception:
                     self._onewin_ready = False
             if new_bb and not old_bb:
@@ -146,9 +149,31 @@ class BKRouter:
     def set_odds_update_callback(self, callback):
         """Set a lightweight listener for read-only 1win odds-cache updates."""
         self._odds_update_callback = callback
+        self._adapter_update_callback = None
         if self._onewin_stream is not None:
             try:
                 self._onewin_stream.set_odds_update_callback(callback)
+            except Exception:
+                pass
+
+    def _install_onewin_callback(self, stream):
+        if self._adapter_update_callback is not None:
+            callback = self._adapter_update_callback
+
+            def notify(match_id):
+                callback("1win", str(match_id), time.monotonic())
+        else:
+            notify = self._odds_update_callback
+        if notify is not None:
+            stream.set_odds_update_callback(notify)
+
+    def set_adapter_update_callback(self, callback):
+        """Register the normalized ``(adapter_id, event_id, monotonic_time)`` callback."""
+        self._adapter_update_callback = callback
+        self._odds_update_callback = None
+        if self._onewin_stream is not None:
+            try:
+                self._install_onewin_callback(self._onewin_stream)
             except Exception:
                 pass
 
@@ -165,8 +190,7 @@ class BKRouter:
             try:
                 stream = _ow.get_global_stream(verbose=False)
                 self._onewin_stream = stream
-                if self._odds_update_callback is not None:
-                    stream.set_odds_update_callback(self._odds_update_callback)
+                self._install_onewin_callback(stream)
                 print("[ROUTER] 1win stream started")
             except Exception as e:
                 print(f"[ROUTER] 1win start failed: {e}")
@@ -384,6 +408,21 @@ class BKRouter:
             if match_id is None:
                 continue
             index.setdefault(str(match_id).strip(), set()).add(str(slug))
+        return index
+
+    def adapter_event_index(self):
+        """Return provider event IDs mapped to PM markets by adapter identity."""
+        index = {}
+        with self._lock:
+            pairs = list(self.bindings.items())
+        for slug, pair in pairs:
+            if not pair or len(pair) < 2:
+                continue
+            adapter_id, binding = str(pair[0]).strip(), pair[1] or {}
+            event_id = binding.get("match_id") if isinstance(binding, dict) else None
+            if event_id is None or not adapter_id or adapter_id.lower() == "pm":
+                continue
+            index.setdefault((adapter_id, str(event_id).strip()), set()).add(str(slug))
         return index
 
     def bb_stakes_debug(self, slug):

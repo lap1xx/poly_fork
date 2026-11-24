@@ -27,6 +27,7 @@ import requests
 from arb_invariants import is_pm_bookmaker_pair as _is_pm_bookmaker_pair
 from event_dispatch import (
     DirtyUpdateQueue,
+    build_adapter_event_index,
     build_token_slug_index,
     resolve_dirty_slugs,
 )
@@ -2296,7 +2297,7 @@ def main():
                 no_bb=args.no_bb,
             )
             router.configure_sources(selected_sources)
-            router.set_odds_update_callback(update_queue.put_onewin_match)
+            router.set_adapter_update_callback(update_queue.put_adapter_event)
             router.start()
             ok_ow = router.wait_onewin(timeout=60, min_matches=1)
             ok_bb = False
@@ -2376,14 +2377,16 @@ def main():
     printed_once = set()
     upd_count = {}
     token_index = build_token_slug_index(market_map)
-    match_index = router.onewin_match_index() if router is not None else {}
+    adapter_event_index = (
+        router.adapter_event_index() if router is not None else {}
+    )
 
     def refresh_event_indexes():
         token_index.clear()
         token_index.update(build_token_slug_index(market_map))
-        match_index.clear()
+        adapter_event_index.clear()
         if router is not None:
-            match_index.update(router.onewin_match_index())
+            adapter_event_index.update(router.adapter_event_index())
 
     newly_bound_slugs = set()
 
@@ -2532,7 +2535,9 @@ def main():
                 except (TypeError, ValueError):
                     pass
             source_events = update_queue.drain(timeout=min(0.1, max(0.01, poll)))
-            dirty_slugs = resolve_dirty_slugs(source_events, token_index, match_index)
+            dirty_slugs = resolve_dirty_slugs(
+                source_events, token_index, adapter_event_index
+            )
             source_event_at = min(
                 (event[2] for event in source_events if len(event) > 2),
                 default=None,

@@ -12,19 +12,24 @@ def _key(value):
 
 
 class DirtyUpdateQueue:
-    """Thread-safe event queue that coalesces duplicate source updates."""
+    """Thread-safe event queue that coalesces duplicate source updates.
+
+    Events retain the compact legacy shape ``(source_id, event_id, received_at_epoch)``.
+    ``source_id`` is ``pm`` for CLOB tokens and the adapter ID for provider events.
+    """
 
     def __init__(self):
         self._queue = queue.Queue()
         self._pending = set()
         self._lock = threading.Lock()
 
-    def put(self, source, identifier):
+    def put(self, source, identifier, received_at=None):
+        source_key = _key(source)
         key = _key(identifier)
-        if not key:
+        if not source_key or not key:
             return False
-        event_key = (str(source), key)
-        event = (event_key[0], event_key[1], time.time())
+        event_key = (source_key, key)
+        event = (source_key, key, time.time() if received_at is None else received_at)
         with self._lock:
             if event_key in self._pending:
                 return False
@@ -35,8 +40,23 @@ class DirtyUpdateQueue:
     def put_pm_token(self, token_id):
         return self.put("pm", token_id)
 
+    def put_adapter_event(self, adapter_id, provider_event_id, received_at=None):
+        """Queue a monotonic provider receipt as epoch time for legacy diagnostics."""
+        if _key(adapter_id).lower() == "pm":
+            return False
+        received_at_epoch = time.time()
+        if received_at is not None:
+            try:
+                age = time.monotonic() - float(received_at)
+                if age >= 0:
+                    received_at_epoch -= age
+            except (TypeError, ValueError, OverflowError):
+                pass
+        return self.put(adapter_id, provider_event_id, received_at_epoch)
+
     def put_onewin_match(self, match_id):
-        return self.put("1win", match_id)
+        """Backward-compatible 1win callback target."""
+        return self.put_adapter_event("1win", match_id)
 
     def drain(self, timeout=0.0, limit=10000):
         """Take up to ``limit`` unique updates, waiting only for the first one."""
@@ -79,16 +99,38 @@ def build_token_slug_index(market_map):
     return dict(index)
 
 
-def resolve_dirty_slugs(events, token_index, match_index):
-    """Resolve source events to the exact PM markets that need recalculation."""
+def build_adapter_event_index(bindings_by_adapter):
+    """Build ``(adapter_id, provider_event_id) -> PM market keys`` index."""
+    index = defaultdict(set)
+    for adapter_id, event_to_slugs in (bindings_by_adapter or {}).items():
+        adapter_key = _key(adapter_id)
+        if not adapter_key or adapter_key.lower() == "pm":
+            continue
+        for event_id, slugs in (event_to_slugs or {}).items():
+            event_key = _key(event_id)
+            if event_key:
+                index[(adapter_key, event_key)].update(
+                    str(slug) for slug in (slugs or ()) if _key(slug)
+                )
+    return dict(index)
+
+
+def resolve_dirty_slugs(events, token_index, adapter_event_index):
+    """Resolve PM token or adapter event updates to dependent PM markets.
+
+    Plain event-ID keys are also accepted for legacy 1win indexes.
+    """
     dirty = set()
-    for event in events or []:
-        if len(event) < 2:
+    for event in events or ():
+        if not isinstance(event, (tuple, list)) or len(event) < 2:
             continue
         source, identifier = event[:2]
         key = _key(identifier)
+        if not key:
+            continue
         if source == "pm":
             dirty.update(token_index.get(key, ()))
-        elif source == "1win":
-            dirty.update(match_index.get(key, ()))
+        else:
+            dirty.update(adapter_event_index.get((str(source), key), ()))
+            dirty.update(adapter_event_index.get(key, ()))
     return dirty

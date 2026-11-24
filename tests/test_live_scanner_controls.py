@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 import bk_router
 import polyarb_v4
 import web_app
+from event_dispatch import resolve_dirty_slugs
 
 
 class RuntimeConfigTests(unittest.TestCase):
@@ -224,7 +225,7 @@ class RuntimeConfigTests(unittest.TestCase):
 class RuntimeRouterSelectionTests(unittest.TestCase):
     def test_hot_switch_clears_old_bindings_and_uses_only_selected_feed(self):
         one_win = SimpleNamespace(
-            bind_slug=Mock(return_value={"provider": "1win"}),
+            bind_slug=Mock(return_value={"provider": "1win", "match_id": 501}),
             get_live_bc=Mock(return_value={}),
         )
         betboom = SimpleNamespace(
@@ -241,11 +242,19 @@ class RuntimeRouterSelectionTests(unittest.TestCase):
             _, initial_source = router.bind(slug, market)
             self.assertEqual(initial_source, "1win")
             self.assertIn(slug, router.fallback_bindings)
+            self.assertEqual(router.adapter_event_index(), {("1win", "501"): {slug}})
 
             self.assertTrue(router.configure_sources(["BetBoom"]))
             self.assertEqual(router.active_sources(), ["BetBoom"])
             self.assertNotIn(slug, router.bindings)
             self.assertNotIn(slug, router.fallback_bindings)
+            self.assertEqual(router.adapter_event_index(), {})
+            self.assertEqual(
+                resolve_dirty_slugs(
+                    [("1win", "501", time.time())], {}, router.adapter_event_index()
+                ),
+                set(),
+            )
 
             _, selected_source = router.bind(slug, market)
             self.assertEqual(selected_source, "BetBoom")

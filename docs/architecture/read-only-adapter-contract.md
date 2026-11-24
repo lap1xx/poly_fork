@@ -83,7 +83,7 @@ Binding — отдельная привязка пары `(adapter_id, PM market
 
 ## Контракт обновления и индексы
 
-Обновление передаётся как лёгкое событие `(adapter_id, provider_event_id, received_at_monotonic)`; PM CLOB update использует `(pm, token_id, received_at_monotonic)`. Очередь coalesce-ит повторные обновления одного источника/идентификатора и ограничивает размер/drain работы.
+Adapter callback передаёт `(adapter_id, provider_event_id, received_at_monotonic)`. Очередь coalesce-ит повторные обновления одного источника/идентификатора; для совместимости с dashboard latency diagnostics сохраняет событие как `(source_id, event_id, received_at_epoch)`, конвертируя monotonic receipt на границе. `source_id` равен `pm` для CLOB token и adapter ID для provider event.
 
 Для разрешения event → recalculation целевые обратные индексы:
 
@@ -108,10 +108,10 @@ Health должен различать transport connected/readiness, completene
 
 ## Текущее состояние и план без смены поведения
 
-- `bk_router.py` сейчас отвечает за 1win-first/BetBoom fallback, runtime source selection, binding cache и feed health. Публичный контракт у источников пока различается.
-- `onewin_bridge.py` имеет event callback с match ID; fresh pair строится из ровно двух открытых котировок и TTL от локального `receivedAt`.
-- `event_dispatch.py` coalesce-ит `pm` token ID и `1win` match ID; `polyarb_v4.py` строит PM token index и OneWin match index.
-- BetBoom пока не включён в тот же callback/index path; для некоторых его расчётов сохраняется ограниченный polling. Health router сейчас экспортирует health 1win.
+- `bk_router.py` отвечает за 1win-first/BetBoom fallback, runtime source selection, binding cache и feed health. Публичный контракт у источников различается.
+- `onewin_bridge.py` сохраняет legacy callback с match ID; router адаптирует его к общему callback `(adapter_id, event_id, monotonic_receipt)`. Fresh pair строится из двух открытых котировок и TTL от локального `receivedAt`.
+- `event_dispatch.py` coalesce-ит PM token и adapter event updates и разрешает provider events через `(adapter_id, event_id)` index; scanner строит его из текущих bindings. Legacy 1win queue/index фасады сохранены.
+- К generic callback path подключён только 1win. BetBoom в него не включён; его routing/fallback и ограниченный polling не изменялись. Health router по-прежнему экспортирует health 1win.
 - Существующие fail-closed matching, source routing, score thresholds и fallback поведение не ослаблять в рамках выделения интерфейса.
 
-Безопасный порядок реализации: (1) добавить протокол/нормализованные dataclasses и тесты на synthetic adapters; (2) адаптировать существующие 1win и BetBoom фасады без изменения их matching; (3) обобщить event ID/обратные индексы и callback routing; (4) проверить включение/отключение, fallback promotion, freshness, partial catalogs и stale events; (5) только отдельным решением оценивать будущие источники. Ни одна стадия этого документа не разрешает подключать новую БК или добавлять действия со ставками.
+Безопасный порядок реализации: (1) добавить протокол/нормализованные dataclasses и тесты на synthetic adapters; (2) адаптировать фасады без изменения matching; (3) обобщить event ID/обратные индексы и callback routing; (4) проверить включение/отключение, invalidation binding, freshness, partial catalogs и read-only границу; (5) только отдельным решением оценивать будущие источники. Этапы 1–4 проверены для текущего 1win event path без изменения priority/fallback. Ни одна стадия этого документа не разрешает подключать новую БК или добавлять действия со ставками.
