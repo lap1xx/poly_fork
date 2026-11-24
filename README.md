@@ -221,6 +221,17 @@ miniapp/            Незавершённый экспериментальны�
 
 `scanner_status.json` также содержит `best_candidate_roi_pct` и `best_candidate_slug`: лучший ROI кандидата после проверки глубины и уточнения цены, даже если он ниже заданного порога показа. Если валидных кандидатов нет, ROI будет `null`.
 
+### Read-only baseline quality gate
+
+Чтобы собрать сопоставимую 15-минутную выборку уже работающего scanner, запусти из каталога проекта:
+
+```bash
+python tools/quality_gate_baseline.py capture --duration-seconds 900 --interval-seconds 1 --status scanner_status.json --output .work/quality-baseline.jsonl
+python tools/quality_gate_baseline.py report --input .work/quality-baseline.jsonl --format markdown --output .work/quality-baseline.md
+```
+
+Утилита только читает локальный `scanner_status.json`: она не запускает scanner, не обращается к Polymarket/1win и не меняет настройки. JSONL создаётся без перезаписи существующего файла; `.work/` следует держать локально и не коммитить. В отчёте commit из runtime status отделён от commit репозитория, из которого запущен collector; latency ограничена временем от локального receipt события до сборки scanner status и не является end-to-end задержкой до панели.
+
 ## Важные ограничения
 
 - Сигнал — расчётная возможность на момент получения данных, а не обещание гарантированной вилки или прибыли. Коэффициенты и глубина могут измениться до ручной проверки.

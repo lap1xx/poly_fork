@@ -155,7 +155,7 @@ CSV_FILE = "arbs.csv"
 JSONL_FILE = "arbs.jsonl"
 STATUS_FILE = "scanner_status.json"
 BK_FILE = "bk_profiles.json"
-
+_SCANNER_COMMIT_CACHE = False
 DEFAULT_CFG = {
     "bank": DEFAULT_RUNTIME_SETTINGS["bank"],
     "currency": "USDT",
@@ -859,7 +859,24 @@ def _write_json_atomic(path, payload):
 
 def _write_scan_status(payload):
     """Atomically publish read-only scan diagnostics for the dashboard."""
-    _write_json_atomic(STATUS_FILE, payload)
+    global _SCANNER_COMMIT_CACHE
+    if _SCANNER_COMMIT_CACHE is False:
+        commit = os.environ.get("POLYARB_BUILD_COMMIT", "").strip()
+        if not commit:
+            try:
+                result = subprocess.run(
+                    ["git", "-C", os.path.dirname(os.path.abspath(__file__)),
+                     "rev-parse", "HEAD"],
+                    check=True, capture_output=True, text=True, timeout=1,
+                )
+                commit = result.stdout.strip()
+            except (OSError, subprocess.SubprocessError):
+                commit = ""
+        _SCANNER_COMMIT_CACHE = commit or None
+    status = dict(payload or {})
+    if _SCANNER_COMMIT_CACHE:
+        status.setdefault("scanner_commit", _SCANNER_COMMIT_CACHE)
+    _write_json_atomic(STATUS_FILE, status)
 
 
 def _write_match_diagnostics(router, market_map):

@@ -114,6 +114,20 @@ class RollingEventLatencyTests(unittest.TestCase):
         self.assertEqual(metrics.snapshot()["overall"]["sample_count"], 0)
 
 
+class ScannerStatusCommitTests(unittest.TestCase):
+    def test_status_writer_adds_runtime_commit_without_mutating_payload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            status_file = Path(tmp) / "scanner_status.json"
+            payload = {"state": "running", "ts": 1.0}
+            with patch.object(polyarb_v4, "STATUS_FILE", str(status_file)), \
+                 patch.object(polyarb_v4, "_SCANNER_COMMIT_CACHE", False), \
+                 patch.dict(os.environ, {"POLYARB_BUILD_COMMIT": "test-build-commit"}):
+                polyarb_v4._write_scan_status(payload)
+            written = json.loads(status_file.read_text(encoding="utf-8"))
+        self.assertEqual(written["scanner_commit"], "test-build-commit")
+        self.assertNotIn("scanner_commit", payload)
+
+
 class FeedCallbackTests(unittest.TestCase):
     def test_pm_book_callback_runs_after_book_is_committed_and_lock_released(self):
         token = "event-pipeline-test-token"
