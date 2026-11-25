@@ -653,7 +653,17 @@ function renderScanStatus() {
           if (currentPm.age_sec != null) currentPmText += ` · ${Number(currentPm.age_sec).toFixed(1)}с`;
           if (currentPm.ask_levels != null) currentPmText += ` · asks ${Number(currentPm.ask_levels)}`;
           if (currentPm.rest_refresh && currentPm.rest_refresh !== 'not_requested') {
-            currentPmText += ` · REST ${currentPm.rest_refresh}`;
+            if (currentPm.rest_refresh === 'queued') {
+              const waiting = currentPm.rest_queue_age_sec;
+              currentPmText += ` · REST в очереди${waiting != null ? ` ${Number(waiting).toFixed(1)}с` : ''}`;
+            } else if (currentPm.rest_refresh === 'fetching') {
+              const elapsed = currentPm.rest_fetch_age_sec;
+              const waiting = currentPm.rest_queue_age_sec;
+              currentPmText += ` · REST запрос выполняется${elapsed != null ? ` ${Number(elapsed).toFixed(1)}с` : ''}`;
+              if (waiting != null && Number(waiting) > 0) currentPmText += ` (очередь ${Number(waiting).toFixed(1)}с)`;
+            } else {
+              currentPmText += ` · REST ${currentPm.rest_refresh}`;
+            }
           }
           parts.push(currentPmText);
         }

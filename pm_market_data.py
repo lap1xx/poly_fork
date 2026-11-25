@@ -531,6 +531,22 @@ def pm_book_diagnostic(token_id, now=None):
                 state = "ask_available"
     with _PM_REFRESH_LOCK:
         refresh = dict(_PM_REFRESH_DIAGNOSTICS.get(key) or {})
+    attempted_at = refresh.get("attempted_at")
+    started_at = refresh.get("started_at")
+    try:
+        queue_age = (max(0.0, now - float(attempted_at))
+                     if refresh.get("state") == "queued" and attempted_at is not None
+                     else max(0.0, float(started_at) - float(attempted_at))
+                     if started_at is not None and attempted_at is not None
+                     else None)
+    except (TypeError, ValueError):
+        queue_age = None
+    try:
+        fetch_age = (max(0.0, now - float(started_at))
+                     if refresh.get("state") == "fetching" and started_at is not None
+                     else None)
+    except (TypeError, ValueError):
+        fetch_age = None
     return {
         "book_state": state,
         "book_age_sec": round(age, 1) if age is not None else None,
@@ -541,8 +557,11 @@ def pm_book_diagnostic(token_id, now=None):
         "best_bid": bids[0][0] if bids else None,
         "best_ask": asks[0][0] if asks else None,
         "rest_refresh": refresh.get("state", "not_requested"),
-        "rest_attempted_at": refresh.get("attempted_at"),
+        "rest_attempted_at": attempted_at,
+        "rest_started_at": started_at,
         "rest_completed_at": refresh.get("completed_at"),
+        "rest_queue_age_sec": round(queue_age, 1) if queue_age is not None else None,
+        "rest_fetch_age_sec": round(fetch_age, 1) if fetch_age is not None else None,
     }
 
 
@@ -616,6 +635,12 @@ def _refresh_pm_book_worker(token_id, attempted_at, reason, fresh_fetch=None, no
     result_state = "fetch_failed"
     bid_levels = ask_levels = 0
     applied = False
+    started_at = time.time()
+    with _PM_REFRESH_LOCK:
+        previous = _PM_REFRESH_DIAGNOSTICS.get(key)
+        if previous is not None:
+            previous["state"] = "fetching"
+            previous["started_at"] = started_at
     try:
         fresh = (fresh_fetch or _fresh_pm_book)(key, timeout=4.0)
         if fresh is not None:
@@ -680,6 +705,7 @@ def _refresh_pm_book_worker(token_id, attempted_at, reason, fresh_fetch=None, no
                 "state": result_state,
                 "reason": reason,
                 "attempted_at": previous.get("attempted_at", attempted_at),
+                "started_at": previous.get("started_at", started_at),
                 "completed_at": time.time(),
                 "bid_levels": bid_levels,
                 "ask_levels": ask_levels,
@@ -696,8 +722,9 @@ def _schedule_pm_book_refresh(token_id, reason, executor=None, fresh_fetch=None,
         _PM_REFRESH_COOLDOWN[key] = now
         _PM_REFRESH_INFLIGHT.add(key)
         _PM_REFRESH_DIAGNOSTICS[key] = {
-            "state": "pending", "reason": reason,
+            "state": "queued", "reason": reason,
             "attempted_at": now, "completed_at": None,
+            "started_at": None,
             "bid_levels": 0, "ask_levels": 0,
         }
     try:
@@ -709,6 +736,7 @@ def _schedule_pm_book_refresh(token_id, reason, executor=None, fresh_fetch=None,
             _PM_REFRESH_DIAGNOSTICS[key] = {
                 "state": "schedule_failed", "reason": reason,
                 "attempted_at": now, "completed_at": time.time(),
+                "started_at": None,
                 "bid_levels": 0, "ask_levels": 0,
             }
         return False

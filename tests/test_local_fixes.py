@@ -457,6 +457,11 @@ class PMBookRecoveryTests(unittest.TestCase):
         def submit(self, function, *args):
             return function(*args)
 
+    class DeferredExecutor:
+        def submit(self, function, *args):
+            self.function = function
+            self.args = args
+
     def setUp(self):
         self.tokens = ["unit-test-pm-book-%s-%d" % (id(self), i) for i in range(4)]
         self._clear_state()
@@ -533,6 +538,43 @@ class PMBookRecoveryTests(unittest.TestCase):
         self.assertEqual(diagnostic["bid_levels"], 1)
         self.assertEqual(diagnostic["ask_levels"], 0)
         get.assert_called_once()
+
+    def test_refresh_diagnostic_distinguishes_queued_fetching_and_completed(self):
+        token = self.tokens[0]
+        executor = self.DeferredExecutor()
+        states_seen_by_fetch = []
+
+        def fake_fetch(_token, timeout=4.0):
+            states_seen_by_fetch.append(polyarb_v4.pm_book_diagnostic(token))
+            return [], [(0.42, 9.0)]
+
+        with patch.object(polyarb_v4, "_PM_REFRESH_EXECUTOR", executor), \
+                patch.object(polyarb_v4, "_fresh_pm_book", side_effect=fake_fetch):
+            self.assertTrue(polyarb_v4._maybe_refresh_stale(token))
+            queued = polyarb_v4.pm_book_diagnostic(token)
+            self.assertEqual(queued["rest_refresh"], "queued")
+            self.assertIsNotNone(queued["rest_queue_age_sec"])
+            self.assertIsNone(queued["rest_fetch_age_sec"])
+            executor.function(*executor.args)
+
+        self.assertEqual(states_seen_by_fetch[0]["rest_refresh"], "fetching")
+        self.assertIsNotNone(states_seen_by_fetch[0]["rest_fetch_age_sec"])
+        completed = polyarb_v4.pm_book_diagnostic(token)
+        self.assertEqual(completed["rest_refresh"], "asks_available")
+        self.assertIsNotNone(completed["rest_started_at"])
+        self.assertIsNotNone(completed["rest_completed_at"])
+
+    def test_signal_drop_carries_rest_queue_and_fetch_ages(self):
+        drop = polyarb_v4._make_signal_drop_diagnostic(
+            {}, "pm_book_unavailable", time.time(),
+            current_pm_diagnostic={
+                "book_state": "missing_book", "rest_refresh": "queued",
+                "rest_queue_age_sec": 7.5, "rest_fetch_age_sec": None,
+            },
+        )
+        self.assertEqual(drop["current_pm_book"]["rest_refresh"], "queued")
+        self.assertEqual(drop["current_pm_book"]["rest_queue_age_sec"], 7.5)
+        self.assertIsNone(drop["current_pm_book"]["rest_fetch_age_sec"])
 
     def test_missing_book_recovery_restores_executable_ask(self):
         token = self.tokens[1]

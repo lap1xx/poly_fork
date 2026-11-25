@@ -1002,6 +1002,8 @@ def _make_signal_drop_diagnostic(snapshot, reason, dropped_at,
             "best_bid": number(current_pm_diagnostic.get("best_bid")),
             "best_ask": number(current_pm_diagnostic.get("best_ask")),
             "rest_refresh": str(current_pm_diagnostic.get("rest_refresh") or ""),
+            "rest_queue_age_sec": number(current_pm_diagnostic.get("rest_queue_age_sec")),
+            "rest_fetch_age_sec": number(current_pm_diagnostic.get("rest_fetch_age_sec")),
         }
     return {
         "slug": str(snapshot.get("slug") or ""),
