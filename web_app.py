@@ -27,6 +27,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from arb_invariants import is_pm_bookmaker_pair
 from opportunity import normalize_scanner_snapshot
+from pm_event_links import polymarket_event_url_for_market
 from pm_fees import fetch_fee_schedule, fee_per_share
 from runtime_settings import (
     DEFAULT_RUNTIME_SETTINGS,
@@ -1088,7 +1089,19 @@ async def api_price_history(slug: str, max_points: int = 120):
 
 @app.get("/api/pm_url/{slug}")
 async def api_pm_url(slug: str):
-    return {"url": f"https://polymarket.com/event/{slug}"}
+    if not polymarket_event_url_for_market({"slug": slug}):
+        return {"url": None}
+    try:
+        markets = await asyncio.to_thread(
+            _http_get, f"{GAMMA}/markets", {"slug": slug}, 5,
+        )
+    except Exception:
+        return {"url": None}
+    if not isinstance(markets, list):
+        return {"url": None}
+    market = next((item for item in markets
+                   if isinstance(item, dict) and item.get("slug") == slug), None)
+    return {"url": polymarket_event_url_for_market(market, slug)}
 
 
 def _walk_pm_asks_with_fee(asks, cash_budget, schedule):

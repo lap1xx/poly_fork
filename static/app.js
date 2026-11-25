@@ -1906,6 +1906,16 @@ function openBookmakerEvent() {
   const url = 'https://betboom.ru/esport/' + sp + '/' + tour + '/' + mid;
   window.open(url, '_blank', 'noopener,noreferrer');
 }
+function polymarketUrlUsesMarketSlug(value, marketSlug) {
+  try {
+    const url = new URL(String(value || ''), window.location.origin);
+    const lastSegment = decodeURIComponent(url.pathname.split('/').filter(Boolean).pop() || '');
+    return lastSegment === String(marketSlug || '');
+  } catch (_error) {
+    return false;
+  }
+}
+
 async function openPMUrl() {
   const a = getActive(); if (!a) return;
   const pmLeg = (a.bets || []).find(leg => leg.source === 'Polymarket');
@@ -1918,7 +1928,7 @@ async function openPMUrl() {
   };
   const pmEventUrl = activeOpportunityEventUrl(a, 'Polymarket')
     || pmLeg?.event_url || a.pm_event_url;
-  if (pmEventUrl) {
+  if (pmEventUrl && !polymarketUrlUsesMarketSlug(pmEventUrl, a.slug)) {
     try {
       openPolymarketEvent(pmEventUrl);
     } catch (e) {
@@ -1930,7 +1940,7 @@ async function openPMUrl() {
     const r = await fetch('/api/pm_url/' + encodeURIComponent(a.slug));
     const j = await r.json();
     if (j.url) openPolymarketEvent(j.url);
-    else toast('PM URL \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D', true);
+    else toast('Ссылка на событие Polymarket не найдена в Gamma', true);
   } catch (e) { toast('Не удалось открыть страницу события Polymarket', true); }
 }
 function markFilled() {

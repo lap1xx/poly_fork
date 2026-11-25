@@ -23,6 +23,7 @@ except Exception:
     pass
 
 import requests
+from pm_event_links import polymarket_event_url_for_market
 from arb_invariants import is_pm_bookmaker_pair as _is_pm_bookmaker_pair
 from arb_candidates import build_arb_candidates as _build_arb_candidates
 from event_dispatch import (
@@ -695,6 +696,7 @@ def fetch_market(slug):
             "status": m.get("status"),
             "closed": m.get("closed"),
             "active": m.get("active"),
+            "pm_event_url": polymarket_event_url_for_market(m),
         }
     except Exception:
         return None
@@ -1806,7 +1808,7 @@ def main():
                             "bk_source": _bk_src,
                             "bk_odds_age_sec": _bk_age,
                             "bk_event_url": (_bb_b or {}).get("event_url"),
-                            "pm_event_url": f"https://polymarket.com/event/{slug}",
+                            "pm_event_url": m.get("pm_event_url") or f"https://polymarket.com/event/{slug}",
                             "bk_match_id": (_bb_b or {}).get("match_id"),
                             "bk_binding": _bb_b,
                             "bb_match_id": ((_bb_b or {}).get("match_id")
