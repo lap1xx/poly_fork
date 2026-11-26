@@ -113,6 +113,7 @@ class BKRouterPriorityTests(unittest.TestCase):
             live_bc=Mock(side_effect=lambda slug: {"pair": True} if slug == live_slug else {}),
         )
         one_win.get_global_stream = Mock(return_value=stream)
+        router._onewin_stream = stream
         router.bindings = {
             live_slug: ("1win", {"match_id": 501}),
             stale_slug: ("1win", {"match_id": 502}),
@@ -128,6 +129,7 @@ class BKRouterPriorityTests(unittest.TestCase):
         self.assertEqual(stream.live_bc.call_count, 2)
         stream.live_bc.assert_any_call(live_slug)
         stream.live_bc.assert_any_call(stale_slug)
+        one_win.get_global_stream.assert_not_called()
 
     def test_invalid_market_shape_is_rejected_before_provider_calls(self):
         router, one_win, betboom = self._router({"provider": "1win"}, {"provider": "BetBoom"})

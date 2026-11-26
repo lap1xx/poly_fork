@@ -56,6 +56,11 @@ MAX_MATCHES_PER_SPORT = 200
 INITIAL_SUBSCRIPTION_LIMIT = 0
 SUBSCRIPTION_BATCH_SIZE = 30
 MATCH_REFRESH_SECONDS = 180
+BOUND_REPAIR_INTERVAL_SECONDS = 20.0
+CATALOG_REPAIR_COOLDOWN_SECONDS = 120.0
+CATALOG_REPAIR_GLOBAL_COOLDOWN_SECONDS = 20.0
+ODDS_RETRY_AFTER_SECONDS = 45.0
+ODDS_RETRY_COOLDOWN_SECONDS = 180.0
 MATCH_AMBIGUITY_MARGIN = 0.08
 TIME_CORROBORATED_SPORT_IDS = {33}
 TIME_CORROBORATED_MIN_SCORE = 0.60
@@ -106,6 +111,11 @@ _MAP_IN_GROUP_RE = re.compile(
     re.I,
 )
 _WINNER_RE = re.compile(r"\b(?:winner|победитель|исход)\b", re.I)
+_CANONICAL_WINNER_RE = re.compile(r"^(?:winner|победитель|исход)$", re.I)
+_CANONICAL_MAP_WINNER_RE = re.compile(
+    r"^(?:map|карта)\s*#?\s*(\d+)\s*[.:-]?\s*(?:winner|победитель|исход)$",
+    re.I,
+)
 
 
 def pm_market_kind(slug: str):
@@ -202,16 +212,30 @@ def _status_is_deleted(value) -> bool:
 
 
 def _group_market_kind(name: str):
-    s = (name or "").strip().lower()
-    if not s or any(x in s for x in ("total", "тотал", "handicap", "фора")):
+    """Accept only the plain full-match or full-map winner market.
+
+    Extra words can change settlement (e.g. no overtime, early payout, half,
+    round). Even identical-looking team names do not make those markets equal.
+    """
+    if not isinstance(name, str):
         return "unsupported", None
-    if not _WINNER_RE.search(s):
-        return "unsupported", None
-    m = _MAP_IN_GROUP_RE.search(s)
-    if m:
-        n = next((g for g in m.groups() if g), None)
-        return ("map_winner", int(n)) if n else ("unsupported", None)
-    return "winner", None
+    s = " ".join(name.strip().split())
+    if _CANONICAL_WINNER_RE.fullmatch(s):
+        return "winner", None
+    match = _CANONICAL_MAP_WINNER_RE.fullmatch(s)
+    if match and int(match.group(1)) > 0:
+        return "map_winner", int(match.group(1))
+    return "unsupported", None
+
+
+def _group_kind_for_binding(group):
+    # Unrecognized period metadata could narrow settlement even when the name
+    # looks canonical. Do not assume it describes the entire match/map.
+    for key in ("period", "periodName"):
+        value = group.get(key)
+        if value is not None and (not isinstance(value, str) or value.strip()):
+            return "unsupported", None
+    return _group_market_kind(group.get("name"))
 
 
 _CYRILLIC_TRANSLATION = str.maketrans({
@@ -227,7 +251,10 @@ _GENERIC_TEAM_SUFFIXES = {"esport", "esports", "gaming"}
 
 def _plain_name(value: str) -> str:
     """Fold punctuation, accents and common Cyrillic/Latin spelling variants."""
-    s = unicodedata.normalize("NFKD", str(value or "").strip().casefold())
+    # Preserve Cyrillic й as y before NFKD decomposes it into и + breve;
+    # otherwise stripping combining marks silently changes it to i.
+    raw = str(value or "").strip().casefold().replace("й", "y")
+    s = unicodedata.normalize("NFKD", raw)
     s = "".join(c for c in s if not unicodedata.combining(c))
     s = s.translate(_CYRILLIC_TRANSLATION).replace("&", " and ")
     tokens = re.findall(r"[a-z0-9]+", s)
@@ -374,6 +401,16 @@ class OneWinStream:
         self._price_update_count = 0
         self._last_odds_message_at = None
         self._last_price_update_at = None
+        self._last_match_odds_message_at: dict[str, float] = {}
+        self._last_match_info_at: dict[str, float] = {}
+        self._last_match_price_update_at: dict[str, float] = {}
+        self._subscription_sent_at: dict[str, float] = {}
+        self._last_odds_retry_at: dict[str, float] = {}
+        self._last_catalog_repair_at: dict[int, float] = {}
+        self._last_catalog_repair_global_at = 0.0
+        self._odds_resubscribe_attempts = 0
+        self._catalog_repair_attempts = 0
+        self._repair_thread = None
         self._odds_update_callback = None
 
     def set_odds_update_callback(self, callback):
@@ -404,7 +441,10 @@ class OneWinStream:
             if response.status_code != 200:
                 self._log("catalog sport=%s HTTP %s", sport_id, response.status_code)
                 return None
-            return _extract_items(response.json())
+            rows = _extract_items(response.json())
+            received_at = time.time()
+            return [dict(row, _phase_catalog_received_at=received_at)
+                    if isinstance(row, dict) else row for row in rows]
         except Exception as exc:
             self._log("catalog sport=%s failed: %s", sport_id, type(exc).__name__)
             return None
@@ -448,7 +488,10 @@ class OneWinStream:
             _key(m.get("id")) for m in items
             if isinstance(m, dict) and m.get("id") is not None
         }
+        changed_ids = set()
         with self.lock:
+            bound_ids = {_key(binding.get("match_id")) for binding in self.bindings.values()
+                         if isinstance(binding, dict) and binding.get("match_id") is not None}
             if replace_sport_ids:
                 replace_ids = {_key(sid) for sid in replace_sport_ids}
                 for mid, old_match in list(self.matches.items()):
@@ -456,9 +499,13 @@ class OneWinStream:
                             and mid not in incoming_ids):
                         self.matches.pop(mid, None)
                         self.stakes.pop(mid, None)
+                        if mid in bound_ids:
+                            changed_ids.add(mid)
             for m in items:
                 if not isinstance(m, dict) or m.get("id") is None:
                     continue
+                mid = _key(m["id"])
+                old_match = self.matches.get(mid) or {}
                 home = m.get("homeTeam") or m.get("home_team") or {}
                 away = m.get("awayTeam") or m.get("away_team") or {}
                 sport = m.get("sport") or {}
@@ -469,7 +516,19 @@ class OneWinStream:
                 match_slug = m.get("slug")
                 home_slug = home.get("slug") if isinstance(home, dict) else None
                 away_slug = away.get("slug") if isinstance(away, dict) else None
-                self.matches[_key(m["id"])] = {
+                catalog_at = m.get("_phase_catalog_received_at", time.time())
+                catalog_start = m.get("startAt") or m.get("start_at")
+                catalog_service, catalog_v2 = m.get("service"), m.get("serviceV2")
+                try:
+                    old_at = float(old_match.get("_phase_catalog_at"))
+                    if math.isfinite(old_at) and old_at > float(catalog_at):
+                        catalog_at = old_at
+                        catalog_start = old_match.get("_phase_catalog_start")
+                        catalog_service = old_match.get("_phase_catalog_service")
+                        catalog_v2 = old_match.get("_phase_catalog_service_v2")
+                except (TypeError, ValueError, OverflowError):
+                    pass
+                self.matches[mid] = {
                     "id": m["id"],
                     "name": m.get("name"),
                     "slug": match_slug,
@@ -481,6 +540,12 @@ class OneWinStream:
                     "startAt": m.get("startAt") or m.get("start_at"),
                     "service": m.get("service"),
                     "serviceV2": m.get("serviceV2"),
+                    "_phase_catalog_at": catalog_at,
+                    "_phase_catalog_start": catalog_start,
+                    "_phase_catalog_service": catalog_service,
+                    "_phase_catalog_service_v2": catalog_v2,
+                    "_phase_ws_service": old_match.get("_phase_ws_service"),
+                    "_phase_ws_service_at": old_match.get("_phase_ws_service_at"),
                     "sportId": m.get("sportId") or m.get("sport_id") or sport.get("id"),
                     "sportTag": m.get("sportTag") or sport.get("tag"),
                     "sport_slug": sport.get("slug"),
@@ -496,7 +561,37 @@ class OneWinStream:
                     "home_slug": home_slug,
                     "away_slug": away_slug,
                 }
+                if mid in bound_ids:
+                    changed_ids.add(mid)
         self._ready.set()
+        callback = self._odds_update_callback
+        if callback is not None:
+            for mid in changed_ids:
+                try:
+                    callback(mid)
+                except Exception:
+                    pass
+
+    def phase_evidence(self, slug, expected_match_id):
+        """Read evidence for an existing binding without starting or subscribing."""
+        if expected_match_id is None or not self._connected.is_set():
+            return None
+        with self.lock:
+            binding = self.bindings.get(slug)
+            if (not isinstance(binding, dict)
+                    or _key(binding.get("match_id")) != _key(expected_match_id)):
+                return None
+            match = self.matches.get(_key(expected_match_id))
+            if not isinstance(match, dict) or _key(match.get("id")) != _key(expected_match_id):
+                return None
+            return {
+                "startAt": match.get("_phase_catalog_start"),
+                "service": match.get("_phase_catalog_service"),
+                "serviceV2": match.get("_phase_catalog_service_v2"),
+                "catalog_at": match.get("_phase_catalog_at"),
+                "ws_service": match.get("_phase_ws_service"),
+                "ws_service_at": match.get("_phase_ws_service_at"),
+            }
 
     def start(self):
         if websocket is None or requests is None:
@@ -510,6 +605,10 @@ class OneWinStream:
             target=self._refresh_loop, name="onewin-catalog-refresh", daemon=True
         )
         self._refresh_thread.start()
+        self._repair_thread = threading.Thread(
+            target=self._repair_loop, name="onewin-bound-market-repair", daemon=True
+        )
+        self._repair_thread.start()
 
     def stop(self):
         self._stop.set()
@@ -526,6 +625,112 @@ class OneWinStream:
     def _refresh_loop(self):
         while not self._stop.wait(MATCH_REFRESH_SECONDS):
             self.fetch_live_matches()
+
+    def _repair_loop(self):
+        """Repair only bound-market catalog/subscription gaps off the hot path."""
+        while not self._stop.wait(BOUND_REPAIR_INTERVAL_SECONDS):
+            if not self._connected.is_set():
+                continue
+            now = time.time()
+            with self.lock:
+                bindings = [(slug, dict(binding)) for slug, binding in self.bindings.items()
+                            if isinstance(binding, dict)]
+            catalog_sports = set()
+            retry_matches = {}
+            for slug, binding in bindings:
+                try:
+                    _, diagnostic = self.inspect_live_bc(slug)
+                except Exception:
+                    continue
+                reason = diagnostic.get("reason")
+                match_id = binding.get("match_id")
+                match_key = _key(match_id)
+                if reason == "missing_match_details":
+                    try:
+                        sport_id = int(binding.get("sport_id"))
+                    except (TypeError, ValueError):
+                        sport_id = None
+                    if sport_id in WANTED_SPORTS:
+                        catalog_sports.add(sport_id)
+                if reason not in {"no_fresh_sides", "one_side_not_fresh", "market_group_empty",
+                                  "missing_market_group"} or not match_key:
+                    continue
+                last_price = self._last_match_price_update_at.get(match_key)
+                sent_at = self._subscription_sent_at.get(match_key)
+                baseline = last_price if last_price is not None else sent_at
+                if baseline is None or now - baseline < ODDS_RETRY_AFTER_SECONDS:
+                    continue
+                if now - self._last_odds_retry_at.get(match_key, 0.0) < ODDS_RETRY_COOLDOWN_SECONDS:
+                    continue
+                retry_matches[match_key] = match_id
+
+            if catalog_sports:
+                eligible = [sport_id for sport_id in catalog_sports
+                            if now - self._last_catalog_repair_at.get(sport_id, 0.0)
+                            >= CATALOG_REPAIR_COOLDOWN_SECONDS]
+                if eligible:
+                    sport_id = min(eligible, key=lambda sid: self._last_catalog_repair_at.get(sid, 0.0))
+                    self._refresh_bound_sport_catalog(sport_id, now=now)
+
+            # At most one match per repair interval; retransmission is not an ACK.
+            if retry_matches:
+                match_key = min(retry_matches, key=lambda key: self._last_odds_retry_at.get(key, 0.0))
+                try:
+                    if self._resubscribe_match_odds(retry_matches[match_key], now=now):
+                        self._last_odds_retry_at[match_key] = now
+                        self._odds_resubscribe_attempts += 1
+                except Exception as exc:
+                    self._log("bounded odds resubscribe failed for %s: %s", match_key, type(exc).__name__)
+
+    def _refresh_bound_sport_catalog(self, sport_id, now=None):
+        """Refresh one relevant sport catalog in background, merging without pruning."""
+        try:
+            sport_id = int(sport_id)
+        except (TypeError, ValueError):
+            return False
+        now = time.time() if now is None else float(now)
+        if sport_id not in WANTED_SPORTS:
+            return False
+        if now - self._last_catalog_repair_global_at < CATALOG_REPAIR_GLOBAL_COOLDOWN_SECONDS:
+            return False
+        if now - self._last_catalog_repair_at.get(sport_id, 0.0) < CATALOG_REPAIR_COOLDOWN_SECONDS:
+            return False
+        self._last_catalog_repair_global_at = now
+        self._last_catalog_repair_at[sport_id] = now
+        try:
+            rows = self._fetch_sport(sport_id, MAX_MATCHES_PER_SPORT)
+            if rows is None:
+                self._catalog_repair_attempts += 1
+                return False
+            # Merge returned details; do not delete unrelated events from a
+            # bounded or partial targeted catalog response.
+            for row in rows:
+                if isinstance(row, dict) and not row.get("sportId") and not row.get("sport_id"):
+                    row["sportId"] = sport_id
+            self._store_matches(rows)
+            self._catalog_repair_attempts += 1
+            return True
+        except Exception as exc:
+            self._catalog_repair_attempts += 1
+            self._log("bound catalog repair sport=%s failed: %s", sport_id, type(exc).__name__)
+            return False
+
+    def _resubscribe_match_odds(self, match_id, now=None):
+        """Send one bounded odds-subscription retry; the server may ignore duplicates."""
+        key = _key(match_id)
+        if not key:
+            return False
+        now = time.time() if now is None else float(now)
+        with self._send_lock:
+            ws = self._ws
+            if ws is None or not self._connected.is_set():
+                return False
+            for base in (True, False):
+                self._send_packet(ws, "subscribe-match-odds", [match_id], base)
+                self._subscribed_odds[base].add(key)
+            self._subscription_sent_at[key] = now
+        self._log("bounded odds resubscribe sent for bound match %s (not an acknowledgement)", key)
+        return True
 
     def _run_loop(self):
         attempt = 0
@@ -565,8 +770,12 @@ class OneWinStream:
         )
         with self._send_lock:
             self._ws = ws
-        self._subscribed_info.clear()
-        self._subscribed_odds = {True: set(), False: set()}
+            self._subscribed_info.clear()
+            self._subscribed_odds = {True: set(), False: set()}
+        with self.lock:
+            for match in self.matches.values():
+                match.pop("_phase_ws_service", None)
+                match.pop("_phase_ws_service_at", None)
         try:
             greeting = ws.recv()
             if not isinstance(greeting, str) or not greeting.startswith("0"):
@@ -653,6 +862,10 @@ class OneWinStream:
                     if odds_new:
                         self._send_packet(ws, "subscribe-match-odds", odds_new, base)
                         self._subscribed_odds[base].update(_key(mid) for mid in odds_new)
+                        if base is False:
+                            sent_at = time.time()
+                            for mid in odds_new:
+                                self._subscription_sent_at[_key(mid)] = sent_at
             self._log("subscribed batch: %d matches; odds groups base/all", len(batch))
 
     def _subscribe_match(self, match_id):
@@ -690,11 +903,23 @@ class OneWinStream:
         mid = data.get("matchId")
         if mid is None:
             return
+        now = time.time()
         with self.lock:
+            self._last_match_info_at[_key(mid)] = now
             match = self.matches.setdefault(_key(mid), {"id": mid})
             match["service"] = data.get("service") or match.get("service")
+            if "service" in data:
+                # A message without the field does not rejuvenate phase data.
+                match["_phase_ws_service"] = data["service"]
+                match["_phase_ws_service_at"] = time.time()
             match["enabledOddsCount"] = data.get("enabledOddsCount")
             match["scoreBoard"] = data.get("scoreBoard")
+        callback = self._odds_update_callback
+        if "service" in data and callback is not None:
+            try:
+                callback(mid)
+            except Exception:
+                pass
 
     def _on_match_odds(self, data: dict, snapshot: bool = False):
         mid = data.get("matchId")
@@ -704,6 +929,7 @@ class OneWinStream:
         base_filter = data.get("isBaseOddsGroups")
         now = time.time()
         with self.lock:
+            self._last_match_odds_message_at[match_key] = now
             if snapshot:
                 self._odds_snapshot_count += 1
             else:
@@ -718,6 +944,7 @@ class OneWinStream:
                 for gid, old_group in list(bucket.items()):
                     if old_group.get("isBase") is True:
                         bucket.pop(gid, None)
+            seen_group_ids = set()
             for group in data.get("oddsGroups", []) or []:
                 if not isinstance(group, dict):
                     continue
@@ -727,13 +954,24 @@ class OneWinStream:
                 if not group_id:
                     continue
                 old = bucket.get(group_id, {})
+                ambiguous_identity = (not group.get("id") or
+                                      (snapshot and group_id in seen_group_ids) or
+                                      (not snapshot and old.get("ambiguous_identity", False)))
+                seen_group_ids.add(group_id)
                 odds = {} if snapshot else dict(old.get("odds") or {})
+                has_unkeyed_outcomes = False if snapshot else bool(old.get("has_unkeyed_outcomes"))
+                seen_odd_ids = set()
                 for odd in group.get("oddsList", []) or []:
                     if not isinstance(odd, dict):
+                        has_unkeyed_outcomes = True
                         continue
                     odd_id = _key(odd.get("id"))
                     if not odd_id:
+                        has_unkeyed_outcomes = True
                         continue
+                    if snapshot and odd_id in seen_odd_ids:
+                        has_unkeyed_outcomes = True
+                    seen_odd_ids.add(odd_id)
                     if _status_is_deleted(odd.get("status")):
                         odds.pop(odd_id, None)
                         continue
@@ -744,6 +982,7 @@ class OneWinStream:
                         merged["receivedAt"] = now
                         self._price_update_count += 1
                         self._last_price_update_at = now
+                        self._last_match_price_update_at[match_key] = now
                     elif old_received_at is not None:
                         # A status/name-only delta does not reaffirm the cached price.
                         merged["receivedAt"] = old_received_at
@@ -754,7 +993,9 @@ class OneWinStream:
                 for field in ("id", "name", "isBase", "renderType", "period", "periodName"):
                     if field in group:
                         merged_group[field] = group[field]
-                merged_group.update({"groupId": group_id, "odds": odds, "receivedAt": now})
+                merged_group.update({"groupId": group_id, "odds": odds, "receivedAt": now,
+                                     "ambiguous_identity": bool(ambiguous_identity),
+                                     "has_unkeyed_outcomes": has_unkeyed_outcomes})
                 bucket[group_id] = merged_group
         callback = self._odds_update_callback
         if callback is not None:
@@ -844,6 +1085,8 @@ class OneWinStream:
                 round(max(0.0, now - last_price_at), 1)
                 if last_price_at is not None else None
             ),
+            "bounded_odds_resubscribe_attempts": self._odds_resubscribe_attempts,
+            "targeted_catalog_repair_attempts": self._catalog_repair_attempts,
             "max_quote_age_sec": ODDS_MAX_AGE_SECONDS,
             "last_error": self.last_error,
         }
@@ -979,50 +1222,186 @@ class OneWinStream:
         self._subscribe_match(best["id"])
         return dict(binding)
 
-    def live_bc(self, slug: str):
+    def inspect_live_bc(self, slug: str, *, _details: bool = True):
+        """Evaluate the exact live pair and explain rejections without relaxing it.
+
+        Receipt ages are local observations, not exchange-to-client latency.
+        A sent subscription is not evidence that the provider acknowledged it.
+        """
+        diagnostic = {"reason": "disconnected", "stage": "transport", "slug": str(slug)} if _details else None
         if not self._connected.is_set():
-            return {}
+            return {}, diagnostic
         with self.lock:
             binding = self.bindings.get(slug)
             if not binding:
-                return {}
-            match = self.matches.get(_key(binding["match_id"]), {})
-            groups = list((self.stakes.get(_key(binding["match_id"])) or {}).values())
+                if _details:
+                    diagnostic["reason"] = "not_bound"
+                    diagnostic["stage"] = "binding"
+                return {}, diagnostic
+            binding = dict(binding)
+            match_key = _key(binding["match_id"])
+            match = dict(self.matches.get(match_key, {}))
+            now = time.time()
+            info_at = self._last_match_info_at.get(match_key)
+            odds_at = self._last_match_odds_message_at.get(match_key)
+            price_at = self._last_match_price_update_at.get(match_key)
+            subscription_at = self._subscription_sent_at.get(match_key)
+            retry_at = self._last_odds_retry_at.get(match_key)
+            # _on_match_odds replaces groups and changed odds, never mutates the
+            # published objects. A shallow snapshot therefore stays consistent
+            # while avoiding a copy of every unrelated price under the feed lock.
+            groups = list((self.stakes.get(match_key) or {}).values())
+            desired = match_key in self._desired_ids if _details else None
+        if _details:
+            # A send can block on the network. A diagnostic must never stall
+            # the dispatcher just to report whether the packet was sent.
+            subscription_sent = None
+            if self._send_lock.acquire(blocking=False):
+                try:
+                    subscription_sent = match_key in self._subscribed_odds.get(False, set())
+                finally:
+                    self._send_lock.release()
+            diagnostic.update({
+                "match_id": binding["match_id"],
+                "market_kind": binding["kind"],
+                "market_arg": binding.get("arg"),
+                "subscription_desired": desired,
+                "odds_subscription_sent": subscription_sent,
+                "stage": "catalog_match",
+                "catalog_match_present": bool(match),
+                "home_present": bool(match.get("home")),
+                "away_present": bool(match.get("away")),
+                "match_info_age_sec": round(max(0.0, now - info_at), 1) if info_at is not None else None,
+                "odds_message_age_sec": round(max(0.0, now - odds_at), 1) if odds_at is not None else None,
+                "price_update_age_sec": round(max(0.0, now - price_at), 1) if price_at is not None else None,
+                "subscription_age_sec": round(max(0.0, now - subscription_at), 1) if subscription_at is not None else None,
+                "last_resubscribe_age_sec": round(max(0.0, now - retry_at), 1) if retry_at is not None else None,
+            })
         if not match.get("home") or not match.get("away"):
-            return {}
+            if _details:
+                diagnostic["reason"] = "missing_match_details"
+                diagnostic["missing_fields"] = [
+                    field for field in ("home", "away") if not match.get(field)
+                ]
+            return {}, diagnostic
         matching = []
         for group in groups:
-            group_kind, group_arg = _group_market_kind(group.get("name"))
+            group_kind, group_arg = _group_kind_for_binding(group)
             if group_kind == binding["kind"] and group_arg == binding.get("arg"):
                 matching.append(group)
+        if _details:
+            diagnostic["matching_groups"] = len(matching)
+            diagnostic["stage"] = "market_group"
+            if len(matching) > 1 or any(group.get("ambiguous_identity") for group in matching):
+                diagnostic["group_examples"] = [
+                    {"id": str(group.get("groupId") or group.get("id") or "")[:80],
+                     "name": str(group.get("name") or "")[:120],
+                     "is_base": group.get("isBase") if isinstance(group.get("isBase"), bool) else None,
+                     "ambiguous_identity": bool(group.get("ambiguous_identity")),
+                     "period": str(group["period"])[:80] if group.get("period") is not None else None,
+                     "period_name": str(group["periodName"])[:80] if group.get("periodName") is not None else None,
+                     "outcome_count": len(group.get("odds") or {})}
+                    for group in matching[:5]
+                ]
+                diagnostic["group_examples_truncated"] = len(matching) > 5
         # Multiple identically classified groups are ambiguous; don't guess.
-        if len(matching) != 1:
-            return {}
+        if len(matching) != 1 or matching[0].get("ambiguous_identity"):
+            if _details:
+                diagnostic["reason"] = (
+                    "missing_market_group" if not matching else "ambiguous_market_groups"
+                )
+            return {}, diagnostic
         candidates = {"home": [], "away": []}
-        now = time.time()
-        for odd in (matching[0].get("odds") or {}).values():
+        if _details:
+            diagnostic["stage"] = "outcomes"
+        if _details:
+            states = ("fresh", "stale", "closed", "invalid_price",
+                      "missing_timestamp", "invalid_timestamp")
+            side_details = {
+                side: {**{state: 0 for state in states}, "last_quote_age_sec": None}
+                for side in ("home", "away")
+            }
+        unmapped_outcomes = 0
+        mapped_outcomes = {}
+        odds = matching[0].get("odds") or {}
+        if not odds:
+            if _details:
+                diagnostic["reason"] = "market_group_empty"
+                diagnostic["outcome_count"] = 0
+            return {}, diagnostic
+        for odd in odds.values():
+            age_sec = None
             if not _status_is_open(odd.get("status")):
-                continue
-            price = _finite_odds(odd.get("cf"))
-            if price is None:
-                continue
-            try:
-                age_sec = now - float(odd.get("receivedAt"))
-            except (TypeError, ValueError):
-                continue
-            if not math.isfinite(age_sec) or age_sec < 0.0 or age_sec > ODDS_MAX_AGE_SECONDS:
-                continue
-            side = _team_from_outcome(odd, match)
-            if side:
+                state = "closed"
+                price = None
+            else:
+                price = _finite_odds(odd.get("cf"))
+                if price is None:
+                    state = "invalid_price"
+                else:
+                    try:
+                        age_sec = now - float(odd.get("receivedAt"))
+                    except (TypeError, ValueError):
+                        state = "missing_timestamp"
+                    else:
+                        if not math.isfinite(age_sec) or age_sec < 0.0:
+                            state = "invalid_timestamp"
+                        elif age_sec > ODDS_MAX_AGE_SECONDS:
+                            state = "stale"
+                        else:
+                            state = "fresh"
+            side = None
+            label = str(odd.get("name") or odd.get("outcome") or odd.get("shortName") or "").strip()
+            if label not in mapped_outcomes:
+                mapped_outcomes[label] = _team_from_outcome(odd, match)
+            side = mapped_outcomes[label]
+            if not side:
+                unmapped_outcomes += 1
+            if _details and side:
+                side_details[side][state] += 1
+                if age_sec is not None and math.isfinite(age_sec) and age_sec >= 0:
+                    previous = side_details[side]["last_quote_age_sec"]
+                    if previous is None or age_sec < previous:
+                        side_details[side]["last_quote_age_sec"] = round(age_sec, 1)
+            if side and state == "fresh":
                 candidates[side].append((price, age_sec))
+        if _details:
+            mapped_details = side_details
+            if binding["swap"]:
+                mapped_details = {"home": side_details["away"], "away": side_details["home"]}
+            diagnostic["sides"] = [
+                {"outcome": binding["pm_home"], **mapped_details["home"]},
+                {"outcome": binding["pm_away"], **mapped_details["away"]},
+            ]
+            diagnostic["unmapped_outcomes"] = unmapped_outcomes
+            diagnostic["outcome_count"] = len(odds)
+            diagnostic["has_unkeyed_outcomes"] = bool(matching[0].get("has_unkeyed_outcomes"))
+        if unmapped_outcomes or len(odds) > 2 or matching[0].get("has_unkeyed_outcomes"):
+            # A draw or an unknown outcome means the two teams are not proven
+            # to cover all settlement outcomes, even if that odd is suspended;
+            # malformed/unkeyed and duplicate IDs cannot be safely discarded.
+            if _details:
+                diagnostic["reason"] = "unsupported_outcomes"
+            return {}, diagnostic
         if len(candidates["home"]) != 1 or len(candidates["away"]) != 1:
-            return {}
+            if _details:
+                diagnostic["stage"] = "quote_freshness"
+                fresh_counts = [len(candidates[side]) for side in ("home", "away")]
+                diagnostic["reason"] = (
+                    "ambiguous_side_quotes" if any(count > 1 for count in fresh_counts)
+                    else "one_side_not_fresh" if sum(fresh_counts) == 1
+                    else "no_fresh_sides"
+                )
+            return {}, diagnostic
         sides = {"home": candidates["home"][0][0], "away": candidates["away"][0][0]}
         ages = {"home": candidates["home"][0][1], "away": candidates["away"][0][1]}
         if binding["swap"]:
             sides = {"home": sides["away"], "away": sides["home"]}
             ages = {"home": ages["away"], "away": ages["home"]}
         # Preserve full precision for downstream TTL checks; round only in UI.
+        if _details:
+            diagnostic["reason"] = "fresh"
+            diagnostic["stage"] = "complete"
         return {
             binding["pm_home"]: {
                 "src": "1win", "o": sides["home"], "c": 0.0,
@@ -1032,7 +1411,13 @@ class OneWinStream:
                 "src": "1win", "o": sides["away"], "c": 0.0,
                 "age_sec": ages["away"],
             },
-        }
+        }, diagnostic
+
+    def live_bc(self, slug: str):
+        return self.inspect_live_bc(slug, _details=False)[0]
+
+    def diagnose_live_bc(self, slug: str):
+        return self.inspect_live_bc(slug)[1]
 
     def snapshot_matches(self):
         with self.lock:

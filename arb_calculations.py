@@ -1,5 +1,6 @@
 """Pure scanner payout/ROI calculations with injectable PM book operations."""
 import math
+import time
 
 def resolve_usd_rub_rate(cbr_rate, configured_rate):
     """Prefer fresh CBR data; fall back only to a positive finite configured rate."""
@@ -100,6 +101,18 @@ def refine_stakes(
                 return None
             avg = depth_quote["avg_price"]
             shares = depth_quote["shares"]
+            if b.get("pm_book_age_source") == "local_receipt":
+                try:
+                    times = (float(b["pm_book_received_at"]),
+                             float(depth_quote["book_received_at"]))
+                    now = time.time()
+                    if not all(math.isfinite(ts) and 0 < ts <= now for ts in times):
+                        raise ValueError("invalid receipt timestamp")
+                    b["pm_book_received_at"] = min(times)
+                except (KeyError, TypeError, ValueError, OverflowError):
+                    # Once provenance is missing, a newer book cannot prove
+                    # the age of the earlier inputs used in this calculation.
+                    b["pm_book_received_at"] = None
             # Preserve the initial candidate-sizing probe fields, but publish
             # the depth price/size used by this stake-refinement iteration.
             b["pm_refined_avg_ask"] = float(avg)

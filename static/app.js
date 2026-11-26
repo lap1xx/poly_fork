@@ -23,6 +23,7 @@ const state = {
   suggestedCapped: false,
   audioCtx: null,
   soundEnabled: localStorage.getItem('poly_arb_sound') !== 'off',
+  desktopNotificationsEnabled: localStorage.getItem('poly_arb_desktop_notifications') === 'on',
   config: {
     rate: 1, bank: 100, currency: 'USDT',
     safe_fork_threshold: 0.45, min_roi_pct: 3,
@@ -33,6 +34,8 @@ const state = {
 
 const pmBookCache = {};  // slug -> {best_ask, best_bid, ask_depth_usd}
 const quoteFlashTimers = new WeakMap();
+// Отдельный, ограниченный кэш ссылок не участвует в получении котировок.
+const pmEventLinkCache = new Map();
 
 const BK_LIST = [
   { id: '1win',    name: '1win',    speed: 0, color: 'onewin' },
@@ -85,7 +88,101 @@ function updateSoundBtn() {
   btn.style.opacity = state.soundEnabled ? '1' : '0.45';
 }
 
+function updateDesktopNotificationsBtn() {
+  const btn = document.getElementById('btn-desktop-notify');
+  if (!btn) return;
+  const enabled = state.desktopNotificationsEnabled && window.Notification?.permission === 'granted';
+  btn.classList.toggle('notify-enabled', Boolean(enabled));
+  btn.setAttribute('aria-pressed', String(Boolean(enabled)));
+  btn.setAttribute('aria-label', enabled ? 'Уведомления включены' : 'Уведомления выключены');
+  btn.title = `Уведомления ${enabled ? 'включены' : 'выключены'} · новые свежие вилки при скрытой вкладке`;
+}
+
+async function toggleDesktopNotifications() {
+  if (state.desktopNotificationPermissionPending) return;
+  if (state.desktopNotificationsEnabled && window.Notification?.permission === 'granted') {
+    state.desktopNotificationsEnabled = false;
+    localStorage.setItem('poly_arb_desktop_notifications', 'off');
+    updateDesktopNotificationsBtn();
+    return;
+  }
+  if (!window.Notification || typeof window.Notification.requestPermission !== 'function') {
+    toast('Уведомления недоступны в этом браузере', true);
+    return;
+  }
+  state.desktopNotificationPermissionPending = true;
+  try {
+    const permission = await window.Notification.requestPermission();
+    state.desktopNotificationsEnabled = permission === 'granted';
+    localStorage.setItem('poly_arb_desktop_notifications', state.desktopNotificationsEnabled ? 'on' : 'off');
+    if (!state.desktopNotificationsEnabled) toast('Разрешение на уведомления не выдано', true);
+  } catch (e) {
+    state.desktopNotificationsEnabled = false;
+    toast('Не удалось включить уведомления', true);
+  } finally {
+    state.desktopNotificationPermissionPending = false;
+    updateDesktopNotificationsBtn();
+  }
+}
+
+function notifyNewSignals(rows) {
+  if (!state.desktopNotificationsEnabled || !document.hidden || state.wsState !== 'connected'
+      || !window.Notification || window.Notification.permission !== 'granted') return;
+  const now = Date.now() / 1000;
+  const statusAt = Number(state.scanStatus?.ts);
+  if (state.scanStatus?.state !== 'running' || !Number.isFinite(statusAt)
+      || now - statusAt < -0.5 || now - statusAt > 10) return;
+  const visible = new Set(state.visible.map(row => row.slug));
+  const fresh = rows.filter(a => {
+    if (!a?.slug || !visible.has(a.slug) || a.inactive_snapshot || a.roi == null || !Number.isFinite(Number(a.roi))) return false;
+    const pm = (a.bets || []).find(leg => leg.source === 'Polymarket');
+    const bk = (a.bets || []).find(leg => leg.source && leg.source !== 'Polymarket');
+    if (!pm || !bookmakerQuoteIsFresh(a, bk)) return false;
+    const ageValue = pmBookAge(pm, a);
+    const elapsed = now - Number(a.ts);
+    if (ageValue == null || ageValue === '') return false;
+    const age = Number(ageValue);
+    return Number.isFinite(age) && age >= 0 && Number.isFinite(elapsed) && elapsed >= -0.5
+      && age + Math.max(0, elapsed) <= runtimeFreshnessLimit('polymarket_book_ttl_sec', 30);
+  });
+  if (!fresh.length) return;
+  const first = fresh[0];
+  const title = fresh.length === 1 ? `Новая вилка · ${fmtPct(first.roi)}` : `Новые вилки: ${fresh.length}`;
+  const eventName = String(first.title || first.q || first.slug).slice(0, 140);
+  try {
+    const notification = new window.Notification(title, {
+      body: `${eventName}\nПроверьте котировки и исходы вручную.`, tag: 'poly-arb-new-signals',
+    });
+    notification.onclick = () => {
+      window.focus();
+      if (state.arbs.some(a => a.slug === first.slug)) selectArb(first.slug);
+      notification.close();
+    };
+  } catch (e) { /* Notifications are optional; scanner operation must continue. */ }
+}
+
 /* ============= UTILS ============= */
+function pmBookAge(pm, arb) {
+  if (pm.pm_book_age_sec != null) return pm.pm_book_age_sec;
+  // New snapshots explicitly identify the receipt-age semantics. An unknown
+  // receipt age must not be replaced by the age of an unchanged best ask.
+  if (pm.pm_book_age_source === 'local_receipt') return null;
+  return pm.pm_age ?? arb.pm_age;
+}
+
+function formatPmDropQuote(pm) {
+  if (pm.best_ask == null) return null;
+  let text = `последний PM ${pm.outcome || ''} ask ${(Number(pm.best_ask) * 100).toFixed(1)}¢`;
+  if (pm.average_ask != null) text += ` / avg ${(Number(pm.average_ask) * 100).toFixed(1)}¢`;
+  if (pm.book_age_sec != null) {
+    const label = pm.book_age_source === 'local_receipt' ? 'стакан' : 'без изменения лучшего ask';
+    text += ` · ${label} ${Number(pm.book_age_sec).toFixed(1)}с`;
+  } else if (pm.book_age_source === 'local_receipt') {
+    text += ' · возраст стакана неизвестен';
+  }
+  return text;
+}
+
 function escapeHtml(s) {
   return String(s || '').replace(/[&<>"']/g, c => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
@@ -109,6 +206,9 @@ function normalizePmFeeSchedule(schedule) {
   const enabled = schedule?.enabled ?? schedule?.fees_enabled;
   if (!schedule || typeof enabled !== 'boolean'
       || schedule.source !== 'clob_market_info') return null;
+  if (schedule.rate == null || schedule.exponent == null
+      || typeof schedule.rate === 'boolean' || typeof schedule.exponent === 'boolean'
+      || String(schedule.rate).trim() === '' || String(schedule.exponent).trim() === '') return null;
   const rate = Number(schedule.rate);
   const exponent = Number(schedule.exponent);
   if (!Number.isFinite(rate) || rate < 0 || rate > 1
@@ -167,6 +267,19 @@ function fmtAgo(sec) {
   if (m < 60) return m + 'м ' + s + 'с';
   const h = Math.floor(m / 60);
   return h + 'ч ' + (m % 60) + 'м';
+}
+function ageExceedsTtl(ageValue, ttlValue) {
+  const age = ageValue == null || ageValue === '' ? NaN : Number(ageValue);
+  const ttl = ttlValue == null || ttlValue === '' ? NaN : Number(ttlValue);
+  return Number.isFinite(age) && age >= 0 && Number.isFinite(ttl) && age > ttl;
+}
+function freshnessBadge(label, ageValue, ttlValue) {
+  const age = ageValue == null || ageValue === '' ? NaN : Number(ageValue);
+  if (!Number.isFinite(age) || age < 0) {
+    return `<span class="tag">${escapeHtml(label)} ?</span>`;
+  }
+  const stale = ageExceedsTtl(age, ttlValue);
+  return `<span class="tag${stale ? ' pm-age' : ''}">${escapeHtml(label)} ${fmtAgo(age)}${stale ? ' · УСТАРЕЛИ' : ''}</span>`;
 }
 function sportClass(s) { return (s || 'other').toLowerCase(); }
 function toast(msg, err) {
@@ -258,6 +371,7 @@ function setPanelStatus(status, retryMs = 0) {
     dot.classList.toggle('disconnected', status === 'disconnected');
     dot.classList.toggle('stale', status === 'stale');
   }
+  if (status !== 'connected' && state.activeSlug && getActive()) renderHowMuch(getActive());
 }
 
 /* ============= WS ============= */
@@ -329,18 +443,21 @@ function connectWS() {
       : new Map();
     const newArbs = Array.isArray(msg.arbs) ? msg.arbs : [];
     let hasNew = false;
+    const newlySeen = [];
     for (const a of newArbs) {
       if (a && a.slug && !state.seenSlugs.has(a.slug)) {
         state.seenSlugs.add(a.slug);
         state.freshSlugs.add(a.slug);
+        newlySeen.push(a);
         hasNew = true;
         setTimeout(() => state.freshSlugs.delete(a.slug), 2600);
       }
     }
     state.arbs = newArbs;
     if (state._primed && hasNew) playArbChime();
-    state._primed = true;
     applyFilters();
+    if (state._primed && newlySeen.length) notifyNewSignals(newlySeen);
+    state._primed = true;
     if (state.activeSlug || state.activeSnapshotId) refreshDetailThrottled();
     if (state.scanStatus) {
       state.scanStatus.ui_render_ms = Math.round((performance.now() - uiRenderStarted) * 10) / 10;
@@ -367,6 +484,7 @@ function applyFilters() {
   if (document.getElementById('f-cs2').checked) sports.add('CS2');
   if (document.getElementById('f-dota2').checked) sports.add('DOTA2');
   if (document.getElementById('f-lol').checked) sports.add('LOL');
+  if (document.getElementById('f-valorant')?.checked) sports.add('VALORANT');
   if (document.getElementById('f-tennis').checked) sports.add('TENNIS');
   const minRoi = parseFloat(document.getElementById('f-minroi').value || '0') / 100;
 
@@ -549,6 +667,21 @@ function renderScanStatus() {
       freshPairsLabel
     );
   }
+  const pairReasonLabels = {
+    disconnected: 'нет соединения', not_bound: 'нет привязки',
+    missing_match_details: 'нет данных матча', missing_market_group: 'нет группы рынка',
+    ambiguous_market_groups: 'неоднозначные группы', ambiguous_side_quotes: 'неоднозначные исходы',
+    unsupported_outcomes: 'лишние или нераспознанные исходы',
+    one_side_not_fresh: 'одна сторона без свежей цены', no_fresh_sides: 'нет свежих сторон',
+    diagnostic_error: 'ошибка диагностики',
+  };
+  const pairDiagnostics = matching.onewin_pair_diagnostics || {};
+  const pairReasonCounts = Object.entries(pairDiagnostics.reason_counts || {})
+    .filter(([reason, count]) => reason !== 'fresh' && Number(count) > 0)
+    .map(([reason, count]) => `${pairReasonLabels[reason] || reason} ${Number(count)}`);
+  if (pairReasonCounts.length) {
+    reasons.unshift(`1win · привязанные PM-рынки: ${pairReasonCounts.join(' · ')}`);
+  }
   const oneWinHealth = (status.bookmaker_feed_health || {})['1win'];
   if (oneWinHealth) {
     reasons.unshift(
@@ -667,12 +800,30 @@ function renderScanStatus() {
           }
           parts.push(currentPmText);
         }
-        if (pm.best_ask != null) {
-          let pmText = `PM ${pm.outcome || ''} ask ${(Number(pm.best_ask) * 100).toFixed(1)}¢`;
-          if (pm.average_ask != null) pmText += ` / avg ${(Number(pm.average_ask) * 100).toFixed(1)}¢`;
-          if (pm.book_age_sec != null) pmText += ` · стакан ${Number(pm.book_age_sec).toFixed(1)}с`;
-          parts.push(pmText);
+        const currentPair = drop.current_onewin_pair;
+        if (currentPair) {
+          let pairText = `1win сейчас: ${pairReasonLabels[currentPair.reason] || currentPair.reason || 'неизвестно'}`;
+          if (currentPair.odds_subscription_sent === false) pairText += ' · подписка на odds не отправлена';
+          if (Array.isArray(currentPair.sides)) {
+            const sideLabels = {
+              fresh: 'свежая', stale: 'устарела', closed: 'закрыта',
+              invalid_price: 'нет цены', missing_timestamp: 'нет времени цены',
+              invalid_timestamp: 'некорректное время',
+            };
+            const sides = currentPair.sides.map(side => {
+              const states = Object.entries(sideLabels)
+                .filter(([key]) => Number(side[key]) > 0)
+                .map(([key, label]) => `${label}${Number(side[key]) > 1 ? ` ×${Number(side[key])}` : ''}`);
+              const ageText = side.last_quote_age_sec == null ? '' : ` ${Number(side.last_quote_age_sec).toFixed(1)}с`;
+              return `${side.outcome || 'исход'}: ${states.join(', ') || 'нет котировки'}${ageText}`;
+            });
+            pairText += ` · ${sides.join(' / ')}`;
+          }
+          if (Number(currentPair.unmapped_outcomes) > 0) pairText += ` · нераспознанных исходов ${Number(currentPair.unmapped_outcomes)}`;
+          parts.push(pairText);
         }
+        const pmText = formatPmDropQuote(pm);
+        if (pmText) parts.push(pmText);
         if (bookmaker.odds != null) {
           let bkText = `последний ${bookmaker.source || 'БК'} ${bookmaker.outcome || ''} ${Number(bookmaker.odds).toFixed(2)}×`;
           if (bookmaker.age_sec != null) bkText += ` · котировка ${Number(bookmaker.age_sec).toFixed(1)}с`;
@@ -737,6 +888,26 @@ function setCardMarkup(card, selector, markup, cacheKey) {
   }
 }
 
+function phaseTag(row, detailed = false) {
+  const phase = ['live', 'prematch', 'unknown'].includes(row.phase) ? row.phase : 'unknown';
+  const labels = { live: 'LIVE', prematch: 'ПРЕМАТЧ',
+    unknown: detailed ? 'СТАТУС НЕ ПОДТВЕРЖДЁН' : 'СТАТУС ?' };
+  let label = labels[phase];
+  let title = '';
+  if (phase === 'prematch' && row.phase_source === '1win') {
+    label += ' · 1win';
+    title = 'Прематч по данным 1win';
+    const diff = Number(row.phase_start_difference_sec);
+    if (row.phase_start_difference_sec != null && Number.isFinite(diff) && diff !== 0) {
+      title += `; время начала отличается от Polymarket на ${Math.abs(diff / 60).toFixed(1)} мин`;
+    }
+  } else if (phase === 'unknown' && row.phase_source === 'conflict') {
+    title = 'Источники противоречат друг другу';
+  }
+  const attr = title ? ` title="${escapeHtml(title)}"` : '';
+  return `<span class="tag phase-${phase}"${attr}>${label}</span>`;
+}
+
 function updateArbCard(card, a) {
   // Dual-read drives list values and validated event-link actions; other detail/calculator data remains legacy-backed.
   const legacy = a;
@@ -746,8 +917,6 @@ function updateArbCard(card, a) {
   const legs = Array.isArray(a.bets) ? a.bets : [];
   const pmLeg = legs.find(l => l && l.source === 'Polymarket') || {};
   const bbLeg = legs.find(l => l && l.source && l.source !== 'Polymarket') || {};
-  const phase = ['live', 'prematch', 'unknown'].includes(a.phase) ? a.phase : 'unknown';
-  const phaseLabels = { live: 'LIVE', prematch: 'ПРЕМАТЧ', unknown: 'СТАТУС ?' };
   const title = a.title && a.q && a.title !== a.q ? `${a.title} · ${a.q}` : (a.title || a.q || slug);
   const classes = ['arb'];
   if (slug === state.activeSlug) classes.push('active');
@@ -763,16 +932,25 @@ function updateArbCard(card, a) {
   setCardText(card, '.arb-roi', fmtPct(a.roi));
   setCardText(card, '.arb-age', fmtAgo(a.age_sec));
 
-  const tags = [`<span class="tag phase-${phase}">${phaseLabels[phase]}</span>`];
-  const pmAge = pmLeg.pm_age || a.pm_age;
-  if (pmAge && pmAge > 60) tags.push(`<span class="tag pm-age">PM ${Math.floor(pmAge)}с</span>`);
+  const tags = [phaseTag(a)];
+  const freshness = (state.config && state.config.runtime_limits && state.config.runtime_limits.freshness)
+    || (state.scanStatus && state.scanStatus.runtime_limits && state.scanStatus.runtime_limits.freshness)
+    || {};
+  const pmAge = pmBookAge(pmLeg, a);
+  const bookmakerSource = String(bbLeg.source || a.bk_source || 'БК');
+  const bookmakerAge = bbLeg.odds_age_sec != null ? bbLeg.odds_age_sec : a.bk_odds_age_sec;
+  const pmStale = ageExceedsTtl(pmAge, freshness.polymarket_book_ttl_sec);
+  const bookmakerTtl = bookmakerSource.toLowerCase() === '1win'
+    ? freshness.onewin_odds_max_age_sec : null;
+  const bookmakerStale = ageExceedsTtl(bookmakerAge, bookmakerTtl);
+  const hasStaleLeg = pmStale || bookmakerStale;
+  tags.push(freshnessBadge('PM', pmAge, freshness.polymarket_book_ttl_sec));
+  tags.push(freshnessBadge(bookmakerSource, bookmakerAge, bookmakerTtl));
   const sourceAge = a.source_age_sec == null ? NaN : Number(a.source_age_sec);
-  if (Number.isFinite(sourceAge)) {
-    const ageLabel = `ДАННЫЕ ${Math.floor(sourceAge)}с`;
-    const ageClass = a.source_state === 'stale' ? 'tag pm-age' : 'tag';
-    tags.push(`<span class="${ageClass}">${ageLabel}${a.source_state === 'stale' ? ' · УСТАРЕЛИ' : ''}</span>`);
-  } else {
-    tags.push('<span class="tag pm-age">СВЕЖЕСТЬ ?</span>');
+  if (a.source_state === 'stale' && !hasStaleLeg) {
+    const sourceLabel = Number.isFinite(sourceAge)
+      ? `ДАННЫЕ ${fmtAgo(sourceAge)} · УСТАРЕЛИ` : 'ДАННЫЕ УСТАРЕЛИ';
+    tags.push(`<span class="tag pm-age">${sourceLabel}</span>`);
   }
   const opportunityStatusLabels = {
     stale: 'КОТИРОВКИ УСТАРЕЛИ',
@@ -780,6 +958,7 @@ function updateArbCard(card, a) {
     withdrawn: 'ВОЗМОЖНОСТЬ СНЯТА',
   };
   if (opportunityStatusLabels[a.opportunity_status]
+      && !(a.opportunity_status === 'stale' && hasStaleLeg)
       && !(a.opportunity_status === 'stale' && a.source_state === 'stale')) {
     tags.push(`<span class="tag pm-age">${opportunityStatusLabels[a.opportunity_status]}</span>`);
   }
@@ -835,9 +1014,6 @@ function updatePinnedSnapshotCard(card, row) {
   const lockedText = lockedAt > 0 ? new Date(lockedAt * 1000).toLocaleTimeString('ru-RU') : '—';
   const title = row.title && row.q && row.title !== row.q
     ? `${row.title} · ${row.q}` : (row.title || row.q || row.slug || 'Событие');
-  const phase = ['live', 'prematch', 'unknown'].includes(row.phase) ? row.phase : 'unknown';
-  const phaseLabels = { live: 'LIVE', prematch: 'ПРЕМАТЧ', unknown: 'СТАТУС ?' };
-
   card.className = `arb pinned-snapshot-card${selected ? ' active' : ''}`;
   card.dataset.pinnedSnapshotId = id;
   delete card.dataset.arbSlug;
@@ -850,7 +1026,7 @@ function updatePinnedSnapshotCard(card, row) {
   setCardText(card, '.arb-age', `СНИМОК ${lockedText} · ${Math.floor(expiresIn / 60)}:${String(expiresIn % 60).padStart(2, '0')} ДО СНЯТИЯ`);
 
   const tags = [`<span class="tag ${escapeHtml(sportClass(row.sport))}">${escapeHtml(row.sport || '')}</span>`];
-  tags.push(`<span class="tag phase-${phase}">${phaseLabels[phase]}</span>`);
+  tags.push(phaseTag(row));
   tags.push('<span class="tag snapshot-lock">СНИМОК · НЕАКТИВНО</span>');
   setCardMarkup(card, '.arb-tags', tags.join(''), '_renderedTags');
   setCardText(card, '.arb-market-value', window.PolyArbMarketDisplay.marketTypeLabel(row.market_type));
@@ -945,8 +1121,13 @@ function renderArbs() {
 
 /* ============= DETAIL ============= */
 function selectArb(slug) {
+  state.bookRequestId = (state.bookRequestId || 0) + 1;
+  state.chartRequestId = (state.chartRequestId || 0) + 1;
+  state.priceChartData = null;
   state.activeSlug = slug;
   state.activeSnapshotId = null;
+  setEventActionLink(document.getElementById('btn-open-bb'), null, 'Определяется ссылка события');
+  setEventActionLink(document.getElementById('btn-buy-pm'), null, 'Определяется ссылка события');
   state.detailEdited = false;
   state.calcEdited = false;
   state.suggestedCapped = false;
@@ -961,8 +1142,13 @@ function selectArb(slug) {
 function selectPinnedSnapshot(snapshotId) {
   const row = currentPinnedSnapshots().find(item => pinnedSnapshotId(item) === String(snapshotId));
   if (!row) return;
+  state.bookRequestId = (state.bookRequestId || 0) + 1;
+  state.chartRequestId = (state.chartRequestId || 0) + 1;
+  state.priceChartData = null;
   state.activeSlug = null;
   state.activeSnapshotId = String(snapshotId);
+  setEventActionLink(document.getElementById('btn-open-bb'), null, 'Определяется ссылка события');
+  setEventActionLink(document.getElementById('btn-buy-pm'), null, 'Определяется ссылка события');
   state.detailEdited = false;
   state.calcEdited = false;
   state.suggestedCapped = false;
@@ -975,12 +1161,17 @@ function selectPinnedSnapshot(snapshotId) {
 }
 
 function closeDetail() {
+  state.bookRequestId = (state.bookRequestId || 0) + 1;
+  state.chartRequestId = (state.chartRequestId || 0) + 1;
+  state.priceChartData = null;
   state.activeSlug = null;
   state.activeSnapshotId = null;
   const ph = document.getElementById('detail-placeholder');
   const body = document.getElementById('detail-body');
   if (ph) { ph.classList.remove('hidden'); ph.style.display = 'flex'; }
   if (body) { body.classList.add('hidden'); body.style.display = 'none'; }
+  setEventActionLink(document.getElementById('btn-open-bb'), null, 'Сначала выберите событие');
+  setEventActionLink(document.getElementById('btn-buy-pm'), null, 'Сначала выберите событие');
   renderArbs();
 }
 
@@ -1022,9 +1213,7 @@ function refreshDetail(options = {}) {
   document.getElementById('det-title').textContent = eventTitle + (frozen ? ' · ЗАКРЕПЛЁННЫЙ СНИМОК' : '');
   const tags = [`<span class="tag mtype">${escapeHtml(window.PolyArbMarketDisplay.marketTypeLabel(a.market_type))}</span>`,
                 `<span class="tag ${escapeHtml(sportClass(a.sport))}">${escapeHtml(a.sport || '')}</span>`];
-  const detailPhase = ['live','prematch','unknown'].includes(a.phase) ? a.phase : 'unknown';
-  const detailPhaseLabel = { live: 'LIVE', prematch: 'ПРЕМАТЧ', unknown: 'СТАТУС НЕ ПОДТВЕРЖДЁН' }[detailPhase];
-  tags.push(`<span class="tag phase-${detailPhase}">${detailPhaseLabel}</span>`);
+  tags.push(phaseTag(a, true));
   if (a.is_streamer) tags.push(`<span class="tag streamer">СТРИМЕР</span>`);
   if (a.source_state === 'stale') tags.push(`<span class="tag pm-age">ДАННЫЕ УСТАРЕЛИ</span>`);
   else if (a.source_state === 'unknown') tags.push(`<span class="tag pm-age">СВЕЖЕСТЬ НЕИЗВЕСТНА</span>`);
@@ -1068,24 +1257,19 @@ function refreshDetail(options = {}) {
 
   document.getElementById('pm-side-lbl').textContent = pmLeg.outcome || '—';
   renderHowMuch(a);
+  updateEventActionLinks(a);
   if (frozen) {
     state.bookRequestId = (state.bookRequestId || 0) + 1;
     state.chartRequestId = (state.chartRequestId || 0) + 1;
-    document.getElementById('pm-book-title').textContent = 'ЗАПОМНЕННАЯ КОТИРОВКА';
-    document.getElementById('pm-book-body').innerHTML = '<tr><td colspan="3" class="empty-cell">Актуальный стакан не загружается для снимка</td></tr>';
-    document.getElementById('pm-book-foot').textContent = 'Значения сохранены на момент фиксации';
-    const canvas = document.getElementById('price-chart');
-    const context = canvas.getContext('2d');
-    context.clearRect(0, 0, canvas.width, canvas.height);
-    context.fillStyle = '#4a5a52';
-    context.font = '12px monospace';
-    context.fillText('История цен не обновляется для снимка', 12, 24);
-    document.getElementById('chart-title').textContent = 'ИСТОРИЯ НЕ ЗАГРУЖАЕТСЯ';
-    document.getElementById('chart-foot').textContent = 'Снимок не содержит живую историю котировок';
-    document.getElementById('chart-delta').textContent = 'неактивно';
+    showSnapshotMarketData();
   } else {
-    document.getElementById('pm-book-title').textContent = 'СТАКАН POLYMARKET';
-    document.getElementById('chart-title').textContent = 'ИСТОРИЯ ЦЕНЫ';
+    showLiveMarketData();
+    const showingLive = renderLivePmBook(a);
+    const bookFoot = document.getElementById('pm-book-foot');
+    if (!showingLive && bookFoot?.textContent.startsWith('LIVE-кэш')) {
+      bookFoot.textContent = 'LIVE-стакан устарел · ожидание обновления REST';
+      document.getElementById('pm-book-body').innerHTML = '<tr><td colspan="3" class="empty-cell">Стакан устарел</td></tr>';
+    }
     if (loadRemote) {
       loadPmBook(a.slug);
       loadPriceChart(a.slug);
@@ -1093,22 +1277,151 @@ function refreshDetail(options = {}) {
   }
 }
 
+function showSnapshotMarketData() {
+  state.priceChartData = null;
+  document.getElementById('pm-book-title').textContent = 'СТАКАН POLYMARKET · СНИМОК';
+  document.getElementById('pm-book-head').hidden = true;
+  document.getElementById('pm-book-body').innerHTML = '<tr><td colspan="3" class="empty-cell snapshot-empty-cell">Актуальный стакан для сохранённого снимка не загружается.</td></tr>';
+  document.getElementById('pm-book-foot').textContent = 'Котировки в расчёте сохранены на момент снимка';
+  document.getElementById('price-chart').hidden = true;
+  document.getElementById('chart-snapshot-placeholder').hidden = false;
+  document.getElementById('chart-title').textContent = 'ИСТОРИЯ ЦЕНЫ';
+  document.getElementById('chart-foot').textContent = 'Снимок не содержит актуальной истории котировок';
+  document.getElementById('chart-delta').textContent = 'неактивно';
+}
+
+function showLiveMarketData() {
+  document.getElementById('pm-book-title').textContent = 'СТАКАН POLYMARKET';
+  document.getElementById('pm-book-head').hidden = false;
+  document.getElementById('price-chart').hidden = false;
+  document.getElementById('chart-snapshot-placeholder').hidden = true;
+  document.getElementById('chart-title').textContent = 'ИСТОРИЯ ЦЕНЫ';
+}
+
 /* ============= PM BOOK ============= */
+function runtimeFreshnessLimit(name, fallback) {
+  const freshness = state.scanStatus?.runtime_limits?.freshness
+    || state.config?.runtime_limits?.freshness || {};
+  const value = Number(freshness[name]);
+  return Number.isFinite(value) && value > 0 && value <= 600 ? value : fallback;
+}
+
+function livePmBookFor(a, pmLeg) {
+  const book = a?.pm_book_snapshot;
+  if (!a || a.inactive_snapshot || state.wsState !== 'connected' || !pmLeg?.token
+      || !book || String(book.token) !== String(pmLeg.token) || !Array.isArray(book.asks)) return null;
+  const receivedAt = Number(book.received_at);
+  const age = Date.now() / 1000 - receivedAt;
+  const ttl = runtimeFreshnessLimit('polymarket_book_ttl_sec', 30);
+  if (!Number.isFinite(receivedAt) || receivedAt <= 0 || !Number.isFinite(age)
+      || age < -0.5 || age > ttl) return null;
+  return book;
+}
+
+function bookmakerQuoteIsFresh(a, bbLeg) {
+  if (!a || !bbLeg || state.wsState !== 'connected') return false;
+  const snapshotAt = Number(a.ts);
+  const ageValue = bbLeg.odds_age_sec ?? a.bk_odds_age_sec;
+  if (ageValue == null || ageValue === '') return false;
+  const quotedAge = Number(ageValue);
+  const elapsed = Date.now() / 1000 - snapshotAt;
+  const ttl = bbLeg.source === '1win'
+    ? runtimeFreshnessLimit('onewin_odds_max_age_sec', 30)
+    : runtimeFreshnessLimit('dashboard_source_stale_sec', 10);
+  return Number.isFinite(snapshotAt) && snapshotAt > 0 && Number.isFinite(quotedAge)
+    && quotedAge >= 0 && Number.isFinite(elapsed) && elapsed >= -0.5
+    && Math.max(0, elapsed) + quotedAge <= ttl;
+}
+
+function pmQuoteForEnteredAmount(a, pmLeg, amount) {
+  const stake = Number(amount);
+  if (!a?.slug || !pmLeg?.token || !Number.isFinite(stake) || stake < 1 || stake > 100000) return null;
+  const live = livePmBookFor(a, pmLeg);
+  const schedule = getPmFeeSchedule(pmLeg);
+  const liveQuote = live && schedule && window.PolyArbPmDepthQuote
+    ? window.PolyArbPmDepthQuote.quote(live.asks, stake, schedule) : null;
+  if (liveQuote && (liveQuote.full || !live.asks_truncated)) {
+    return {...liveQuote, source: 'live', truncated: Boolean(live.asks_truncated)};
+  }
+  const cached = pmBookCache[a.slug];
+  const ageMs = Date.now() - Number(cached?.fetched_at);
+  const avg = cached?.avg_for_size;
+  const cachedSchedule = normalizePmFeeSchedule(cached?.fee_schedule);
+  const feeScheduleMatches = !schedule || (cachedSchedule && schedule.enabled === cachedSchedule.enabled
+    && schedule.rate === cachedSchedule.rate && schedule.exponent === cachedSchedule.exponent);
+  const newerLiveBook = live && Number(live.received_at) * 1000 > Number(cached?.fetched_at);
+  if (cached && String(cached.token_id) === String(pmLeg.token)
+      && cached.outcome === pmLeg.outcome && Number.isFinite(ageMs) && ageMs >= 0
+      && ageMs <= runtimeFreshnessLimit('polymarket_book_ttl_sec', 30) * 1000
+      && !newerLiveBook
+      && Math.abs(Number(cached.requested_usd) - stake) <= Math.max(1e-9, stake * 1e-12)
+      && cachedSchedule && feeScheduleMatches
+      && avg && Number.isFinite(Number(avg.shares)) && Number(avg.shares) > 0
+      && Number.isFinite(Number(avg.total_cost)) && Number(avg.total_cost) > 0
+      && avg.fee_estimate != null && Number.isFinite(Number(avg.fee_estimate)) && Number(avg.fee_estimate) >= 0
+      && Number.isFinite(Number(avg.avg_price)) && Number(avg.avg_price) > 0 && Number(avg.avg_price) < 1
+      && Number.isFinite(Number(avg.odds_eff)) && Number(avg.odds_eff) > 0
+      && typeof avg.full === 'boolean') {
+    return {
+      ...avg, shares: Number(avg.shares), fee: Number(avg.fee_estimate),
+      available_cash_usd: Number(cached.ask_depth_usd), source: 'rest', truncated: false,
+    };
+  }
+  return liveQuote ? {...liveQuote, source: 'live', truncated: Boolean(live.asks_truncated)} : null;
+}
+
+function renderLivePmBook(a) {
+  const pmLeg = (a?.bets || []).find(leg => leg.source === 'Polymarket') || {};
+  const book = livePmBookFor(a, pmLeg);
+  if (!book) return false;
+  const pmUsd = Number(document.getElementById('hm-pm-stake')?.value || 0);
+  let cumulative = 0;
+  const rows = book.asks.slice(0, 7).map(level => {
+    const price = Number(level.price), size = Number(level.size);
+    if (!Number.isFinite(price) || !Number.isFinite(size) || price <= 0 || price >= 1 || size <= 0) return '';
+    const inOrder = cumulative < pmUsd;
+    const cost = price * size;
+    cumulative += cost;
+    return `<tr class="${inOrder ? 'in-order' : 'out-order'}"><td>${(price * 100).toFixed(1)}¢</td><td>${Math.round(size)}</td><td>${cost.toFixed(2)}</td></tr>`;
+  }).join('');
+  const tbody = document.getElementById('pm-book-body');
+  const html = rows || '<tr><td colspan="3" class="empty-cell">пусто</td></tr>';
+  if (tbody.innerHTML !== html) tbody.innerHTML = html;
+  const age = Math.max(0, Date.now() / 1000 - Number(book.received_at));
+  const suffix = book.asks_truncated ? ' · передана часть уровней' : '';
+  document.getElementById('pm-book-foot').textContent =
+    `LIVE-кэш сканера · ${age.toFixed(1)}с · уровней ${Math.min(book.asks.length, 7)}/${Number(book.total_ask_levels || book.asks.length)}${suffix}`;
+  return true;
+}
+
 async function loadPmBook(slug) {
   const enteredUsd = parseFloat(document.getElementById('hm-pm-stake')?.value || '0');
   const requestedUsd = Number.isFinite(enteredUsd) && enteredUsd >= 1 && enteredUsd <= 100000
     ? enteredUsd : 50;
-  if (!state.bookInFlightKeys) state.bookInFlightKeys = new Set();
-  const requestKey = `${slug}:${requestedUsd.toFixed(2)}`;
-  if (state.bookInFlightKeys.has(requestKey)) return;
-  state.bookInFlightKeys.add(requestKey);
+  const active = getActive();
+  const activePmLeg = (active?.bets || []).find(leg => leg.source === 'Polymarket') || {};
+  if (!active || active.inactive_snapshot || active.slug !== slug || !activePmLeg.token) return;
+  const requestedToken = String(activePmLeg.token);
+  const requestedOutcome = String(activePmLeg.outcome || '');
+  const liveBook = active?.slug === slug ? livePmBookFor(active, activePmLeg) : null;
+  const liveQuote = liveBook && window.PolyArbPmDepthQuote
+    ? window.PolyArbPmDepthQuote.quote(liveBook.asks, requestedUsd, getPmFeeSchedule(activePmLeg)) : null;
+  if (liveBook && liveQuote && (liveQuote.full || !liveBook.asks_truncated)) {
+    renderLivePmBook(active);
+    return;
+  }
+  if (!state.bookInFlightKeys) state.bookInFlightKeys = new Map();
+  const requestKey = JSON.stringify([slug, requestedToken, requestedOutcome, requestedUsd]);
+  if (state.bookInFlightKeys.has(requestKey) && state.bookInFlightKeys.get(requestKey) === state.bookRequestId) return;
   const requestId = state.bookRequestId = (state.bookRequestId || 0) + 1;
+  state.bookInFlightKeys.set(requestKey, requestId);
   const tbody = document.getElementById('pm-book-body');
   const foot = document.getElementById('pm-book-foot');
   if (!pmBookCache[slug]) {
     tbody.innerHTML = '<tr><td colspan="3" class="empty-cell">Загрузка…</td></tr>';
     foot.textContent = 'Получение REST-стакана…';
   }
+  const requestStartedAt = Date.now();
   try {
     const r = await fetch(`/api/pm_book/${encodeURIComponent(slug)}?size_usd=${requestedUsd}`);
     const j = await r.json();
@@ -1123,7 +1436,9 @@ async function loadPmBook(slug) {
     const a = getActive();
     if (!a || a.slug !== slug) return;
     const pmLeg = (a.bets || []).find(l => l.source === 'Polymarket') || {};
-    const book = j.books.find(b => (b.outcome || '').trim() === (pmLeg.outcome || '').trim());
+    if (String(pmLeg.token || '') !== requestedToken || String(pmLeg.outcome || '') !== requestedOutcome) return;
+    const book = j.books.find(b => pmLeg.token && String(b.token_id) === String(pmLeg.token)
+      && (b.outcome || '').trim() === (pmLeg.outcome || '').trim());
     if (!book) {
       tbody.innerHTML = '<tr><td colspan="3" class="empty-cell">Исход в стакане не найден</td></tr>';
       return;
@@ -1131,15 +1446,18 @@ async function loadPmBook(slug) {
 
     pmBookCache[slug] = {
       outcome: pmLeg.outcome,
+      token_id: book.token_id,
+      fee_schedule: j.fee_schedule,
       best_ask: book.best_ask,
       best_bid: book.best_bid,
       ask_depth_usd: book.ask_depth_usd,
       avg_for_size: book.avg_for_size,
       requested_usd: requestedUsd,
-      fetched_at: Date.now(),
+      fetched_at: requestStartedAt,
       fetch_ms: Number(j.fetch_ms),
     };
     renderHowMuch(a);
+    if (renderLivePmBook(a)) return;
 
     const pmUsd = parseFloat(document.getElementById('hm-pm-stake')?.value || '0');
 
@@ -1183,78 +1501,108 @@ async function loadPmBook(slug) {
         : 'Ошибка сети';
     }
   } finally {
-    state.bookInFlightKeys.delete(requestKey);
+    if (state.bookInFlightKeys.get(requestKey) === requestId) state.bookInFlightKeys.delete(requestKey);
   }
 }
 
 /* ============= PRICE CHART ============= */
+function preparePriceChart(canvas) {
+  if (!canvas || canvas.hidden) return null;
+  const w = Number(canvas.clientWidth), h = Number(canvas.clientHeight);
+  if (!(w > 0 && h > 0)) return null;
+  const deviceScale = Number(window.devicePixelRatio);
+  const scale = Number.isFinite(deviceScale) && deviceScale > 0 ? Math.min(deviceScale, 4) : 1;
+  canvas.width = Math.max(1, Math.round(w * scale));
+  canvas.height = Math.max(1, Math.round(h * scale));
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return null;
+  ctx.setTransform(canvas.width / w, 0, 0, canvas.height / h, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  return { ctx, w, h };
+}
+
+function observePriceChartResize() {
+  const canvas = document.getElementById('price-chart');
+  if (!canvas || typeof window.ResizeObserver !== 'function') return;
+  state.chartResizeObserver = new window.ResizeObserver(() => {
+    const data = state.priceChartData;
+    if (data && state.activeSlug === data.slug && !canvas.hidden) drawPriceChart(data.points);
+  });
+  state.chartResizeObserver.observe(canvas);
+}
+
+function drawPriceChart(pts) {
+  const chart = preparePriceChart(document.getElementById('price-chart'));
+  if (!chart) return;
+  const { ctx, w, h } = chart;
+  const foot = document.getElementById('chart-foot');
+  const delta = document.getElementById('chart-delta');
+
+  if (pts.length < 2) {
+    ctx.fillStyle = '#b8c8d1';
+    ctx.font = '12px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('Недостаточно данных', w / 2, h / 2, Math.max(1, w - 20));
+    foot.textContent = '—';
+    delta.textContent = '—';
+    return;
+  }
+
+  const min = Math.min(...pts);
+  const max = Math.max(...pts);
+  const pad = 20;
+  const x0 = pad, x1 = w - pad, y0 = pad, y1 = h - pad;
+  const xs = pts.map((_, i) => x0 + (i / (pts.length - 1)) * (x1 - x0));
+  const ys = pts.map(v => y1 - ((v - min) / (max - min || 1)) * (y1 - y0));
+
+  ctx.strokeStyle = '#1e2824';
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const y = y0 + (i / 4) * (y1 - y0);
+    ctx.beginPath();
+    ctx.moveTo(x0, y);
+    ctx.lineTo(x1, y);
+    ctx.stroke();
+  }
+
+  ctx.strokeStyle = '#00ff88';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(xs[0], ys[0]);
+  for (let i = 1; i < xs.length; i++) ctx.lineTo(xs[i], ys[i]);
+  ctx.stroke();
+
+  ctx.fillStyle = '#00ff88';
+  ctx.beginPath();
+  ctx.arc(xs[xs.length - 1], ys[ys.length - 1], 4, 0, Math.PI * 2);
+  ctx.fill();
+
+  const last = pts.slice(-1)[0];
+  const prev = pts.slice(0, -1).reverse().find(v => Math.abs(v - last) > 0.001);
+  if (prev === undefined) {
+    delta.textContent = '\u043D\u0435 \u043C\u0435\u043D\u044F\u043B\u043E\u0441\u044C';
+    delta.style.color = 'var(--dim)';
+  } else {
+    const d = (last - prev) * 100;
+    delta.textContent = (d >= 0 ? '+' : '') + d.toFixed(1) + '\u00A2 \u0437\u0430 \u0432\u0440\u0435\u043C\u044F \u0436\u0438\u0437\u043D\u0438';
+    delta.style.color = d >= 0 ? 'var(--green)' : 'var(--red)';
+  }
+
+  foot.textContent = `${(min * 100).toFixed(1)}¢ — ${(max * 100).toFixed(1)}¢ · ${pts.length} точек`;
+}
+
 async function loadPriceChart(slug) {
   const requestId = state.chartRequestId = (state.chartRequestId || 0) + 1;
-  const canvas = document.getElementById('price-chart');
-  const ctx = canvas.getContext('2d');
-  const w = canvas.width = canvas.clientWidth * (window.devicePixelRatio || 1);
-  const h = canvas.height = 180 * (window.devicePixelRatio || 1);
-  ctx.scale(1, 1);
-  ctx.clearRect(0, 0, w, h);
-
+  state.priceChartData = null;
+  preparePriceChart(document.getElementById('price-chart'));
   try {
     const r = await fetch(`/api/price_history/${encodeURIComponent(slug)}?max_points=120`);
     const j = await r.json();
     if (requestId !== state.chartRequestId || state.activeSlug !== slug) return;
     const pts = (j.points || []).map(p => p.ask).filter(v => v > 0);
-    const foot = document.getElementById('chart-foot');
-    const delta = document.getElementById('chart-delta');
-
-    if (pts.length < 2) {
-      ctx.fillStyle = '#4a5a52';
-      ctx.font = '12px monospace';
-      ctx.fillText('Недостаточно данных', w / 2 - 60, h / 2);
-      foot.textContent = '—';
-      delta.textContent = '—';
-      return;
-    }
-
-    const min = Math.min(...pts);
-    const max = Math.max(...pts);
-    const pad = 20;
-    const x0 = pad, x1 = w - pad, y0 = pad, y1 = h - pad;
-    const xs = pts.map((_, i) => x0 + (i / (pts.length - 1)) * (x1 - x0));
-    const ys = pts.map(v => y1 - ((v - min) / (max - min || 1)) * (y1 - y0));
-
-    ctx.strokeStyle = '#1e2824';
-    ctx.lineWidth = 1;
-    for (let i = 0; i <= 4; i++) {
-      const y = y0 + (i / 4) * (y1 - y0);
-      ctx.beginPath();
-      ctx.moveTo(x0, y);
-      ctx.lineTo(x1, y);
-      ctx.stroke();
-    }
-
-    ctx.strokeStyle = '#00ff88';
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.moveTo(xs[0], ys[0]);
-    for (let i = 1; i < xs.length; i++) ctx.lineTo(xs[i], ys[i]);
-    ctx.stroke();
-
-    ctx.fillStyle = '#00ff88';
-    ctx.beginPath();
-    ctx.arc(xs[xs.length - 1], ys[ys.length - 1], 4, 0, Math.PI * 2);
-    ctx.fill();
-
-    const last = pts.slice(-1)[0];
-    const prev = pts.slice(0, -1).reverse().find(v => Math.abs(v - last) > 0.001);
-    if (prev === undefined) {
-      delta.textContent = '\u043D\u0435 \u043C\u0435\u043D\u044F\u043B\u043E\u0441\u044C';
-      delta.style.color = 'var(--dim)';
-    } else {
-      const d = (last - prev) * 100;
-      delta.textContent = (d >= 0 ? '+' : '') + d.toFixed(1) + '\u00A2 \u0437\u0430 \u0432\u0440\u0435\u043C\u044F \u0436\u0438\u0437\u043D\u0438';
-      delta.style.color = d >= 0 ? 'var(--green)' : 'var(--red)';
-    }
-
-    foot.textContent = `${(min * 100).toFixed(1)}¢ — ${(max * 100).toFixed(1)}¢ · ${pts.length} точек`;
+    state.priceChartData = { slug, points: pts };
+    drawPriceChart(pts);
   } catch (e) {
     if (requestId === state.chartRequestId && state.activeSlug === slug) {
       document.getElementById('chart-foot').textContent = 'ошибка';
@@ -1282,7 +1630,7 @@ function renderHowMuch(a) {
   document.getElementById('market-bk-name').textContent = bbLeg.source || 'Букмекер';
   document.getElementById('market-bk-outcome').textContent = bbLeg.outcome || '—';
   document.getElementById('market-pm-outcome').textContent = pmLeg.outcome || '—';
-  document.getElementById('kpi-odds-label').textContent = frozen ? 'КЭФЫ В СНИМКЕ' : 'КЭФЫ В РАСЧЁТЕ';
+  document.getElementById('kpi-odds-label').textContent = frozen ? 'КЭФЫ В СНИМКЕ' : 'КЭФЫ СКАНЕРА';
   document.getElementById('hm-title').textContent = frozen ? 'СОХРАНЁННЫЕ СТАВКИ' : 'СКОЛЬКО СТАВИТЬ';
   document.getElementById('hm-rate').textContent = frozen ? 'СУММЫ ЗАМОРОЖЕНЫ · USDT' : 'суммы в USDT';
 
@@ -1296,6 +1644,8 @@ function renderHowMuch(a) {
   const pmInput = document.getElementById('hm-pm-stake');
   bbInput.readOnly = frozen;
   pmInput.readOnly = frozen;
+  syncNumberStepperState(bbInput);
+  syncNumberStepperState(pmInput);
   if (frozen) {
     bbInput.value = Number(bbSt).toFixed(2);
     pmInput.value = Number(pmSt).toFixed(2);
@@ -1310,54 +1660,64 @@ function renderHowMuch(a) {
     document.getElementById('hm-pm-stake').value = Number(plan.polymarketUsdt).toFixed(2);
   }
   // лучшее ask из стакана, а не среднее по $50
-  const cachedBook = !frozen && pmBookCache[state.activeSlug]?.outcome === pmLeg.outcome
-    ? pmBookCache[state.activeSlug] : null;
-  const pmBestAsk = Number(pmLeg.pm_best_ask || a.pm_best_ask || cachedBook?.best_ask || 0);
+  const candidateCache = pmBookCache[state.activeSlug];
+  const cachedBook = !frozen && candidateCache?.outcome === pmLeg.outcome
+    && String(candidateCache?.token_id) === String(pmLeg.token) ? candidateCache : null;
+  const liveBook = !frozen ? livePmBookFor(a, pmLeg) : null;
+  const pmBestAsk = Number(liveBook?.asks?.[0]?.price || pmLeg.pm_best_ask || a.pm_best_ask || cachedBook?.best_ask || 0);
   const pmPriceLabel = document.getElementById('hm-pm-price-label');
   if (pmPriceLabel) pmPriceLabel.textContent = frozen ? 'ASK В СНИМКЕ' : 'ЦЕНА ДОЛИ · ASK';
   const pmPriceText = pmBestAsk > 0 && pmBestAsk < 1 ? (pmBestAsk * 100).toFixed(1) + '¢' : '—';
   setLiveQuoteValue(document.getElementById('hm-pm-price'), pmPriceText, quoteScope);
-  const avg = cachedBook?.avg_for_size;
   const enteredUsd = Number(document.getElementById('hm-pm-stake').value);
+  const depthQuote = !frozen ? pmQuoteForEnteredAmount(a, pmLeg, enteredUsd) : null;
   if (frozen) {
-    const capturedAvg = Number(pmLeg.pm_avg_ask || 0);
+    const capturedAvg = Number(pmLeg.pm_refined_avg_ask || pmLeg.pm_avg_ask || 0);
     document.getElementById('hm-avg-label').textContent = 'Средняя при фиксации';
     document.getElementById('hm-avg').textContent = capturedAvg > 0
       ? (capturedAvg * 100).toFixed(1) + '¢ · сохранённое значение' : '—';
   } else {
     document.getElementById('hm-avg-label').textContent = 'Средняя по стакану';
-    document.getElementById('hm-avg').textContent = avg && avg.avg_price && Math.abs(cachedBook.requested_usd - enteredUsd) < 0.005
-      ? (avg.avg_price * 100).toFixed(1) + '¢ · ' + cachedBook.requested_usd.toFixed(2) + ' USDT' + (avg.full ? '' : ' · неполный объём') : '—';
+    document.getElementById('hm-avg').textContent = depthQuote && Number(depthQuote.avg_price) > 0
+      ? (Number(depthQuote.avg_price) * 100).toFixed(1) + '¢ · ' + enteredUsd.toFixed(2) + ' USDT' + (depthQuote.full ? '' : ' · неполный объём') : '—';
   }
   const sharesPrice = Number(pmLeg.pm_avg_ask || pmLeg.pm_best_ask || a.pm_best_ask || 0);
-  const capturedShares = Number(pmLeg.pm_target_shares || 0);
-  const shares = frozen && capturedShares > 0
-    ? capturedShares : (sharesPrice > 0 ? pmSt / sharesPrice : 0);
+  const capturedShares = Number(pmLeg.pm_refined_shares || pmLeg.pm_target_shares || 0);
+  const shares = frozen ? (capturedShares > 0 ? capturedShares : (sharesPrice > 0 ? pmSt / sharesPrice : 0))
+    : (depthQuote?.full ? Number(depthQuote.shares) : 0);
   document.getElementById('hm-shares-label').textContent = frozen ? 'Доли в снимке' : 'Оценка долей PM';
   document.getElementById('hm-shares').textContent = shares > 0
     ? `${shares.toLocaleString('ru-RU', { maximumFractionDigits: 4 })} долей` : '—';
-  setLiveQuoteValue(document.getElementById('hm-eff'), pmLeg.o ? fmtOdds(pmLeg.o) : '—', quoteScope);
+  const pmSlippage = Number(pmLeg.s ?? 0);
+  const baseOdds = frozen ? Number(pmLeg.o) : (depthQuote?.full ? Number(depthQuote.odds_eff) : 0);
+  const effectiveOdds = Number.isFinite(pmSlippage) && pmSlippage >= 0 && pmSlippage < 1
+    ? baseOdds * (1 - pmSlippage) : 0;
+  setLiveQuoteValue(document.getElementById('hm-eff'), effectiveOdds > 0 ? fmtOdds(effectiveOdds) : '—', quoteScope);
+  const fee = frozen && pmLeg.pm_fee_estimated_usd != null
+    ? Number(pmLeg.pm_fee_estimated_usd) : (!frozen && depthQuote?.full ? Number(depthQuote.fee) : NaN);
+  const feeEl = document.getElementById('hm-fee');
+  if (feeEl) feeEl.textContent = Number.isFinite(fee) && fee >= 0 ? fmtMoney(fee) : '—';
+  const depth = Number(depthQuote?.available_cash_usd);
+  if (!frozen) {
+    const hasDepth = Number.isFinite(depth) && depth > 0;
+    document.getElementById('kpi-depth-label').textContent = hasDepth && depthQuote.truncated ? 'МИН. ГЛУБИНА PM' : 'ДОСТУПНО В PM';
+    document.getElementById('kpi-depth').textContent = hasDepth
+      ? (depthQuote.truncated ? '≥ ' : '') + fmtMoney(depth) : '—';
+  }
 
   recalcHowMuch();
 
   const actionHint = document.getElementById('action-hint');
   if (actionHint) actionHint.textContent = frozen
     ? 'Это сохранённый неактивный снимок, не текущие котировки. Ссылки открывают площадки вручную; перед любыми действиями сверьте исходы и цены. Автоматических ставок нет.'
-    : 'Оценка по снимку; после изменения суммы требуется перепроверить обе стороны и глубину стакана. Сделка записывается вручную.';
+    : `${depthQuote?.source === 'live' ? 'Оценка по LIVE-кэшу сканера.' : depthQuote?.source === 'rest' ? 'Оценка по резервному REST-стакану.' : 'Ожидание свежего расчёта PM.'} ` +
+      'Это не гарантия исполнения: перед действиями сверьте обе стороны, комиссию и объём. Сделка записывается вручную.';
 
   const buyBtn = document.getElementById('btn-buy-pm');
   buyBtn.textContent = `ОТКРЫТЬ POLYMARKET · ${parseFloat(document.getElementById('hm-pm-stake').value || 0).toFixed(2)} USDT ↗`;
   const filledBtn = document.getElementById('btn-filled');
   filledBtn.disabled = frozen;
   filledBtn.title = frozen ? 'Неактивный снимок не является фактической сделкой' : 'Записать исполненную вручную сделку';
-  const bkBtn = document.getElementById('btn-open-bb');
-  const oneWinUrlReady = bbLeg.source === '1win'
-    && Boolean(activeOpportunityEventUrl(a, '1win') || bbLeg.event_url || a.bk_event_url);
-  const betBoomUrlReady = bbLeg.source === 'BetBoom' && Boolean(a.bb_match_id && a.bb_tournament_id);
-  bkBtn.disabled = !(oneWinUrlReady || betBoomUrlReady);
-  bkBtn.textContent = oneWinUrlReady ? 'ОТКРЫТЬ СОБЫТИЕ 1WIN ↗'
-    : betBoomUrlReady ? 'ОТКРЫТЬ СОБЫТИЕ BETBOOM ↗' : 'ОТКРЫТЬ СОБЫТИЕ БК ↗';
-  bkBtn.title = bkBtn.disabled ? 'Ссылка на страницу события ещё не найдена' : 'Открыть страницу события без автоматической ставки';
   document.getElementById('hm-bb-name').textContent = bbLeg.source || 'Букмекер';
 }
 
@@ -1369,27 +1729,61 @@ function recalcHowMuch() {
 
   const pmLeg = (a.bets || []).find(l => l.source === 'Polymarket') || {};
   const bbLeg = (a.bets || []).find(l => l.source && l.source !== 'Polymarket') || {};
-  const pmO = pmLeg.o || 0, bbO = bbLeg.o || 0;
+  const bbO = Number(bbLeg.o), commission = Number(bbLeg.c ?? 0), slippage = Number(bbLeg.s ?? 0);
+  const pmSlippage = Number(pmLeg.s ?? 0);
+  const validAmounts = Number.isFinite(pmStakeUsdt) && pmStakeUsdt > 0
+    && Number.isFinite(bbStake) && bbStake > 0;
+  const bank = validAmounts ? pmStakeUsdt + bbStake : 0;
+  const freshBookmaker = frozen || bookmakerQuoteIsFresh(a, bbLeg);
+  const quote = frozen
+    ? {full: true, shares: pmStakeUsdt * Number(pmLeg.o), total_cost: pmStakeUsdt}
+    : pmQuoteForEnteredAmount(a, pmLeg, pmStakeUsdt);
+  const position = validAmounts && freshBookmaker && window.PolyArbPmDepthQuote
+    ? window.PolyArbPmDepthQuote.position(quote, pmStakeUsdt, bbStake, bbO, commission, slippage, pmSlippage) : null;
+  const pmWinEl = document.getElementById('hm-pm-win');
+  const bookmakerWinEl = document.getElementById('hm-bb-win');
+  const validPm = quote?.full === true && Number.isFinite(Number(quote.shares)) && Number(quote.shares) > 0
+    && Number.isFinite(Number(quote.total_cost))
+    && Math.abs(Number(quote.total_cost) - pmStakeUsdt) <= Math.max(0.000002, pmStakeUsdt * 1e-10);
+  if (pmWinEl) pmWinEl.textContent = validPm && Number.isFinite(pmSlippage) && pmSlippage >= 0 && pmSlippage < 1
+    ? fmtMoney(Number(quote.shares) * (1 - pmSlippage)) : '—';
+  const adjustedBkOdds = bbO * (1 - slippage);
+  const validBk = freshBookmaker && Number.isFinite(bbStake) && bbStake > 0 && Number.isFinite(adjustedBkOdds)
+    && adjustedBkOdds > 1 && Number.isFinite(commission) && commission >= 0 && commission < 1
+    && Number.isFinite(slippage) && slippage >= 0 && slippage < 1;
+  const bookmakerPayout = validBk ? bbStake * (1 + (adjustedBkOdds - 1) * (1 - commission)) : NaN;
+  if (bookmakerWinEl) bookmakerWinEl.textContent = Number.isFinite(bookmakerPayout)
+    ? fmtMoney(bookmakerPayout) : '—';
 
-  const pay1 = pmStakeUsdt * pmO;
-  const pay2 = bbStake * bbO;
-  const bank = pmStakeUsdt + bbStake;
-  const minPay = Math.min(pay1, pay2);
-  const profit = minPay - bank;
-
-  document.getElementById('hm-total').textContent = fmtMoney(bank);
-  document.getElementById('hm-payout').textContent = fmtMoney(minPay);
+  document.getElementById('hm-total').textContent = validAmounts ? fmtMoney(bank) : '—';
+  document.getElementById('hm-payout').textContent = position
+    ? fmtMoney(Math.min(position.pm_payout, position.bookmaker_payout)) : '—';
   const profitEl = document.getElementById('hm-profit');
-  profitEl.textContent = (profit >= 0 ? '+' : '') + fmtMoney(profit);
-  profitEl.style.color = profit >= 0 ? 'var(--green)' : 'var(--red)';
+  profitEl.textContent = position ? (position.minimum_profit >= 0 ? '+' : '') + fmtMoney(position.minimum_profit) : '—';
+  profitEl.style.color = position ? (position.minimum_profit >= 0 ? 'var(--green)' : 'var(--red)') : 'var(--dim)';
+  const roiEl = document.getElementById('hm-roi');
+  if (roiEl) {
+    roiEl.textContent = position ? fmtPct(position.minimum_roi) : '—';
+    roiEl.style.color = position ? (position.minimum_roi >= 0 ? 'var(--green)' : 'var(--red)') : 'var(--dim)';
+  }
   if (frozen) {
     document.getElementById('hm-risk-note').textContent = 'Суммы ставок и котировки заморожены из снимка; изменение общего банка на сохранённые значения не влияет.';
   } else {
     updatePlanRiskNote(bank);
+    let issue = '';
+    if (!validAmounts) issue = 'Введите положительные суммы на обе стороны.';
+    else if (!freshBookmaker) issue = 'Котировка БК устарела или не подтверждена; общий расчёт скрыт.';
+    else if (pmStakeUsdt < 1 || pmStakeUsdt > 100000) issue = 'Для расчёта PM укажите сумму от 1 до 100 000 USDT.';
+    else if (!quote) issue = 'Ожидание свежего стакана и комиссии для введённой суммы.';
+    else if (!quote.full) issue = quote.truncated
+      ? 'Переданной части стакана недостаточно; ожидается REST или уменьшите сумму.'
+      : 'Недостаточная глубина PM для введённой суммы.';
+    else if (!position) issue = 'Не удалось подтвердить расчёт сумм и коэффициентов.';
+    if (issue) document.getElementById('hm-risk-note').textContent += ` ${issue}`;
   }
 
   document.getElementById('btn-buy-pm').textContent =
-    `ОТКРЫТЬ POLYMARKET · ${pmStakeUsdt.toFixed(2)} USDT ↗`;
+    `ОТКРЫТЬ POLYMARKET · ${(Number.isFinite(pmStakeUsdt) ? pmStakeUsdt : 0).toFixed(2)} USDT ↗`;
 
   if (!state.calcEdited) syncCalcFromDetail(pmLeg, bbLeg, pmStakeUsdt, bbStake);
 }
@@ -1576,7 +1970,7 @@ function openBkModal() {
     return `<button class="bk-item ${on ? 'on' : ''} ${disabled ? 'disabled' : ''}"
       type="button" aria-pressed="${on}" ${disabled ? 'disabled' : ''}
       onclick="toggleBk('${bookmaker.id}')">
-      <span class="mark">✓</span>
+      <span class="mark" aria-hidden="true"></span>
       <span class="name">${escapeHtml(bookmaker.name)}</span>
       <span class="speed">${disabled ? 'недоступен' : on ? 'включён' : 'выключен'}</span>
     </button>`;
@@ -1714,10 +2108,16 @@ async function saveMinRoi() {
 }
 
 /* ============= EDIT MODAL ============= */
-function openEdit(slug) {
+function openEdit(slug, initialStakes = null) {
   const a = state.arbs.find(x => x.slug === slug) || getActive();
   if (!a) return;
   state.editing = JSON.parse(JSON.stringify(a));
+  if (initialStakes) {
+    state.editing.stakes = (state.editing.bets || []).map(leg => {
+      const value = Number(leg.source === 'Polymarket' ? initialStakes.pm : initialStakes.bookmaker);
+      return Number.isFinite(value) && value > 0 ? value : 0;
+    });
+  }
   renderEditor();
   document.getElementById('modal-edit').classList.remove('hidden');
   document.getElementById('pm-check-panel').classList.add('hidden');
@@ -1883,8 +2283,22 @@ async function checkPM() {
 }
 function refreshPMNow() { checkPM(); }
 
-function openBookmakerEvent() {
-  const a = getActive(); if (!a) return;
+function setEventActionLink(element, url, unavailableReason) {
+  if (!element) return;
+  if (url) {
+    element.setAttribute('href', url);
+    element.setAttribute('aria-disabled', 'false');
+    element.removeAttribute('tabindex');
+    element.title = 'Открыть страницу события без автоматической ставки';
+  } else {
+    element.removeAttribute('href');
+    element.setAttribute('aria-disabled', 'true');
+    element.setAttribute('tabindex', '-1');
+    element.title = unavailableReason || 'Ссылка на событие недоступна';
+  }
+}
+
+function bookmakerEventUrl(a) {
   const bkLeg = (a.bets || []).find(leg => leg.source && leg.source !== 'Polymarket');
   const oneWinEventUrl = activeOpportunityEventUrl(a, '1win')
     || bkLeg?.event_url || a.bk_event_url;
@@ -1893,28 +2307,16 @@ function openBookmakerEvent() {
       const eventUrl = new URL(oneWinEventUrl, window.location.origin);
       const allowedOrigin = window.POLYARB_ONEWIN_ORIGIN;
       if (eventUrl.protocol !== 'https:' || eventUrl.username || eventUrl.password
-          || !allowedOrigin || eventUrl.origin !== allowedOrigin) {
-        throw new Error('Недоверенный адрес события 1win');
-      }
-      window.open(eventUrl.href, '_blank', 'noopener,noreferrer');
-    } catch (e) {
-      toast('Не удалось открыть страницу события 1win', true);
-    }
-    return;
+          || !allowedOrigin || eventUrl.origin !== allowedOrigin) return null;
+      return eventUrl.href;
+    } catch (_error) { return null; }
   }
-  if (bkLeg?.source !== 'BetBoom') {
-    toast('Ссылка на страницу события ещё не найдена', true);
-    return;
-  }
-  const mid = a.bb_match_id, tour = a.bb_tournament_id;
-  if (!(tour && mid)) {
-    toast('Точная ссылка на событие BetBoom не найдена', true);
-    return;
-  }
+  if (bkLeg?.source !== 'BetBoom') return null;
+  const mid = String(a.bb_match_id || ''), tour = String(a.bb_tournament_id || '');
+  if (!/^[a-zA-Z0-9_-]+$/.test(mid) || !/^[a-zA-Z0-9_-]+$/.test(tour)) return null;
   const sportMap = { 'CS2': 'cs2', 'DOTA2': 'dota-2', 'LOL': 'lol', 'VALORANT': 'valorant', 'TENNIS': 'tennis' };
   const sp = sportMap[a.sport] || 'esport';
-  const url = 'https://betboom.ru/esport/' + sp + '/' + tour + '/' + mid;
-  window.open(url, '_blank', 'noopener,noreferrer');
+  return 'https://betboom.ru/esport/' + sp + '/' + tour + '/' + mid;
 }
 function polymarketUrlUsesMarketSlug(value, marketSlug) {
   try {
@@ -1926,32 +2328,89 @@ function polymarketUrlUsesMarketSlug(value, marketSlug) {
   }
 }
 
-async function openPMUrl() {
-  const a = getActive(); if (!a) return;
+function updateEventActionLinks(a) {
+  const bkLeg = (a.bets || []).find(leg => leg.source && leg.source !== 'Polymarket');
+  const bkElement = document.getElementById('btn-open-bb');
+  const sourceLabel = bkLeg?.source === '1win' ? '1WIN' : bkLeg?.source === 'BetBoom' ? 'BETBOOM' : 'БК';
+  if (bkElement) bkElement.textContent = `ОТКРЫТЬ СОБЫТИЕ ${sourceLabel} ↗`;
+  const bkUrl = bookmakerEventUrl(a);
+  setEventActionLink(bkElement, bkUrl, 'Ссылка на страницу события БК не найдена или недопустима');
+
+  const pmElement = document.getElementById('btn-buy-pm');
+  const status = document.getElementById('event-link-status');
   const pmLeg = (a.bets || []).find(leg => leg.source === 'Polymarket');
-  const openPolymarketEvent = (value) => {
-    const safeUrl = window.PolyArbProviderLinks?.polymarketEventUrl(
-      value, window.location.origin,
-    );
-    if (!safeUrl) throw new Error('Небезопасная ссылка на Polymarket');
-    window.open(safeUrl, '_blank', 'noopener,noreferrer');
-  };
   const pmEventUrl = activeOpportunityEventUrl(a, 'Polymarket')
     || pmLeg?.event_url || a.pm_event_url;
-  if (pmEventUrl && !polymarketUrlUsesMarketSlug(pmEventUrl, a.slug)) {
-    try {
-      openPolymarketEvent(pmEventUrl);
-    } catch (e) {
-      toast('Не удалось открыть страницу события Polymarket', true);
-    }
+  const validate = value => window.PolyArbProviderLinks?.polymarketEventUrl(value, window.location.origin) || null;
+  const safeDirectUrl = pmEventUrl ? validate(pmEventUrl) : null;
+  if (pmEventUrl && !safeDirectUrl) {
+    setEventActionLink(pmElement, null, 'Недопустимая ссылка Polymarket');
+    if (status) status.textContent = 'Ссылка Polymarket недоступна или небезопасна.';
     return;
   }
-  try {
-    const r = await fetch('/api/pm_url/' + encodeURIComponent(a.slug));
-    const j = await r.json();
-    if (j.url) openPolymarketEvent(j.url);
-    else toast('Ссылка на событие Polymarket не найдена в Gamma', true);
-  } catch (e) { toast('Не удалось открыть страницу события Polymarket', true); }
+  if (safeDirectUrl && !polymarketUrlUsesMarketSlug(safeDirectUrl, a.slug)) {
+    setEventActionLink(pmElement, safeDirectUrl);
+    if (status) status.textContent = '';
+    return;
+  }
+  const slug = String(a.slug || '');
+  if (!slug || slug.length > 300 || !window.PolyArbProviderLinks?.polymarketEventUrl) {
+    setEventActionLink(pmElement, null, 'Ссылка Polymarket недоступна');
+    if (status) status.textContent = 'Ссылка Polymarket недоступна.';
+    return;
+  }
+
+  let cached = pmEventLinkCache.get(slug);
+  const now = Date.now();
+  // Успех держим 5 минут; ошибки повторяем не чаще одного раза в 30 секунд.
+  if (cached && cached.status !== 'pending' && now >= cached.expiresAt) {
+    pmEventLinkCache.delete(slug);
+    cached = null;
+  }
+  if (cached?.status === 'ready') {
+    setEventActionLink(pmElement, cached.url);
+    if (status) status.textContent = '';
+    return;
+  }
+  if (cached?.status === 'failed') {
+    setEventActionLink(pmElement, null, 'Ссылка Polymarket не найдена; будет повторная попытка');
+    if (status) status.textContent = 'Ссылка Polymarket не найдена; повторим попытку автоматически.';
+    return;
+  }
+  setEventActionLink(pmElement, null, 'Определяется ссылка Polymarket');
+  if (status) status.textContent = 'Определяем ссылку Polymarket…';
+  if (cached?.status === 'pending') return;
+
+  // Сетевое разрешение запускается только для выбранного рынка и не блокирует UI.
+  // Одна заявка на slug, в том числе при частых обновлениях live и снимков.
+  if (pmEventLinkCache.size >= 200) {
+    for (const [key, entry] of pmEventLinkCache) {
+      if (entry.status !== 'pending') { pmEventLinkCache.delete(key); break; }
+    }
+  }
+  const pending = { status: 'pending' };
+  pmEventLinkCache.set(slug, pending);
+  const controller = typeof AbortController === 'function' ? new AbortController() : null;
+  const timeout = controller ? setTimeout(() => controller.abort(), 12000) : null;
+  Promise.resolve().then(() => fetch('/api/pm_url/' + encodeURIComponent(slug),
+    controller ? { signal: controller.signal } : {}))
+    .then(response => {
+      if (!response.ok) throw new Error('Не удалось определить ссылку');
+      return response.json();
+    })
+    .then(data => validate(data?.url))
+    .catch(() => null)
+    .then(url => {
+      if (timeout !== null) clearTimeout(timeout);
+      if (pmEventLinkCache.get(slug) !== pending) return;
+      pmEventLinkCache.set(slug, url
+        ? { status: 'ready', url, expiresAt: Date.now() + 300000 }
+        : { status: 'failed', expiresAt: Date.now() + 30000 });
+      // Никогда не применять результат к старой карточке: заново читаем
+      // текущий live-сигнал или закреплённый снимок и его актуальные URL.
+      const current = getActive();
+      if (current && String(current.slug || '') === slug) updateEventActionLinks(current);
+    });
 }
 function markFilled() {
   const a = getActive();
@@ -1960,7 +2419,10 @@ function markFilled() {
     toast('Неактивный снимок нельзя записать как исполненную сделку', true);
     return;
   }
-  openEdit(a.slug);
+  openEdit(a.slug, {
+    pm: document.getElementById('hm-pm-stake').value,
+    bookmaker: document.getElementById('hm-bb-stake').value,
+  });
 }
 
 async function showTrades() {
@@ -2087,7 +2549,61 @@ async function shutdownBot() {
   } catch (e) { toast('\u0421\u0435\u0442\u044C: ' + e.message, true); }
 }
 
+function syncNumberStepperState(input) {
+  const wrapper = input && input.closest('.number-control');
+  if (!wrapper) return;
+  wrapper.querySelectorAll('.number-step-button').forEach(button => {
+    button.disabled = Boolean(input.disabled || input.readOnly);
+  });
+}
+
+function enhanceNumberSteppers(root = document) {
+  const inputs = root.matches && root.matches('input[type="number"]')
+    ? [root] : Array.from(root.querySelectorAll('input[type="number"]'));
+  inputs.forEach(input => {
+    if (input.dataset.numberStepperReady || input.disabled || input.readOnly || !input.parentNode) return;
+    input.dataset.numberStepperReady = 'true';
+    const wrapper = document.createElement('span');
+    wrapper.className = 'number-control';
+    input.parentNode.insertBefore(wrapper, input);
+    wrapper.appendChild(input);
+
+    const buttons = document.createElement('span');
+    buttons.className = 'number-control-buttons';
+    const label = input.getAttribute('aria-label') || input.id.replace(/-/g, ' ') || 'значение';
+    const addStepButton = (direction, name, path) => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = `number-step-button ${name}`;
+      button.setAttribute('aria-label', `${direction > 0 ? 'Увеличить' : 'Уменьшить'} ${label}`);
+      button.innerHTML = `<svg viewBox="0 0 12 12" aria-hidden="true"><path d="${path}"/></svg>`;
+      button.addEventListener('click', event => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (input.disabled || input.readOnly) return;
+        const previous = input.value;
+        try {
+          if (direction > 0) input.stepUp();
+          else input.stepDown();
+        } catch (error) {
+          return;
+        }
+        if (input.value !== previous) {
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+          input.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+      });
+      buttons.appendChild(button);
+    };
+    addStepButton(1, 'up', 'm3 7.5 3-3 3 3');
+    addStepButton(-1, 'down', 'm3 4.5 3 3 3-3');
+    wrapper.appendChild(buttons);
+    syncNumberStepperState(input);
+  });
+}
+
 function init() {
+  enhanceNumberSteppers();
   document.querySelectorAll('.tab').forEach(t => {
     t.addEventListener('click', () => {
       document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
@@ -2097,7 +2613,7 @@ function init() {
     });
   });
 
-  ['f-cs2','f-dota2','f-lol','f-tennis'].forEach(id => {
+  ['f-cs2','f-dota2','f-lol','f-valorant','f-tennis'].forEach(id => {
     const el = document.getElementById(id);
     if (el) el.addEventListener('change', applyFilters);
   });
@@ -2146,6 +2662,9 @@ function init() {
   const soundBtn = document.getElementById('st-sound');
   if (soundBtn) soundBtn.addEventListener('click', toggleSound);
   updateSoundBtn();
+  const desktopNotifyBtn = document.getElementById('btn-desktop-notify');
+  if (desktopNotifyBtn) desktopNotifyBtn.addEventListener('click', toggleDesktopNotifications);
+  updateDesktopNotificationsBtn();
 
   const cfgBtn = document.getElementById('btn-config');
   if (cfgBtn) cfgBtn.addEventListener('click', openConfig);
@@ -2157,6 +2676,8 @@ function init() {
   const detClose = document.getElementById('btn-det-close');
   if (detClose) detClose.addEventListener('click', closeDetail);
 
+  observePriceChartResize();
+
   const hmBB = document.getElementById('hm-bb-stake');
   if (hmBB) hmBB.addEventListener('input', () => { state.detailEdited = true; state.suggestedCapped = false; recalcHowMuch(); });
   const hmPM = document.getElementById('hm-pm-stake');
@@ -2164,16 +2685,15 @@ function init() {
     state.detailEdited = true;
     state.suggestedCapped = false;
     state.bookRequestId = (state.bookRequestId || 0) + 1;
-    document.getElementById('hm-avg').textContent = '—';
-    recalcHowMuch();
+    const active = getActive();
+    if (active) {
+      renderHowMuch(active);
+      renderLivePmBook(active);
+    }
     clearTimeout(state.bookRefreshTimer);
     state.bookRefreshTimer = setTimeout(() => { if (state.activeSlug) loadPmBook(state.activeSlug); }, 600);
   });
 
-  const openBB = document.getElementById('btn-open-bb');
-  if (openBB) openBB.addEventListener('click', openBookmakerEvent);
-  const buyPM = document.getElementById('btn-buy-pm');
-  if (buyPM) buyPM.addEventListener('click', openPMUrl);
   const filled = document.getElementById('btn-filled');
   if (filled) filled.addEventListener('click', markFilled);
 
@@ -2218,6 +2738,7 @@ function init() {
   setInterval(() => {
     renderArbs();
     if (state.activeSnapshotId) refreshDetail();
+    else if (state.activeSlug) refreshDetail({loadRemote: false});
   }, 1000);
 
   loadDaily();

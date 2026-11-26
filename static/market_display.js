@@ -32,7 +32,7 @@
       : 0;
     const amount = Number(stake);
     const quoteAge = isPolymarket
-      ? (leg.pm_book_age_sec ?? leg.pm_age ?? null)
+      ? (leg.pm_book_age_sec ?? (leg.pm_book_age_source === 'local_receipt' ? null : leg.pm_age) ?? null)
       : (leg.odds_age_sec ?? null);
     return {
       source,
@@ -114,7 +114,8 @@
         pm_best_ask: isPm ? (legacyLeg.pm_best_ask ?? leg.price) : undefined,
         pm_avg_ask: isPm ? leg.price : undefined,
         pm_book_age_sec: isPm ? quoteAgeSec : undefined,
-        pm_age: isPm ? quoteAgeSec : undefined,
+        pm_book_age_source: isPm ? legacyLeg.pm_book_age_source : undefined,
+        pm_age: isPm ? (legacyLeg.pm_age ?? quoteAgeSec) : undefined,
         pm_fee_enabled: isPm && pmFeeSchedule ? pmFeeSchedule.enabled : undefined,
         pm_fee_rate: isPm && pmFeeSchedule ? pmFeeSchedule.rate : undefined,
         pm_fee_exponent: isPm && pmFeeSchedule ? pmFeeSchedule.exponent : undefined,

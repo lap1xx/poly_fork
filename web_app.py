@@ -29,6 +29,8 @@ from arb_invariants import is_pm_bookmaker_pair
 from opportunity import normalize_scanner_snapshot
 from pm_event_links import polymarket_event_url_for_market
 from pm_fees import fetch_fee_schedule, fee_per_share
+from pm_depth_quote import quote_pm_asks
+from scanner_publisher import SCANNER_WS_MAX_BYTES
 from runtime_settings import (
     DEFAULT_RUNTIME_SETTINGS,
     RUNTIME_LIMIT_DEFAULTS,
@@ -73,7 +75,6 @@ _scanner_state = None
 _scanner_session_id = None
 _scanner_seq = -1
 _broadcast_wakeup = None
-SCANNER_WS_MAX_BYTES = 8 * 1024 * 1024
 SCANNER_STATE_STALE_SECONDS = 3.0
 
 
@@ -252,13 +253,25 @@ def _save_hidden():
 
 def _load_first_seen():
     raw = _load_json(FIRST_SEEN_FILE, {})
-    if isinstance(raw, dict):
-        with _first_seen_lock:
-            for k, v in raw.items():
-                try:
-                    _first_seen[k] = float(v)
-                except Exception:
-                    continue
+    if not isinstance(raw, dict):
+        return
+    now = time.time()
+    loaded = {}
+    for key, value in raw.items():
+        if not isinstance(key, str) or not key:
+            continue
+        try:
+            timestamp = float(value)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        # Persisted age cannot prove continuity across a long outage.
+        if (not math.isfinite(timestamp) or timestamp <= 0 or timestamp > now
+                or now - timestamp > FIRST_SEEN_TTL):
+            continue
+        loaded[key] = timestamp
+    with _first_seen_lock:
+        _first_seen.clear()
+        _first_seen.update(loaded)
 
 def _save_first_seen():
     with _first_seen_lock:
@@ -1106,33 +1119,9 @@ async def api_pm_url(slug: str):
 
 def _walk_pm_asks_with_fee(asks, cash_budget, schedule):
     """Estimate shares purchasable for a cash budget using a market fee curve."""
-    remaining = float(cash_budget)
-    gross_cost = fee_total = shares = 0.0
-    for price, available in asks:
-        fee_ps = fee_per_share(price, schedule["rate"], schedule["exponent"])
-        if fee_ps is None:
-            return None
-        cash_per_share = price + fee_ps
-        take = min(available, remaining / cash_per_share)
-        if take <= 0:
-            continue
-        shares += take
-        gross_cost += take * price
-        fee_total += take * fee_ps
-        remaining -= take * cash_per_share
-        if remaining <= max(1e-8, cash_budget * 1e-10):
-            break
-    if shares <= 0:
+    if not isinstance(schedule, dict):
         return None
-    total_cost = gross_cost + fee_total
-    return {
-        "avg_price": gross_cost / shares,
-        "shares": shares,
-        "fee": fee_total,
-        "total_cost": total_cost,
-        "odds_eff": shares / total_cost,
-        "full": remaining <= max(1e-8, cash_budget * 1e-10),
-    }
+    return quote_pm_asks(asks, cash_budget, schedule.get("rate"), schedule.get("exponent"))
 
 
 @app.get("/api/pm_book/{slug}")
@@ -1176,7 +1165,7 @@ async def api_pm_book(slug: str, size_usd: float = 50.0, force: int = 0):
         outcome = outcomes[i] if i < len(outcomes) else f"out{i}"
         if isinstance(b, Exception):
             books.append({
-                "outcome": outcome, "best_bid": None, "best_ask": None,
+                "outcome": outcome, "token_id": str(tid), "best_bid": None, "best_ask": None,
                 "ask_depth_usd": 0, "bids": [], "asks": [],
                 "sizes": [], "avg_for_size": None, "err": str(b),
             })
@@ -1224,6 +1213,7 @@ async def api_pm_book(slug: str, size_usd: float = 50.0, force: int = 0):
 
         books.append({
             "outcome": outcome,
+            "token_id": str(tid),
             "best_bid": best_bid,
             "best_ask": best_ask,
             "ask_depth_usd": round(ask_depth_usd, 2),
@@ -1235,6 +1225,8 @@ async def api_pm_book(slug: str, size_usd: float = 50.0, force: int = 0):
                  "odds_eff": round(quote["odds_eff"], 4),
                  "fee_estimate": round(quote["fee"], 6),
                  "shares": round(quote["shares"], 6),
+                 "total_cost": round(quote["total_cost"], 6),
+                 "unfilled_usd": round(quote["unfilled_usd"], 6),
                  "full": quote["full"]}
                 if quote else None
             ),

@@ -1,4 +1,5 @@
 import json
+import subprocess
 import sys
 import threading
 import unittest
@@ -255,6 +256,11 @@ class PMCatalogRefreshTests(unittest.TestCase):
         self.assertEqual(diagnostic["failed_queries"], 0)
         self.assertEqual(diagnostic["total_pages"], 14)
         self.assertEqual(diagnostic["cursor_exhausted_queries"], 14)
+        self.assertEqual(len(diagnostic["queries"]), 14)
+        self.assertTrue(all(
+            isinstance(query.get("elapsed_ms"), (int, float)) and query["elapsed_ms"] >= 0
+            for query in diagnostic["queries"]
+        ))
 
     def test_fetch_marks_any_failed_query_as_partial(self):
         def fake_tag(tag, _query_limit):
@@ -328,6 +334,7 @@ class PMCatalogRefreshTests(unittest.TestCase):
         self.assertTrue(result["cursor_exhausted"])
         self.assertIsNone(result["error"])
         self.assertEqual(result["pages"], 2)
+        self.assertGreaterEqual(result["elapsed_ms"], 0)
         self.assertEqual([event["id"] for event in result["events"]], ["e1", "e2"])
         self.assertEqual(
             get.call_args_list[0].kwargs["params"]["limit"],
@@ -1216,10 +1223,17 @@ class CalculationTests(unittest.TestCase):
         self.assertFalse(feed.update_tokens(["c", "b", "a"]))
 
     def test_onewin_is_not_imported_or_enabled_by_default(self):
-        from bk_router import BKRouter
-        router = BKRouter(use_bb=False)
-        self.assertFalse(router.use_onewin)
-        self.assertNotIn("onewin_bridge", sys.modules)
+        # Other test modules can import the adapter during pytest collection.
+        # Check lazy loading in a clean interpreter rather than relying on order.
+        code = (
+            "import sys; from bk_router import BKRouter; "
+            "router = BKRouter(use_bb=False); "
+            "assert not router.use_onewin; "
+            "assert 'onewin_bridge' not in sys.modules"
+        )
+        result = subprocess.run([sys.executable, "-B", "-c", code],
+                                capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 class HistoryAndStatsTests(unittest.TestCase):

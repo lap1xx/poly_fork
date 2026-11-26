@@ -164,7 +164,7 @@ class QualityGateBaselineTests(unittest.TestCase):
                 "matching_stats": {"pm_markets": 1},
             }), encoding="utf-8")
             result = capture(
-                status_path, output_path, duration_sec=0.04, interval_sec=0.005,
+                status_path, output_path, duration_sec=0.25, interval_sec=0.005,
                 project_dir=root,
             )
             records = load_jsonl(output_path)

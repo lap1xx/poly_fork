@@ -51,9 +51,9 @@ def _normalize_phase(value: Any) -> str:
 def _quote_age(bet: Mapping[str, Any], source_kind: str, arb: Mapping[str, Any]) -> float:
     if source_kind == "prediction_market":
         raw = bet.get("pm_book_age_sec")
-        if raw is None:
+        if raw is None and bet.get("pm_book_age_source") != "local_receipt":
             raw = bet.get("pm_age")
-        if raw is None:
+        if raw is None and bet.get("pm_book_age_source") != "local_receipt":
             raw = arb.get("pm_age")
     else:
         raw = bet.get("odds_age_sec", arb.get("bk_odds_age_sec"))

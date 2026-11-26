@@ -371,6 +371,12 @@ class OneWinFeedTests(unittest.TestCase):
         self.assertEqual(self.ow._name_score("Виртус.pro", "Virtus Pro"), 1.0)
         self.assertEqual(self.ow._name_score("NAVI Esports", "Navi"), 1.0)
 
+    def test_cyrillic_short_i_is_not_decomposed_to_latin_i(self):
+        self.assertEqual(self.ow._plain_name("Йодпетч"), "yodpetch")
+        self.assertGreaterEqual(
+            self.ow._name_score("Kamonwan Yodpetch", "Камонван Йодпетч"), 0.65
+        )
+
     def test_team_name_subset_is_not_accepted_as_a_match(self):
         self.assertEqual(
             self.ow._name_score("Team Spirit", "Team Spirit Academy"), 0.0

@@ -33,6 +33,7 @@
       <button class="header-action" id="btn-daily" type="button">Итоги дня</button>
       <button class="header-action tools-toggle" id="btn-tools-toggle" type="button" aria-expanded="false" aria-controls="col-calc" aria-label="Показать инструменты">ИНСТРУМЕНТЫ <span aria-hidden="true">⌗</span></button>
       <button class="icon-btn" id="st-sound" title="Звук" aria-label="Звук">🔊</button>
+      <button class="icon-btn" id="btn-desktop-notify" type="button" title="Уведомления выключены" aria-label="Уведомления выключены" aria-pressed="false"><svg aria-hidden="true" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8a6 6 0 0 0-12 0c0 7-2 7-2 9h16c0-2-2-2-2-9M10 20h4"/></svg></button>
       <button class="icon-btn" id="btn-config" title="Настройки" aria-label="Настройки">⚙</button>
       <button class="icon-btn danger" id="btn-shutdown" title="Закрыть веб-панель" aria-label="Закрыть веб-панель">⏻</button>
     </div>
@@ -52,6 +53,7 @@
         <label class="chk"><input type="checkbox" id="f-cs2" checked> CS2</label>
         <label class="chk"><input type="checkbox" id="f-dota2" checked> DOTA2</label>
         <label class="chk"><input type="checkbox" id="f-lol" checked> LOL</label>
+        <label class="chk"><input type="checkbox" id="f-valorant" checked> VALORANT</label>
         <label class="chk"><input type="checkbox" id="f-tennis" checked> TENNIS</label>
         <label class="chk minroi" title="Сохранённый порог ROI применяется запущенным сканером, если CLI override не задан">MIN ROI ≥ <input type="number" id="f-minroi" value="3" min="0" max="100" step="0.5" aria-label="Минимальный ROI сканера">%</label>
         <button class="bk-settings-btn" type="button" id="btn-bk-settings">БУКМЕКЕРЫ</button>
@@ -111,7 +113,6 @@
           <div class="market-identity-head"><span>СРАВНИВАЕМЫЙ РЫНОК</span><b id="market-label">—</b></div>
           <div class="market-identity-sides">
             <div class="market-identity-side bookmaker"><small id="market-bk-name">1win</small><b id="market-bk-outcome">—</b></div>
-            <span class="market-identity-vs">противоположные исходы</span>
             <div class="market-identity-side polymarket"><small>POLYMARKET</small><b id="market-pm-outcome">—</b></div>
           </div>
           <div class="market-identity-note">Одна нога Polymarket и одна нога выбранной БК · котировки только read-only · ставки размещаются вручную</div>
@@ -120,7 +121,7 @@
         <!-- 4 KPI -->
         <div class="kpi-row">
           <div class="kpi kpi-roi">
-            <div class="kpi-lbl">ВИЛКА</div>
+            <div class="kpi-lbl">ROI СКАНЕРА</div>
             <div class="kpi-val" id="kpi-roi">—</div>
           </div>
           <div class="kpi">
@@ -157,7 +158,7 @@
               <span class="panel-sub" id="pm-side-lbl">—</span>
             </div>
             <table class="pm-book" id="pm-book">
-              <thead>
+              <thead id="pm-book-head">
                 <tr><th>цена, ¢</th><th>кол-во</th><th>USDT</th></tr>
               </thead>
               <tbody id="pm-book-body">
@@ -173,6 +174,7 @@
               <span class="panel-sub" id="chart-delta">—</span>
             </div>
             <canvas class="price-chart" id="price-chart" width="480" height="220"></canvas>
+            <div class="price-chart-placeholder" id="chart-snapshot-placeholder" hidden>История цен для сохранённого снимка не загружается.</div>
             <div class="chart-foot" id="chart-foot">—</div>
           </div>
         </div>
@@ -189,11 +191,13 @@
               <div class="hm-leg-top"><span class="hm-bk" id="hm-bb-name">1win</span><span class="hm-odds"><small>КЭФ</small><b id="hm-bb-odds">—</b></span></div>
               <small class="hm-outcome" id="hm-bb-outcome">—</small>
               <label class="hm-stake" for="hm-bb-stake"><span>Сумма ставки</span><span class="hm-stake-input"><input type="number" step="0.01" id="hm-bb-stake" value="0" aria-label="Сумма ставки у букмекера, USDT"><span class="hm-cur">USDT</span></span></label>
+              <div class="hm-leg-return" title="Расчётная выплата включает поставленную сумму и зависит от показанного коэффициента."><span>Выплата при выигрыше</span><b id="hm-bb-win">—</b></div>
             </div>
             <div class="hm-leg pm">
               <div class="hm-leg-top"><span class="hm-bk">Polymarket</span><span class="hm-odds"><small id="hm-pm-price-label">ЦЕНА ДОЛИ · ASK</small><b id="hm-pm-price">—</b></span></div>
               <small class="hm-outcome" id="hm-pm-outcome">—</small>
               <label class="hm-stake" for="hm-pm-stake"><span>Сумма ставки</span><span class="hm-stake-input"><input type="number" step="0.01" id="hm-pm-stake" value="0" aria-label="Сумма ставки Polymarket, USDT"><span class="hm-cur">USDT</span></span></label>
+              <div class="hm-leg-return" title="Оценка по глубине, комиссии и резерву проскальзывания; не гарантия исполнения."><span>Выплата при выигрыше</span><b id="hm-pm-win">—</b></div>
             </div>
           </div>
 
@@ -201,17 +205,20 @@
             <div><span id="hm-avg-label">Средняя по стакану</span><b id="hm-avg">—</b></div>
             <div><span id="hm-shares-label">Доли Polymarket</span><b id="hm-shares">—</b></div>
             <div><span>Эфф. коэффициент PM</span><b id="hm-eff">—</b></div>
+            <div><span>Оценка комиссии PM</span><b id="hm-fee">—</b></div>
             <div class="hm-hl"><span>Всего в игре</span><b id="hm-total">—</b></div>
             <div class="hm-hl"><span>Расчётный мин. возврат</span><b id="hm-payout">—</b></div>
             <div class="hm-hl"><span>Профит</span><b id="hm-profit" class="green">—</b></div>
+            <div class="hm-hl"><span>ROI по введённым суммам</span><b id="hm-roi">—</b></div>
           </div>
           <div class="risk-note" id="hm-risk-note">Укажите общий банк, чтобы увидеть лимит плана.</div>
 
           <div class="hm-actions">
-            <button class="btn dark" id="btn-open-bb">ОТКРЫТЬ СОБЫТИЕ 1WIN ↗</button>
-            <button class="btn green" id="btn-buy-pm">ОТКРЫТЬ POLYMARKET ↗</button>
+            <a class="btn dark event-action" id="btn-open-bb" target="_blank" rel="noopener noreferrer" aria-disabled="true" tabindex="-1">ОТКРЫТЬ СОБЫТИЕ 1WIN ↗</a>
+            <a class="btn green event-action" id="btn-buy-pm" target="_blank" rel="noopener noreferrer" aria-disabled="true" tabindex="-1">ОТКРЫТЬ POLYMARKET ↗</a>
             <button class="btn dark" id="btn-filled">ЗАПИСАТЬ СДЕЛКУ</button>
           </div>
+          <div class="event-link-status" id="event-link-status" role="status" aria-live="polite"></div>
           <div class="action-hint" id="action-hint">Оценка по снимку; после изменения суммы требуется перепроверить обе стороны и глубину стакана. Сделка записывается вручную.</div>
         </div>
         </div>
@@ -221,7 +228,7 @@
     <!-- ============ COL 3: CALCULATOR ============ -->
     <aside class="col-calc" id="col-calc">
       <div class="calc-heading"><div><div class="eyebrow">ДОПОЛНИТЕЛЬНО</div><div class="calc-head">Инструменты</div></div><span class="calc-symbol" aria-hidden="true">⌗</span></div>
-      <p class="calc-intro">В активной вилке суммы и коэффициенты уже показаны по каждой ноге. Ручной расчёт — только для сценария «что если».</p>
+      <p class="calc-intro">В активной вилке суммы и коэффициенты уже показаны по каждой ноге. Ручной расчёт «что если» использует одну введённую цену PM, без глубины стакана.</p>
 
       <details class="calc-details">
         <summary><span>Ручной калькулятор</span><small>не меняет сигнал</small></summary>
@@ -298,7 +305,7 @@
         <div class="sum-item highlight"><div class="lbl">Расчётный ROI</div><div class="val green" id="ed-roi">—</div></div>
       </div>
 
-      <div class="modal-hint">Укажите фактические параметры вручную. Значения в журнале остаются расчётными и не подтверждают исполнение.</div>
+      <div class="modal-hint">Укажите фактические параметры вручную, включая среднюю цену PM по исполненным долям. Здесь расчёт по одной цене, без глубины стакана; запись не подтверждает исполнение.</div>
 
       <div class="modal-actions">
         <button class="btn dark" onclick="closeEdit()">ОТМЕНА</button>
@@ -429,6 +436,7 @@
 <script src="/static/quote_quality.js"></script>
 <script src="/static/market_display.js"></script>
 <script src="/static/provider_links.js"></script>
+<script src="/static/pm_depth_quote.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>

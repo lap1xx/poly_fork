@@ -6,6 +6,48 @@ import threading
 import time
 import uuid
 
+SCANNER_WS_MAX_BYTES = 8 * 1024 * 1024
+
+
+def _serialize_snapshot_with_book_fallback(payload, limit_bytes):
+    """Omit only optional UI books if they make an ingest message too large.
+
+    The input is not mutated. If the legacy payload alone is still too large,
+    its returned byte count exceeds the limit and the caller must not send it.
+    """
+    def encode(value):
+        text = json.dumps(value, ensure_ascii=False, allow_nan=False)
+        return text, len(text.encode("utf-8"))
+
+    text, size = encode(payload)
+    if size <= limit_bytes:
+        return text, size, 0
+
+    omitted = 0
+
+    def without_book(row):
+        nonlocal omitted
+        if not isinstance(row, dict) or "pm_book_snapshot" not in row:
+            return row
+        omitted += 1
+        return {key: value for key, value in row.items() if key != "pm_book_snapshot"}
+
+    arbs = payload.get("arbs")
+    status = payload.get("scan_status")
+    if not isinstance(arbs, dict) or not isinstance(status, dict):
+        return text, size, omitted
+    compact_arbs = {slug: without_book(row) for slug, row in arbs.items()}
+    compact_status = dict(status)
+    pinned = compact_status.get("pinned_signal_snapshots")
+    if isinstance(pinned, list):
+        compact_status["pinned_signal_snapshots"] = [without_book(row) for row in pinned]
+    if not omitted:
+        return text, size, omitted
+    compact_status["pm_book_payload_omitted"] = omitted
+    compact_payload = dict(payload, arbs=compact_arbs, scan_status=compact_status)
+    text, size = encode(compact_payload)
+    return text, size, omitted
+
 
 class ScannerPublisher:
     def __init__(self, url, token, websocket_module=None, reconnect_seconds=1.0, verbose=False):
@@ -22,6 +64,7 @@ class ScannerPublisher:
         self._wake = threading.Event()
         self._connected = threading.Event()
         self._last_error = None
+        self._last_oversize_warning = float('-inf')
         self._lock = threading.Lock()
         self._latest = {"arbs": {}, "scan_status": {}}
         self._thread = threading.Thread(
@@ -114,8 +157,19 @@ class ScannerPublisher:
                         "arbs": arbs,
                         "scan_status": status,
                     }
-                    serialized = json.dumps(payload, ensure_ascii=False, allow_nan=False)
-                    payload_bytes = len(serialized.encode("utf-8"))
+                    serialized, payload_bytes, omitted_books = _serialize_snapshot_with_book_fallback(
+                        payload, SCANNER_WS_MAX_BYTES
+                    )
+                    if payload_bytes > SCANNER_WS_MAX_BYTES:
+                        # Do not cause a reconnect loop. A stale backend scanner
+                        # state will fall back to the existing disk snapshots.
+                        now = time.monotonic()
+                        if self._verbose and now - self._last_oversize_warning >= 30.0:
+                            print("[!] scanner dashboard snapshot too large: bytes=%s limit=%s "
+                                  "omitted_pm_books=%s; using file fallback"
+                                  % (payload_bytes, SCANNER_WS_MAX_BYTES, omitted_books), flush=True)
+                            self._last_oversize_warning = now
+                        continue
                     ws.send(serialized)
             except Exception as exc:
                 was_connected = self._connected.is_set()

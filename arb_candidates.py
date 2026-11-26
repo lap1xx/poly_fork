@@ -1,6 +1,9 @@
 """Polymarket/bookmaker candidate construction, independent of scanner lifecycle."""
 from __future__ import annotations
 
+import math
+import time
+
 from arb_invariants import is_pm_bookmaker_pair
 
 
@@ -83,11 +86,23 @@ def build_arb_candidates(
         if not depth_quote:
             note("pm_depth_short")
             return []
+        # Prefer the top ask from the same locked level snapshot as the depth
+        # calculation; older injected quote implementations need not supply it.
+        ask = depth_quote.get("book_best_ask", ask)
         average_price = depth_quote["avg_price"]
         if average_price > ask * 1.05:
             note("pm_impact_rejected")
             return []
-        book_age = pm_age_sec(pm_tokens[index])
+        price_change_age = pm_age_sec(pm_tokens[index])
+        received_at = depth_quote.get("book_received_at")
+        now = time.time()
+        try:
+            received_at = float(received_at)
+            if not math.isfinite(received_at) or received_at <= 0 or received_at > now:
+                received_at = None
+        except (TypeError, ValueError, OverflowError):
+            received_at = None
+        book_age = now - received_at if received_at is not None else None
         pm_legs.append({
             "source": "Polymarket",
             "outcome": outcome,
@@ -103,8 +118,10 @@ def build_arb_candidates(
             "pm_best_ask": ask,
             "pm_best_bid": best_bid(pm_tokens[index]),
             "pm_avg_ask": average_price,
-            "pm_age": book_age,
+            "pm_age": price_change_age,
             "pm_book_age_sec": book_age,
+            "pm_book_received_at": received_at,
+            "pm_book_age_source": "local_receipt",
             "pm_target_usd": usd_target,
             "pm_target_shares": depth_quote["shares"],
             "pm_verified": pm_refresh_attempted(pm_tokens[index]),

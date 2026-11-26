@@ -38,8 +38,13 @@ def make_ui_snapshot_pair(action_link_mode: str = "v1") -> dict:
         if quote["outcome"] != pm["outcome"]
     )
     now = time.time()
-    slug = captured["market_slug"]
-    pm_event_url = f"https://polymarket.com/event/{slug}"
+    event_slug = captured["market_slug"]
+    slug = f"{event_slug}-game2"
+    pm_book_age_sec = 35.0 if action_link_mode == "pm-stale" else 7.2
+    bookmaker_age_sec = 5.0 if action_link_mode == "pm-stale" else 30.01
+    source_age_sec = 5.0 if action_link_mode == "pm-stale" else 30.01
+    canonical_pm_event_url = f"https://polymarket.com/event/{event_slug}"
+    pm_event_url = f"https://polymarket.com/event/{slug}" if action_link_mode == "legacy-fallback" else canonical_pm_event_url
     bookmaker_event_url = "https://f1w-7707.com/betting/match/esport/replay-match"
     legacy = {
         "slug": slug,
@@ -53,9 +58,9 @@ def make_ui_snapshot_pair(action_link_mode: str = "v1") -> dict:
         "profit": 1.24,
         "ts": now,
         "bk_source": "1win",
-        "bk_odds_age_sec": 30.01,
-        "source_age_sec": 30.01,
-        "source_state": "stale",
+        "bk_odds_age_sec": bookmaker_age_sec,
+        "source_age_sec": source_age_sec,
+        "source_state": "fresh" if action_link_mode == "pm-stale" else "stale",
         "age_sec": 3,
         "pm_event_url": pm_event_url,
         "bk_event_url": bookmaker_event_url,
@@ -67,7 +72,7 @@ def make_ui_snapshot_pair(action_link_mode: str = "v1") -> dict:
                 "o": 1.15,
                 "pm_best_ask": pm["asks"][0][0],
                 "pm_avg_ask": pm["asks"][0][0],
-                "pm_book_age_sec": 7.2,
+                "pm_book_age_sec": pm_book_age_sec,
                 "c": 0.0,
                 "s": 0.0,
                 "pm_fee_enabled": True,
@@ -79,7 +84,7 @@ def make_ui_snapshot_pair(action_link_mode: str = "v1") -> dict:
                 "source": "1win",
                 "outcome": bookmaker["outcome"],
                 "o": bookmaker["odds"],
-                "odds_age_sec": 30.01,
+                "odds_age_sec": bookmaker_age_sec,
                 "c": 0.0,
                 "s": 0.0,
             },
@@ -102,7 +107,7 @@ def make_ui_snapshot_pair(action_link_mode: str = "v1") -> dict:
     if normalized["opportunities"][0]["status"] != "stale":
         raise AssertionError("Replay fixture must exercise stale dual-read presentation")
     ui_legacy = dict(legacy)
-    if action_link_mode == "v1":
+    if action_link_mode in ("v1", "pm-stale"):
         ui_legacy.pop("pm_event_url")
         ui_legacy.pop("bk_event_url")
     elif action_link_mode == "legacy-fallback":
@@ -132,6 +137,7 @@ def make_ui_snapshot_pair(action_link_mode: str = "v1") -> dict:
         "arbs": [ui_legacy],
         "opportunities_v1": normalized,
         "scan_status": {"state": "running", "ts": now, "runtime_limits": runtime_limits},
+        "canonical_pm_event_url": canonical_pm_event_url,
         "config": {
             "bank": 40.0,
             "runtime_limits": runtime_limits,
@@ -153,6 +159,19 @@ def make_ui_snapshot_pair(action_link_mode: str = "v1") -> dict:
 class DashboardBrowserParityTests(unittest.TestCase):
     def test_card_reads_v1_and_detail_remains_legacy(self):
         chromium = shutil.which("chromium") or shutil.which("chromium-browser")
+        if not chromium:
+            install_roots = (
+                Path(os.environ.get("PROGRAMFILES", r"C:\Program Files")),
+                Path(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")),
+            )
+            candidates = [
+                root / "Google" / "Chrome" / "Application" / "chrome.exe"
+                for root in install_roots
+            ] + [
+                root / "Microsoft" / "Edge" / "Application" / "msedge.exe"
+                for root in install_roots
+            ]
+            chromium = next((str(path) for path in candidates if path.is_file()), None)
 
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
@@ -183,7 +202,7 @@ class DashboardBrowserParityTests(unittest.TestCase):
 
             snapshots = {
                 mode: make_ui_snapshot_pair(mode)
-                for mode in ("v1", "legacy-fallback")
+                for mode in ("v1", "legacy-fallback", "pm-stale")
             }
             snapshots_json = json.dumps(snapshots, ensure_ascii=False)
             shim = f"""
@@ -191,9 +210,7 @@ class DashboardBrowserParityTests(unittest.TestCase):
                 const snapshots = {snapshots_json};
                 const actionMode = new URL(location.href).searchParams.get('action_mode') || 'v1';
                 const message = snapshots[actionMode];
-                window.__openedUrls = [];
                 window.__restCalls = {{book: 0, chart: 0}};
-                window.open = (url) => {{ window.__openedUrls.push(String(url)); return {{ closed: false }}; }};
                 class ReplayWebSocket {{
                   static CONNECTING = 0; static OPEN = 1; static CLOSING = 2; static CLOSED = 3;
                   constructor(url) {{
@@ -249,6 +266,14 @@ class DashboardBrowserParityTests(unittest.TestCase):
                                     body=json.dumps(snapshot["config"], ensure_ascii=False),
                                 ),
                             )
+                            page.route(
+                                "**/api/pm_url/**",
+                                lambda route: route.fulfill(
+                                    status=200,
+                                    content_type="application/json",
+                                    body=json.dumps({"url": snapshot["canonical_pm_event_url"]}),
+                                ),
+                            )
                             page.goto(
                                 f"http://127.0.0.1:{port}/?action_mode={action_mode}",
                                 wait_until="domcontentloaded",
@@ -279,6 +304,14 @@ class DashboardBrowserParityTests(unittest.TestCase):
                             self.assertFalse(page.locator("#col-calc").is_visible())
                             warning_tags = card.locator(".arb-tags .pm-age").all_inner_texts()
                             self.assertEqual(sum("УСТАРЕЛИ" in tag or "КОТИРОВКИ УСТАРЕЛИ" in tag for tag in warning_tags), 1)
+                            card_tags = card.locator(".arb-tags").inner_text()
+                            if action_mode == "pm-stale":
+                                self.assertIn("PM 35", card_tags)
+                                self.assertIn("1WIN 5", card_tags)
+                                self.assertTrue(warning_tags[0].startswith("PM 35"))
+                            else:
+                                self.assertIn("PM 7", card_tags)
+                                self.assertIn("1WIN 30", card_tags)
                             page.wait_for_function(
                                 "document.querySelector('#risk-limit-label')?.textContent === '25% на один план'"
                             )
@@ -315,6 +348,12 @@ class DashboardBrowserParityTests(unittest.TestCase):
                             self.assertIn("1win TTL 45 с (переменная среды)", limits_text)
                             self.assertIn("Gamma 100 событий/страницу", limits_text)
                             self.assertIn("safety cap плана 25% банка", limits_text)
+                            safe_threshold = page.locator("#cfg-safe")
+                            threshold_before = float(safe_threshold.input_value())
+                            config_stepper = page.locator('.number-control:has(#cfg-safe) .number-step-button.up')
+                            self.assertEqual(config_stepper.count(), 1)
+                            config_stepper.click()
+                            self.assertAlmostEqual(float(safe_threshold.input_value()), threshold_before + 0.01, places=6)
                             page.locator("#modal-config .modal-actions button").first.click()
 
                             # List/card dual-read remains unchanged; detail and
@@ -327,8 +366,46 @@ class DashboardBrowserParityTests(unittest.TestCase):
                                 "e => parseFloat(getComputedStyle(e).height)"
                             )
                             self.assertLessEqual(chart_height, 110)
+                            self.assertTrue(page.locator("#price-chart").is_visible())
+                            self.assertFalse(page.locator("#chart-snapshot-placeholder").is_visible())
+                            self.assertTrue(page.locator("#pm-book-head").is_visible())
+                            page.wait_for_function("""() => {
+                                const c = document.querySelector('#price-chart');
+                                const scale = Math.min(window.devicePixelRatio || 1, 4);
+                                return c && c.clientWidth > 0 && c.clientHeight > 0 &&
+                                  c.width === Math.round(c.clientWidth * scale) &&
+                                  c.height === Math.round(c.clientHeight * scale);
+                            }""", timeout=5000)
                             self.assertEqual(page.locator("#market-pm-outcome").inner_text(), expected["legs"][0]["outcome"])
                             self.assertEqual(page.locator("#market-bk-outcome").inner_text(), expected["legs"][1]["outcome"])
+
+                            page.locator("#hm-bb-stake").fill("11.00")
+                            page.locator("#hm-pm-stake").fill("13.00")
+                            expected_wins = page.evaluate("""() => {
+                              const amount = selector => Number.parseFloat(document.querySelector(selector).value);
+                              const odds = selector => Number.parseFloat(document.querySelector(selector).textContent);
+                              const format = value => value.toLocaleString('ru-RU', {
+                                minimumFractionDigits: 2, maximumFractionDigits: 2
+                              }) + ' USDT';
+                              return {
+                                bookmaker: format(amount('#hm-bb-stake') * odds('#hm-bb-odds')),
+                              };
+                            }""")
+                            self.assertEqual(page.locator("#hm-bb-win").inner_text(), expected_wins["bookmaker"])
+                            # This replay intentionally has no live PM book and REST is mocked unavailable.
+                            # Do not fabricate a PM payout or total ROI from a scanner multiplier.
+                            self.assertEqual(page.locator("#hm-pm-win").inner_text(), "—")
+                            self.assertEqual(page.locator("#hm-roi").inner_text(), "—")
+                            self.assertTrue(page.locator('.number-control:has(#hm-bb-stake) .number-step-button').count())
+                            self.assertEqual(page.locator("#f-cs2").evaluate("e => getComputedStyle(e).appearance"), "none")
+                            self.assertTrue(page.locator('.number-control:has(#f-minroi) .number-step-button[aria-label^="Увеличить"]').count())
+
+                            page.locator("#btn-tools-toggle").click()
+                            page.locator(".calc-details > summary").click()
+                            odds_input = page.locator("#calc-bk-odds")
+                            current_odds = float(odds_input.input_value())
+                            page.locator('.number-control:has(#calc-bk-odds) .number-step-button.up').click()
+                            self.assertAlmostEqual(float(odds_input.input_value()), current_odds + 0.01, places=6)
 
                             page.wait_for_timeout(150)
                             rest_calls_before_live_update = dict(rest_call_counts)
@@ -356,22 +433,32 @@ class DashboardBrowserParityTests(unittest.TestCase):
                                 expected_urls[source] = (
                                     expected_urls[source] or legacy_row.get(legacy_key)
                                 )
-                            self.assertEqual(
-                                expected_urls["Polymarket"],
-                                "https://polymarket.com/event/" + expected["market"]["slug"],
-                            )
+                            # The API resolves stale child-market links (e.g. -game2)
+                            # to the parent event, so the browser opens the canonical target.
+                            expected_urls["Polymarket"] = snapshot["canonical_pm_event_url"]
+                            self.assertEqual(expected_urls["Polymarket"], snapshot["canonical_pm_event_url"])
                             self.assertEqual(
                                 expected_urls["1win"],
                                 "https://f1w-7707.com/betting/match/esport/replay-match",
                             )
 
-                            # v1 legs are preferred; absent per-leg URLs must
-                            # still fall back to the matching legacy root field.
-                            page.locator("#btn-buy-pm").click()
-                            page.locator("#btn-open-bb").click()
-                            self.assertEqual(page.evaluate("window.__openedUrls"), [
-                                expected_urls["Polymarket"], expected_urls["1win"]
-                            ])
+                            # Actual links allow native middle-click/Ctrl-click.
+                            # Wait for the asynchronous legacy child-slug resolver;
+                            # do not navigate away from the dashboard in this test.
+                            page.wait_for_function(
+                                "url => document.querySelector('#btn-buy-pm')?.getAttribute('href') === url",
+                                arg=snapshot["canonical_pm_event_url"], timeout=10000,
+                            )
+                            for selector, url in (
+                                ("#btn-buy-pm", snapshot["canonical_pm_event_url"]),
+                                ("#btn-open-bb", expected_urls["1win"]),
+                            ):
+                                link = page.locator(selector)
+                                self.assertEqual(link.evaluate("e => e.tagName"), "A")
+                                self.assertEqual(link.get_attribute("href"), url)
+                                self.assertEqual(link.get_attribute("target"), "_blank")
+                                self.assertEqual(set(link.get_attribute("rel").split()), {"noopener", "noreferrer"})
+                                self.assertEqual(link.get_attribute("aria-disabled"), "false")
                             page.close()
                 finally:
                     browser.close()

@@ -345,6 +345,75 @@ class Feed(threading.Thread):
 
 
 BOOK_TTL = RUNTIME_LIMIT_DEFAULTS["pm_book_ttl_sec"]
+
+
+def snapshot_pm_book(aid, now=None, max_ask_levels=25, max_bid_levels=7):
+    """Copy a bounded, fresh book for read-only UI delivery; never start REST.
+
+    A truncated ask snapshot is not the full market depth. Receipt timestamps
+    are local and do not measure network latency or guarantee execution.
+    """
+    if not aid:
+        return None
+    try:
+        now = time.time() if now is None else float(now)
+        ask_limit, bid_limit = int(max_ask_levels), int(max_bid_levels)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if (not math.isfinite(now) or now <= 0 or not 1 <= ask_limit <= 100
+            or not 0 <= bid_limit <= 20):
+        return None
+    with LOCK:
+        book = BOOKS.get(str(aid))
+        if not isinstance(book, dict):
+            return None
+        try:
+            received_at = float(book.get("ts") or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if (not math.isfinite(received_at) or received_at <= 0
+                or now - received_at < 0 or now - received_at > BOOK_TTL):
+            return None
+        all_asks = book.get("asks") or []
+        all_bids = book.get("bids") or []
+        if not isinstance(all_asks, (list, tuple)) or not isinstance(all_bids, (list, tuple)):
+            return None
+        total_asks = len(all_asks)
+        asks = list(all_asks[:ask_limit])
+        bids = list(all_bids[:bid_limit])
+        source_ts = _book_source_timestamp(book)
+    if not asks:
+        return None
+
+    def clean(levels, descending=False):
+        result = []
+        previous = None
+        for row in levels:
+            try:
+                price, size = float(row[0]), float(row[1])
+            except (TypeError, ValueError, IndexError, KeyError, OverflowError):
+                return None
+            if (not math.isfinite(price) or not math.isfinite(size)
+                    or not 0 < price < 1 or size <= 0
+                    or (previous is not None and
+                        (price > previous if descending else price < previous))):
+                return None
+            result.append({"price": price, "size": size})
+            previous = price
+        return result
+
+    ask_rows = clean(asks)
+    bid_rows = clean(bids, descending=True)
+    if ask_rows is None or bid_rows is None:
+        return None
+    return {
+        "token": str(aid), "received_at": received_at, "source_ts": source_ts,
+        "asks": ask_rows, "bids": bid_rows,
+        "asks_truncated": total_asks > ask_limit,
+        "total_ask_levels": total_asks,
+    }
+
+
 def best_ask(aid):
     with LOCK:
         b = BOOKS.get(aid)
@@ -444,10 +513,15 @@ def walk_book_with_fee(aid, target_cost, rate, exponent):
         "fee": fee_total,
         "total_cost": total_cost,
         "effective_multiplier": shares / total_cost,
+        # Captured under the same lock as levels; a later book update must not
+        # make this already calculated quote appear newer than its input.
+        "book_received_at": ts,
+        "book_best_ask": levels[0][0] if levels else None,
     }
 
 
 def pm_age_sec(aid):
+    """Legacy age of the last best-ask change, not book receipt freshness."""
     with LOCK:
         b = BOOKS.get(aid)
         if not b:

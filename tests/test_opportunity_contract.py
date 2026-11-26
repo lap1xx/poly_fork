@@ -247,6 +247,16 @@ class OpportunityContractReplayTests(unittest.TestCase):
             result["opportunities"][0]["legs"][0]["age_ms"], 12_000.0, places=2
         )
 
+    def test_marked_missing_book_receipt_age_never_uses_legacy_price_age(self):
+        payload = self.make_snapshot()
+        candidate = payload["arbs"][self.fixture["market_slug"]]
+        candidate["pm_age"] = 1.0
+        leg = candidate["bets"][0]
+        leg.update(pm_book_age_source="local_receipt", pm_book_age_sec=None, pm_age=1.0)
+        result = normalize_scanner_snapshot(payload)
+        self.assertEqual(result["opportunities"], [])
+        self.assertIn("quote age is missing", result["rejected"][0]["reason"])
+
     def test_bookmaker_to_bookmaker_or_same_outcome_pair_is_rejected(self):
         payload = self.make_snapshot()
         candidate = payload["arbs"][self.fixture["market_slug"]]

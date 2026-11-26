@@ -395,6 +395,32 @@ class BKRouter:
                 return self.fallback_bindings[slug]
             return pair[1] if pair else None
 
+    def onewin_phase_evidence(self, slug):
+        """Read phase evidence for the current binding, without starting a feed."""
+        with self._lock:
+            pair = self.bindings.get(slug)
+            active = self._active_sources.get(slug)
+            stream = self._onewin_stream
+            enabled = self.use_onewin
+        if not enabled or not pair or pair[0] != "1win" or active == "BetBoom":
+            return None
+        binding = pair[1]
+        if not isinstance(binding, dict) or binding.get("match_id") is None:
+            return None
+        inspect = getattr(stream, "phase_evidence", None)
+        if not callable(inspect):
+            return None
+        try:
+            evidence = inspect(slug, binding["match_id"])
+        except Exception:
+            return None
+        with self._lock:
+            if (not self.use_onewin or self._onewin_stream is not stream
+                    or self.bindings.get(slug) != pair
+                    or self._active_sources.get(slug) == "BetBoom"):
+                return None
+        return evidence
+
     def onewin_match_index(self):
         """Return canonical 1win match IDs mapped to every bound PM market."""
         index = {}
@@ -464,6 +490,20 @@ class BKRouter:
         except Exception as e:
             return [{"err": str(e)}]
 
+    def onewin_pair_diagnostic(self, slug):
+        """Inspect the bound 1win market without creating a new binding."""
+        with self._lock:
+            pair = self.bindings.get(slug)
+        if not self.use_onewin or not pair or pair[0] != "1win":
+            return None
+        try:
+            # Diagnostics must never create a feed or send subscriptions.
+            stream = self._onewin_stream or getattr(_ow, "_GLOBAL", None)
+            inspect = getattr(stream, "diagnose_live_bc", None)
+            return inspect(slug) if callable(inspect) else None
+        except Exception:
+            return None
+
     def stats(self, slugs=None):
         with self._lock:
             binding_items = (
@@ -491,17 +531,54 @@ class BKRouter:
                 pass
         if self.use_onewin:
             try:
-                s = _ow.get_global_stream()
+                # Use only an already running stream; stats is read-only.
+                s = self._onewin_stream or getattr(_ow, "_GLOBAL", None)
+                if s is None:
+                    return out
                 with s.lock:
                     out["onewin_matches"] = len(s.matches)
                 live_bc = getattr(s, "live_bc", None)
-                if callable(live_bc):
+                inspect = getattr(s, "inspect_live_bc", None)
+                if callable(inspect) or callable(live_bc):
+                    reason_counts = {}
+                    stage_counts = {}
+                    reason_examples = {}
+                    extra_examples = []
                     for slug in onewin_slugs:
                         try:
-                            if live_bc(slug):
+                            if callable(inspect):
+                                pair, diagnostic = inspect(slug)
+                                reason = str(diagnostic.get("reason") or "unknown")
+                                stage = str(diagnostic.get("stage") or "unknown")
+                                reason_counts[reason] = reason_counts.get(reason, 0) + 1
+                                stage_counts[stage] = stage_counts.get(stage, 0) + 1
+                                if reason != "fresh":
+                                    if reason not in reason_examples:
+                                        reason_examples[reason] = diagnostic
+                                    elif len(extra_examples) < 5:
+                                        extra_examples.append(diagnostic)
+                            else:
+                                pair = live_bc(slug)
+                            if pair:
                                 out["onewin_fresh_pairs"] += 1
                         except Exception:
+                            reason_counts["diagnostic_error"] = reason_counts.get("diagnostic_error", 0) + 1
                             continue
+                    if callable(inspect):
+                        # Keep one example per reason before filling remaining
+                        # slots, prioritizing unsafe/ambiguous interpretations.
+                        priority = ("ambiguous_market_groups", "unsupported_outcomes",
+                                    "ambiguous_side_quotes")
+                        examples = [reason_examples.pop(reason) for reason in priority
+                                    if reason in reason_examples]
+                        examples.extend(reason_examples.values())
+                        examples.extend(extra_examples)
+                        out["onewin_pair_diagnostics"] = {
+                            "scope": "bound_pm_markets",
+                            "reason_counts": reason_counts,
+                            "stage_counts": stage_counts,
+                            "examples": examples[:5],
+                        }
             except Exception:
                 pass
         return out

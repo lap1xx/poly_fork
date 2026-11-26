@@ -1,0 +1,20 @@
+{
+  "capture_date": "2026-11-26",
+  "event_slug": "cs2-baks-npg-2026-11-26",
+  "market_slug": "cs2-baks-npg-2026-11-26-game2",
+  "polymarket": {
+    "source": "https://gamma-api.polymarket.com/events?slug=cs2-baks-npg-2026-11-26",
+    "observed_at": "2026-11-26T15:12:25Z",
+    "event": {"startTime": "2026-11-26T15:10:00Z", "live": false, "active": true, "closed": false},
+    "market": {"eventStartTime": "2026-11-26T15:10:00Z"}
+  },
+  "onewin": {
+    "source": "https://api-gateway.top-parser.com/matches/get-many",
+    "observed_at": "2026-11-26T15:12:53Z",
+    "match_id": 43810101,
+    "service": "PREMATCH",
+    "serviceV2": "prematch",
+    "startAt": 1795706100
+  },
+  "note": "One public read-only request per source; the two records are not an atomic snapshot and do not prove execution or historical source state."
+}

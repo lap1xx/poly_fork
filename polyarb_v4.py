@@ -33,7 +33,7 @@ from event_dispatch import (
     build_token_slug_index,
     resolve_dirty_slugs,
 )
-from event_phase import classify_event_phase
+from event_phase import classify_event_phase, capture_pm_phase_evidence, resolve_event_phase
 from pm_fees import (
     fetch_fee_schedule as fetch_pm_fee_schedule,
     fee_per_share as pm_fee_per_share,
@@ -345,6 +345,9 @@ def log_arb_json(slug, sport, roi, bank, profit, payout_usdt, bets, stakes,
             "question": m.get("q", "")[:200],
             "phase": classify_event_phase(m),
             "live": classify_event_phase(m) == "live",
+            "phase_source": m.get("phase_source"),
+            "phase_reason": m.get("phase_reason"),
+            "phase_start_difference_sec": m.get("phase_start_difference_sec"),
             "streamer": bool(is_streamer(slug, m.get("q", ""))),
             "roi": round(roi, 5),
             "currency": "USDT",
@@ -692,6 +695,7 @@ def fetch_market(slug):
             "start": start,
             "phase": phase,
             "_phase_classified": True,
+            "_pm_phase_evidence": capture_pm_phase_evidence(m, received_at=time.time()),
             "live": phase == "live",
             "status": m.get("status"),
             "closed": m.get("closed"),
@@ -770,6 +774,27 @@ def fetch_live_pm_markets(with_status=False):
 reconcile_pm_market_map = _pm_catalog.reconcile_pm_market_map
 
 
+def _resolved_market_phase(market, router=None, slug=None, *, now=None):
+    evidence = None
+    inspect = getattr(router, "onewin_phase_evidence", None)
+    if callable(inspect):
+        evidence = inspect(slug or market.get("slug"))
+    return resolve_event_phase(market, evidence, now=now)
+
+
+def _market_content_changed(previous, current):
+    """A mere receipt refresh is handled by the active-signal expiry sweep."""
+    if not isinstance(previous, dict) or not isinstance(current, dict):
+        return previous != current
+    def comparable(value):
+        copy = dict(value)
+        evidence = copy.get("_pm_phase_evidence")
+        if isinstance(evidence, dict):
+            copy["_pm_phase_evidence"] = {k: v for k, v in evidence.items() if k != "received_at"}
+        return copy
+    return comparable(previous) != comparable(current)
+
+
 def print_arb(m, bets, r, rate, first_seen, bk):
     sport = detect_sport(m["slug"])
     sc = color_sport(sport)
@@ -777,6 +802,10 @@ def print_arb(m, bets, r, rate, first_seen, bk):
     mtc = color_mtype(mtype)
     phase = classify_event_phase(m)
     phase_label = {"live": "LIVE", "prematch": "PREMATCH", "unknown": "UNKNOWN"}[phase]
+    if m.get("phase_source") == "1win":
+        phase_label += " / 1win"
+    elif m.get("phase_source") == "conflict":
+        phase_label += " / CONFLICT"
     phase_color = C.Y if phase == "live" else C.B if phase == "prematch" else C.DIM
     live_tag = phase_color + C.BOLD + " [" + phase_label + "]" + C.RST
     streamer_tag = (C.M + " [STREAMER]" + C.RST) \
@@ -797,9 +826,15 @@ def print_arb(m, bets, r, rate, first_seen, bk):
         b = bets[i]
         st = r["stakes"][i]
         src = b["source"]
-        speed = bk.get(src, {}).get("update_seconds", 0)
-        speed_col = color_bk_speed(src, bk)
-        speed_str = (speed_col + "(%ds)" % speed + C.RST) if speed > 0 else ""
+        age_text = ""
+        if src != "Polymarket":
+            raw_age = b.get("odds_age_sec")
+            try:
+                age = float(raw_age) if not isinstance(raw_age, bool) else float("nan")
+            except (TypeError, ValueError, OverflowError):
+                age = float("nan")
+            age_text = (" · возраст при отборе %.1fс" % age
+                        if math.isfinite(age) and age >= 0 else " · возраст при отборе неизвестен")
         if src == "Polymarket":
             src_col = C.M
         elif src == "1win":
@@ -809,13 +844,13 @@ def print_arb(m, bets, r, rate, first_seen, bk):
 
         stake_str = "%.2f USDT" % st
 
-        row1 = "  %s%-12s%s %-12s %-26s" % (
-            src_col, src, C.RST, speed_str, b["outcome"][:26],
+        row1 = "  %s%-12s%s %-26s" % (
+            src_col, src, C.RST, b["outcome"][:26],
         )
         row2 = " k=%s%.3f%s  stake=%s%s%s%s" % (
             C.BOLD, b["o"], C.RST, C.BOLD, C.W, stake_str, C.RST,
         )
-        print(row1 + row2)
+        print(row1 + row2 + age_text)
 
     print()
     roi_col = color_roi(r["roi"])
@@ -976,7 +1011,8 @@ def _classify_signal_drop_reason(*, market_missing=False, has_fresh_bookmaker=Fa
 
 def _make_signal_drop_diagnostic(snapshot, reason, dropped_at,
                                  min_roi=0.0, current_best_roi=None,
-                                 current_pm_diagnostic=None):
+                                 current_pm_diagnostic=None,
+                                 current_onewin_diagnostic=None):
     snapshot = snapshot or {}
     bets = snapshot.get("bets") or []
     pm_leg = next((bet for bet in bets if bet.get("source") == "Polymarket"), {})
@@ -1024,10 +1060,13 @@ def _make_signal_drop_diagnostic(snapshot, reason, dropped_at,
             "average_ask": number(pm_leg.get("pm_avg_ask")),
             "best_bid": number(pm_leg.get("pm_best_bid")),
             "book_age_sec": number(pm_leg.get("pm_book_age_sec", pm_leg.get("pm_age"))),
+            "book_age_source": pm_leg.get("pm_book_age_source"),
+            "best_ask_change_age_sec": number(pm_leg.get("pm_age")),
             "target_usd": number(pm_leg.get("pm_target_usd")),
             "target_shares": number(pm_leg.get("pm_target_shares")),
         },
         "current_pm_book": current_pm_book,
+        "current_onewin_pair": current_onewin_diagnostic,
         "bookmaker_quote": {
             "source": str(bookmaker_leg.get("source") or snapshot.get("bk_source") or ""),
             "outcome": str(bookmaker_leg.get("outcome") or ""),
@@ -1056,7 +1095,19 @@ def _prune_recent_signal_drops(drops, now):
     return [row for _slug, row in ordered[:MAX_RECENT_SIGNAL_DROPS]]
 
 
-def _serialize_candidate_bets(bets):
+def _serialize_candidate_bets(bets, now=None):
+    def book_age(bet):
+        if now is None or bet.get("pm_book_age_source") != "local_receipt":
+            return bet.get("pm_book_age_sec")
+        try:
+            ts = float(bet.get("pm_book_received_at"))
+            at = float(now)
+            if not math.isfinite(ts) or not math.isfinite(at) or ts <= 0 or ts > at:
+                return None
+            return at - ts
+        except (TypeError, ValueError, OverflowError):
+            return None
+
     return [
         {
             "source": bet.get("source"),
@@ -1074,7 +1125,9 @@ def _serialize_candidate_bets(bets):
             "pm_best_ask": bet.get("pm_best_ask"),
             "pm_best_bid": bet.get("pm_best_bid"),
             "pm_avg_ask": bet.get("pm_avg_ask"),
-            "pm_book_age_sec": bet.get("pm_book_age_sec"),
+            "pm_book_age_sec": book_age(bet),
+            "pm_book_received_at": bet.get("pm_book_received_at"),
+            "pm_book_age_source": bet.get("pm_book_age_source"),
             "pm_target_usd": bet.get("pm_target_usd"),
             "pm_target_shares": bet.get("pm_target_shares"),
             "pm_refined_avg_ask": bet.get("pm_refined_avg_ask"),
@@ -1127,7 +1180,10 @@ def _pin_signal_snapshot(snapshots, snapshot, now=None):
     key = _pinned_signal_key(snapshot)
     if not key or key in snapshots:
         return False
-    frozen = json.loads(json.dumps(snapshot, ensure_ascii=False))
+    # A pinned signal is explicitly inactive and its UI never uses a live book.
+    # Avoid duplicating a potentially large, immediately stale book for five minutes.
+    without_live_book = {k: v for k, v in snapshot.items() if k != "pm_book_snapshot"}
+    frozen = json.loads(json.dumps(without_live_book, ensure_ascii=False))
     frozen["snapshot_id"] = "%s|%.6f" % (key, now)
     frozen["currency"] = "USDT"
     frozen["locked_at"] = now
@@ -1567,7 +1623,7 @@ def main():
                     changed_slugs = {
                         slug for slug, market in market_map.items()
                         if slug not in previous_market_map
-                        or previous_market_map.get(slug) != market
+                        or _market_content_changed(previous_market_map.get(slug), market)
                     }
                     removed_slugs = set(previous_market_map) - set(market_map)
                     if removed_slugs:
@@ -1635,8 +1691,8 @@ def main():
                 scan_iteration += 1
             if now - last_phase_refresh >= 5.0:
                 phase_counts_cache = {"live": 0, "prematch": 0, "unknown": 0}
-                for _market in market_map.values():
-                    _phase = classify_event_phase(_market)
+                for _slug, _market in market_map.items():
+                    _phase = _resolved_market_phase(_market, router, _slug)["phase"]
                     phase_counts_cache[_phase] = phase_counts_cache.get(_phase, 0) + 1
                 last_phase_refresh = now
 
@@ -1684,8 +1740,19 @@ def main():
                 if not live_bc:
                     scan_counts["no_fresh_bookmaker"] += 1
                     if previous_snapshot is not None:
+                        previous_pm_leg = next(
+                            (bet for bet in previous_snapshot.get("bets", [])
+                             if bet.get("source") == "Polymarket"), {}
+                        )
+                        previous_token = previous_pm_leg.get("token")
+                        current_pm = (pm_book_diagnostic(previous_token)
+                                      if previous_token else None)
+                        current_onewin = (router.onewin_pair_diagnostic(slug)
+                                          if router is not None else None)
                         recent_signal_drops[slug] = _make_signal_drop_diagnostic(
-                            previous_snapshot, "no_fresh_bookmaker_pair", time.time(), min_roi
+                            previous_snapshot, "no_fresh_bookmaker_pair", time.time(), min_roi,
+                            current_pm_diagnostic=current_pm,
+                            current_onewin_diagnostic=current_onewin,
                         )
                     continue
                 scan_counts["with_fresh_bookmaker"] += 1
@@ -1737,7 +1804,12 @@ def main():
                         scan_counts["below_roi"] += 1
                         continue
                     scan_counts["roi_passed"] += 1
-                    phase = classify_event_phase(m)
+                    phase_info = _resolved_market_phase(m, router, slug)
+                    phase = phase_info["phase"]
+                    phase_market = dict(m, phase=phase, _phase_classified=True,
+                                        phase_source=phase_info["source"],
+                                        phase_reason=phase_info["reason"],
+                                        phase_start_difference_sec=phase_info.get("start_difference_sec"))
 
                     # --- web snapshot ---
                     try:
@@ -1787,6 +1859,11 @@ def main():
                                         if b.get("source") != "Polymarket"), {})
                         _bk_age = _bk_leg.get("odds_age_sec")
                         _display_stakes = [float(x) for x in r["stakes"]]
+                        try:
+                            _pm_book_snapshot = _pm_market_data.snapshot_pm_book(_pm_leg.get("token"))
+                        except Exception:
+                            _pm_book_snapshot = None
+                        _snapshot_ts = time.time()
                         candidate_snapshot = {
                             "slug": slug,
                             "q": m.get("q", ""),
@@ -1797,16 +1874,22 @@ def main():
                             "total_bank": float(bank),
                             "currency": "USDT",
                             "rate": 1.0,
-                            "bets": _serialize_candidate_bets(bets),
+                            "bets": _serialize_candidate_bets(bets, now=_snapshot_ts),
                             "stakes": _display_stakes,
                             "payout": float(r["payout"]),
                             "profit": float(_prf),
                             "phase": phase,
+                            "phase_source": phase_info["source"],
+                            "phase_reason": phase_info["reason"],
+                            "phase_start_difference_sec": phase_info.get("start_difference_sec"),
                             "is_live": phase == "live",
                             "is_streamer": bool(is_streamer(slug, m.get("q", ""))),
                             "pm_age": _pm_age,
                             "pm_best_ask": _pm_leg.get("pm_best_ask"),
                             "pm_best_bid": _pm_leg.get("pm_best_bid"),
+                            # Additive UI data only; signal validity still uses
+                            # the scanner's own depth/freshness checks above.
+                            "pm_book_snapshot": _pm_book_snapshot,
                             "bk_source": _bk_src,
                             "bk_odds_age_sec": _bk_age,
                             "bk_event_url": (_bb_b or {}).get("event_url"),
@@ -1819,7 +1902,7 @@ def main():
                                                  if _bk_src == "BetBoom" else None),
                             "bb_binding": _bb_b if _bk_src == "BetBoom" else None,
                             "bb_stakes_debug": _bb_stakes_debug,
-                            "ts": time.time(),
+                            "ts": _snapshot_ts,
                         }
                         _pin_signal_snapshot(
                             pinned_signal_snapshots, candidate_snapshot,
@@ -1866,7 +1949,7 @@ def main():
                     if signal_key not in printed_once:
                         printed_once.add(signal_key)
                         upd_count[signal_key] = 0
-                        print_arb(m, bets, r, rate, fs, bk)
+                        print_arb(phase_market, bets, r, rate, fs, bk)
                     else:
                         upd_count[signal_key] = upd_count.get(signal_key, 0) + 1
                         pm_o = next((b["o"] for b in bets
@@ -1900,7 +1983,7 @@ def main():
                             log_csv(slug, detect_sport(slug), roi, profit)
                             log_arb_json(slug, detect_sport(slug), roi, bank,
                                          profit, r["payout"], bets, r["stakes"],
-                                         m, rate, first_seen_ts=fs)
+                                         phase_market, rate, first_seen_ts=fs)
                         except Exception:
                             pass
 
@@ -1973,6 +2056,7 @@ def main():
                     "bound_betboom": int(router_stats_cache.get("bound_betboom", 0)),
                     "onewin_catalog_matches": int(router_stats_cache.get("onewin_matches", 0)),
                     "fresh_1win_pairs": int(router_stats_cache.get("onewin_fresh_pairs", 0)),
+                    "onewin_pair_diagnostics": router_stats_cache.get("onewin_pair_diagnostics"),
                     "betboom_catalog_matches": int(router_stats_cache.get("bb_matches", 0)),
                 }
             if _now - last_pm_diag_write >= 2.0:

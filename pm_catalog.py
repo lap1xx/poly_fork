@@ -5,7 +5,7 @@ from queue import Empty, Queue
 import threading
 import time
 import requests
-from event_phase import classify_event_phase
+from event_phase import classify_event_phase, capture_pm_phase_evidence
 from runtime_settings import RUNTIME_LIMIT_DEFAULTS
 
 GAMMA = "https://gamma-api.polymarket.com"
@@ -29,7 +29,9 @@ def _fetch_pm_catalog_query(
     gamma_url=GAMMA,
 ):
     """Fetch one tag/mode stream to cursor exhaustion, or report it as partial."""
+    started_at = time.monotonic()
     events = []
+    event_receipts = []
     cursor = None
     seen_cursors = set()
     pages = 0
@@ -111,9 +113,11 @@ def _fetch_pm_catalog_query(
 
         pages += 1
         raw_event_rows += len(page_events)
+        received_at = time.time()
         valid_events = [event for event in page_events if isinstance(event, dict)]
         invalid_event_rows += len(page_events) - len(valid_events)
         events.extend(valid_events)
+        event_receipts.extend([received_at] * len(valid_events))
 
         if "next_cursor" not in payload:
             if len(page_events) < effective_page_limit:
@@ -146,11 +150,13 @@ def _fetch_pm_catalog_query(
         "raw_event_rows": raw_event_rows,
         "invalid_event_rows": invalid_event_rows,
         "events": events,
+        "event_receipts": event_receipts,
         "cursor_exhausted": cursor_exhausted,
         "page_cap_hit": page_cap_hit,
         "effective_page_limit": effective_page_limit,
         "last_http_status": last_http_status,
         "error": error,
+        "elapsed_ms": round((time.monotonic() - started_at) * 1000.0, 1),
     }
 
 
@@ -271,12 +277,16 @@ def fetch_live_pm_markets(
                 "effective_page_limit": result.get("effective_page_limit"),
                 "last_http_status": result.get("last_http_status"),
                 "error": query_error,
+                "elapsed_ms": result.get("elapsed_ms"),
             })
 
-            for event in result.get("events") or []:
+            event_receipts = result.get("event_receipts") or []
+            for event_index, event in enumerate(result.get("events") or []):
                 if not isinstance(event, dict):
                     catalog_complete = False
                     continue
+                received_at = (event_receipts[event_index]
+                               if event_index < len(event_receipts) else None)
                 event_markets = event.get("markets") or []
                 if not isinstance(event_markets, list):
                     catalog_complete = False
@@ -314,6 +324,8 @@ def fetch_live_pm_markets(
                         "o": outcomes, "t": tokens, "start": start,
                         "phase": phase,
                         "_phase_classified": True,
+                        "_pm_phase_evidence": capture_pm_phase_evidence(
+                            market, event, received_at=received_at),
                         "live": phase == "live",
                         "status": market.get("status") or event.get("status"),
                         "closed": market.get("closed", event.get("closed")),

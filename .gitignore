@@ -46,3 +46,6 @@ __pycache__/
 ip/ 
 vendor.txt 
 .work/
+
+# Local read-only fork observer reports
+fork_observer_logs/
